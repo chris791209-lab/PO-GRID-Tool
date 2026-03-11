@@ -16,7 +16,7 @@ PORT_MAP = {
 }
 
 st.set_page_config(page_title=PO GRID 自動生成系統, layout=wide)
-st.title(🎃 季節性 PO GRID 自動生成器)
+st.title("PO GRID 自動生成器")
 
 st.markdown(
 請依序上傳 PO RAW DATA、產品資料 與 PO List (訂單清單)。
@@ -148,4 +148,5 @@ if po_raw_file and prod_file and po_list_file
                 )
                 
             except Exception as e
+
                 st.error(f❌ 處理過程中發生錯誤 {e})
