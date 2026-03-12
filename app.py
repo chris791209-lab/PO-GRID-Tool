@@ -108,18 +108,35 @@ if po_raw_file and prod_file and po_list_file:
                 pivot_df[('PO TOTAL', '', '', '')] = pivot_df.sum(axis=1)
                 
                 # --- 準備左側靜態產品資料 ---
-                prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
-                left_columns = ['DPCI', 'Manufacturer Style # *', 'Product Description', 'Barcode', 'Primary Raw Material Type', 'Import Vendor Name', 'Factory Name', 'Inner Pack Unit Quantity', 'Case Unit Quantity']
-                
-                if 'Factory Name' not in prod_data.columns:
-                    prod_data['Factory Name'] = '未提供工廠名稱'
+                if 'DPCI' not in prod_data.columns:
+                    st.error("❌ 產品資料(PCN) 中找不到必要的 'DPCI' 欄位，請確認上傳的檔案格式是否正確。")
+                    st.stop()
                     
-                left_data = prod_data[left_columns + ['DPCI_MERGE']].drop_duplicates(subset=['DPCI_MERGE']).set_index('DPCI_MERGE')
+                prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
+                
+                # 定義預期需要的左側欄位
+                desired_left_columns = [
+                    'DPCI', 'Manufacturer Style # *', 'Product Description', 
+                    'Barcode', 'Primary Raw Material Type', 'Import Vendor Name', 
+                    'Factory Name', 'Inner Pack Unit Quantity', 'Case Unit Quantity'
+                ]
+                
+                # 💡 容錯機制：如果 PCN 檔案中缺少某些欄位，自動補齊空白，防止當機！
+                for col in desired_left_columns:
+                    if col not in prod_data.columns:
+                        if col == 'Factory Name':
+                            prod_data[col] = '未提供工廠名稱'
+                        elif col == 'Import Vendor Name':
+                            prod_data[col] = '未提供供應商名稱'
+                        else:
+                            prod_data[col] = '' # 其他遺失的欄位直接給空白
+                            
+                left_data = prod_data[desired_left_columns + ['DPCI_MERGE']].drop_duplicates(subset=['DPCI_MERGE']).set_index('DPCI_MERGE')
                 left_data.columns = pd.MultiIndex.from_tuples([(col, '', '', '') for col in left_data.columns])
                 
                 final_df = left_data.join(pivot_df, how='inner')
 
-                # --- 拆檔與寫入 ZIP (修改為：產出一份合併檔案，內部依 Factory 分 Tab) ---
+                # --- 拆檔與寫入 ZIP ---
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                     
@@ -132,35 +149,30 @@ if po_raw_file and prod_file and po_list_file:
                     excel_buffer = io.BytesIO()
                     with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                         
-                        # 直接依照工廠 (Factory Name) 拆分 Tab 分頁
                         grouped_factory = final_df.groupby(factory_col)
                         
                         for factory_name, factory_data in grouped_factory:
-                            # 清理 Tab 名稱，移除 Excel 不允許的特殊字元
                             safe_factory_name = str(factory_name).replace('/', '_').replace('\\', '_')
                             safe_factory_name = safe_factory_name.replace('[', '').replace(']', '').replace('*', '').replace(':', '').replace('?', '')[:31]
                             
                             export_data = factory_data.drop(columns=[vendor_col, factory_col])
                             
-                            # 💡 需求 2：自動過濾數量為 0 的 PO 欄位
+                            # 自動過濾數量為 0 的 PO 欄位
                             cols_to_keep = []
                             for col in export_data.columns:
-                                # 判斷是否為 PO 欄位 (多層表頭的第2層有 PO Number)
                                 if col[1] != '': 
-                                    # 如果該 PO 在此工廠總數 > 0，則保留
                                     if pd.to_numeric(export_data[col], errors='coerce').sum() > 0:
                                         cols_to_keep.append(col)
                                 else:
-                                    # 左側靜態產品資料與 PO TOTAL 一定保留
                                     cols_to_keep.append(col)
                                     
                             export_data = export_data[cols_to_keep]
                             
-                            # 💡 需求 3：加上隱形空白，強迫每個 PO 單獨顯示 PURPOSE 標籤
+                            # 加上隱形空白，強迫每個 PO 單獨顯示 PURPOSE 標籤
                             unmerged_columns = []
                             for i, col in enumerate(export_data.columns):
-                                if col[1] != '': # 如果是 PO 欄位
-                                    new_purpose = str(col[0]) + (" " * i) # 加上等同於索引值的隱形空白
+                                if col[1] != '': 
+                                    new_purpose = str(col[0]) + (" " * i) 
                                     unmerged_columns.append((new_purpose, col[1], col[2], col[3]))
                                 else:
                                     unmerged_columns.append(col)
@@ -169,9 +181,8 @@ if po_raw_file and prod_file and po_list_file:
                             export_data_reset = export_data.reset_index(drop=True)
                             
                             export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
-                            writer.sheets[safe_factory_name].delete_cols(1) # 刪除自動產生的 Index 欄位
+                            writer.sheets[safe_factory_name].delete_cols(1) 
                     
-                    # 💡 需求 1：將所有資料包裝成單一個 Excel 檔案
                     zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
                 
                 st.success("✨ 處理完成！已成功合併為單一檔案，並完成『過濾空數量 PO』與『顯示獨立標籤』設定。")
