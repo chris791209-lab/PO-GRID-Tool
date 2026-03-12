@@ -17,16 +17,15 @@ PORT_MAP = {
 
 st.set_page_config(page_title="PO GRID 自動生成系統", layout="wide")
 
-st.title("PO GRID 自動生成器")
+st.title("🎃 季節性 PO GRID 自動生成器")
 
-# 更新了這裡的提示文字順序與名稱
 st.markdown("""
 請依序上傳 **PO RAW DATA**、**PO List (訂單清單)** 與 **產品資料(PCN)**。
 上傳後，請在下方的表格中輸入對應的「目的地港口代碼」(如 581, 3891 等)，系統將自動生成多層表頭。
 """)
 
 # ==========================================
-# 1. 檔案上傳區 (順序與名稱已修改)
+# 1. 檔案上傳區
 # ==========================================
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -94,18 +93,14 @@ if po_raw_file and prod_file and po_list_file:
                     po_raw['TOTAL ITEM QTY'] = po_raw['TOTAL ITEM QTY'].str.replace(',', '').astype(float)
 
                 # --- 建立含「多層表頭」的樞紐分析表 ---
-                # 1. 整理使用者輸入的港口資料
                 edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).map(PORT_MAP).fillna(edited_po_info['輸入港口代碼 (如:581)'])
                 
-                # 將港口與日期資訊 Join 回 PO RAW
                 po_raw_merged = po_raw.merge(edited_po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
                 
-                # 處理遺失值避免報錯
                 po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('Unknown')
                 po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('Unknown Date')
                 po_raw_merged['PORT_NAME'] = po_raw_merged['PORT_NAME'].fillna('Unknown Port')
                 
-                # 建立 Pivot Table (列=DPCI, 欄=多層次(標籤/PO/日期/港口))
                 pivot_df = po_raw_merged.pivot_table(
                     index='DPCI_MERGE', 
                     columns=['PURPOSE', 'PO NUMBER', 'SHIP_DATES', 'PORT_NAME'], 
@@ -113,41 +108,17 @@ if po_raw_file and prod_file and po_list_file:
                     aggfunc='sum'
                 ).fillna(0)
                 
-                # 計算該品項的總 PO 數量 (加總所有欄位)
-                pivot_df['PO TOTAL'] = pivot_df.sum(axis=1)
+                # 💡 修正點 1: 新增 PO TOTAL 時，必須配合 4 層表頭的格式 (Tuple)
+                pivot_df[('PO TOTAL', '', '', '')] = pivot_df.sum(axis=1)
                 
                 # --- 準備左側靜態產品資料 ---
                 prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
                 left_columns = ['DPCI', 'Manufacturer Style # *', 'Product Description', 'Barcode', 'Primary Raw Material Type', 'Import Vendor Name', 'Inner Pack Unit Quantity', 'Case Unit Quantity']
                 
-                final_df = pd.merge(prod_data[left_columns + ['DPCI_MERGE']], pivot_df.reset_index(), on='DPCI_MERGE', how='inner')
-
-                # --- 拆檔與寫入 ZIP ---
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                    
-                    grouped = final_df.groupby('Import Vendor Name')
-                    
-                    for vendor_name, group_data in grouped:
-                        safe_vendor_name = str(vendor_name).replace('/', '_').replace('\\', '_')
-                        
-                        # 刪除輔助用的合併欄位
-                        export_data = group_data.drop(columns=['DPCI_MERGE', 'Import Vendor Name'])
-                        
-                        excel_buffer = io.BytesIO()
-                        # 使用 ExcelWriter 匯出，Pandas 會自動將 MultiIndex 轉為漂亮的合併儲存格多層表頭
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            export_data.to_excel(writer, index=False, sheet_name='PO GRID')
-                        
-                        zip_file.writestr(f"PO_GRID_{safe_vendor_name}.xlsx", excel_buffer.getvalue())
+                # 將 index 設為 DPCI_MERGE 以便後續無痛合併
+                left_data = prod_data[left_columns + ['DPCI_MERGE']].drop_duplicates(subset=['DPCI_MERGE']).set_index('DPCI_MERGE')
                 
-                st.success("✨ 處理完成！多層次表頭與港口資訊已成功寫入。")
-                st.download_button(
-                    label="📦 點擊下載全廠商 PO GRID (ZIP壓縮檔)",
-                    data=zip_buffer.getvalue(),
-                    file_name="PO_GRIDs_Output.zip",
-                    mime="application/zip"
-                )
+                # 💡 修正點 2: 將左側資料的 1 層表頭擴充為 4 層表頭 (下方留空)
+                left_data.columns = pd.MultiIndex.from_tuples([(col, '', '', '') for col in left_data.columns])
                 
-            except Exception as e:
-                st.error(f"❌ 處理過程中發生錯誤: {e}")
+                # 💡 修正點 3: 使用 join 完美合併兩張多層表頭的表格
