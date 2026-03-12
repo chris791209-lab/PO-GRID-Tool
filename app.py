@@ -17,29 +17,24 @@ PORT_MAP = {
 
 st.set_page_config(page_title="PO GRID 自動生成系統", layout="wide")
 
-# ==========================================
-# 修正重點 1: 加上雙引號
-# ==========================================
-st.title("🎃 季節性 PO GRID 自動生成器")
+st.title("PO GRID 自動生成器")
 
-# ==========================================
-# 修正重點 2: 多行文字加上三個雙引號
-# ==========================================
+# 更新了這裡的提示文字順序與名稱
 st.markdown("""
-請依序上傳 **PO RAW DATA**、**產品資料** 與 **PO List (訂單清單)**。
+請依序上傳 **PO RAW DATA**、**PO List (訂單清單)** 與 **產品資料(PCN)**。
 上傳後，請在下方的表格中輸入對應的「目的地港口代碼」(如 581, 3891 等)，系統將自動生成多層表頭。
 """)
 
 # ==========================================
-# 1. 檔案上傳區
+# 1. 檔案上傳區 (順序與名稱已修改)
 # ==========================================
 col1, col2, col3 = st.columns(3)
 with col1:
     po_raw_file = st.file_uploader("📁 1. PO RAW DATA (CSV)", type=['csv'])
 with col2:
-    prod_file = st.file_uploader("📁 2. 產品資料表 (Excel/CSV)", type=['xlsx', 'csv'])
+    po_list_file = st.file_uploader("📁 2. List of Purchase Orders (CSV)", type=['csv'])
 with col3:
-    po_list_file = st.file_uploader("📁 3. List of Purchase Orders (CSV)", type=['csv'])
+    prod_file = st.file_uploader("📁 3. 產品資料(PCN) (Excel/CSV)", type=['xlsx', 'csv'])
 
 # ==========================================
 # 2. 讀取並顯示「港口輸入互動表」
