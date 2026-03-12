@@ -42,8 +42,12 @@ if po_raw_file and prod_file and po_list_file:
     po_list = pd.read_csv(po_list_file)
     po_raw = pd.read_csv(po_raw_file)
     
-    po_list['SHIP BEGIN DATE'] = pd.to_datetime(po_list['SHIP BEGIN DATE'])
-    po_list['SHIP END DATE'] = pd.to_datetime(po_list['SHIP END DATE'])
+    # 💡 強制將 PO NUMBER 轉為乾淨的文字格式，避免 Unknown 匹配失敗
+    po_list['PO NUMBER'] = po_list['PO NUMBER'].astype(str).str.split('.').str[0].str.strip()
+    po_raw['PO NUMBER'] = po_raw['PO NUMBER'].astype(str).str.split('.').str[0].str.strip()
+    
+    po_list['SHIP BEGIN DATE'] = pd.to_datetime(po_list['SHIP BEGIN DATE'], errors='coerce')
+    po_list['SHIP END DATE'] = pd.to_datetime(po_list['SHIP END DATE'], errors='coerce')
     po_list['SHIP_DATES'] = po_list['SHIP BEGIN DATE'].dt.strftime('%m/%d') + '-' + po_list['SHIP END DATE'].dt.strftime('%m/%d')
     
     po_info = po_list[['PO NUMBER', 'PURPOSE', 'SHIP_DATES']].drop_duplicates()
@@ -54,7 +58,7 @@ if po_raw_file and prod_file and po_list_file:
     
     st.divider()
     st.subheader("📍 步驟 4: 請為以下 PO 分配目的地港口代碼")
-    st.info("提示: 支援代碼 581(PSW), 3890(PNW), 584(ORF), 3891(SAV), 3851(NYC), 3850(OAK), 3887(HOU), 3758(CHARLESTON)")
+    st.info("✏️ 操作說明：請將滑鼠移到表格最右側「輸入港口代碼」的空白處【連點兩下】，即可直接打字輸入！\n\n支援代碼: 581(PSW), 3890(PNW), 584(ORF), 3891(SAV), 3851(NYC), 3850(OAK), 3887(HOU), 3758(CHARLESTON)")
     
     edited_po_info = st.data_editor(
         po_info.reset_index(drop=True),
@@ -86,11 +90,15 @@ if po_raw_file and prod_file and po_list_file:
 
                 # --- 合併港口並建立樞紐 ---
                 edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).map(PORT_MAP).fillna(edited_po_info['輸入港口代碼 (如:581)'])
+                
+                # 若未輸入代碼，顯示未指定
+                edited_po_info['PORT_NAME'] = edited_po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
+
                 po_raw_merged = po_raw.merge(edited_po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
                 
-                po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('Unknown')
-                po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('Unknown Date')
-                po_raw_merged['PORT_NAME'] = po_raw_merged['PORT_NAME'].fillna('Unknown Port')
+                po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('標籤遺失')
+                po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('日期遺失')
+                po_raw_merged['PORT_NAME'] = po_raw_merged['PORT_NAME'].fillna('未指定港口')
                 
                 pivot_df = po_raw_merged.pivot_table(
                     index='DPCI_MERGE', 
@@ -101,40 +109,57 @@ if po_raw_file and prod_file and po_list_file:
                 
                 pivot_df[('PO TOTAL', '', '', '')] = pivot_df.sum(axis=1)
                 
-                # --- 準備左側靜態產品資料 ---
+                # --- 準備左側靜態產品資料 (加入 Factory Name) ---
                 prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
-                left_columns = ['DPCI', 'Manufacturer Style # *', 'Product Description', 'Barcode', 'Primary Raw Material Type', 'Import Vendor Name', 'Inner Pack Unit Quantity', 'Case Unit Quantity']
+                # 💡 在這裡加入了 'Factory Name' 欄位
+                left_columns = ['DPCI', 'Manufacturer Style # *', 'Product Description', 'Barcode', 'Primary Raw Material Type', 'Import Vendor Name', 'Factory Name', 'Inner Pack Unit Quantity', 'Case Unit Quantity']
                 
+                # 確認 Factory Name 欄位存在，若無則建立空白欄位
+                if 'Factory Name' not in prod_data.columns:
+                    prod_data['Factory Name'] = '未提供工廠名稱'
+                    
                 left_data = prod_data[left_columns + ['DPCI_MERGE']].drop_duplicates(subset=['DPCI_MERGE']).set_index('DPCI_MERGE')
                 left_data.columns = pd.MultiIndex.from_tuples([(col, '', '', '') for col in left_data.columns])
                 
                 final_df = left_data.join(pivot_df, how='inner')
 
-                # --- 拆檔與寫入 ZIP ---
+                # --- 拆檔與寫入 ZIP (外層 Vendor，內層 Tab 工廠) ---
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                     
                     vendor_col = ('Import Vendor Name', '', '', '')
-                    grouped = final_df.groupby(vendor_col)
+                    factory_col = ('Factory Name', '', '', '')
                     
-                    for vendor_name, group_data in grouped:
+                    final_df[vendor_col] = final_df[vendor_col].fillna('未指定供應商')
+                    final_df[factory_col] = final_df[factory_col].fillna('未指定工廠')
+                    
+                    # 第一層：依照供應商 (Vendor) 拆分 Excel 檔案
+                    grouped_vendor = final_df.groupby(vendor_col)
+                    
+                    for vendor_name, vendor_data in grouped_vendor:
                         safe_vendor_name = str(vendor_name).replace('/', '_').replace('\\', '_')
-                        export_data = group_data.drop(columns=[vendor_col])
                         
                         excel_buffer = io.BytesIO()
                         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            # 重設 index 變回 0,1,2... 確保資料乾淨
-                            export_data_reset = export_data.reset_index(drop=True)
                             
-                            # 💡 破解限制：開啟 index=True 寫入
-                            export_data_reset.to_excel(writer, index=True, sheet_name='PO GRID')
+                            # 第二層：在同一個 Excel 檔案中，依照工廠 (Factory) 拆分 Tab 分頁
+                            grouped_factory = vendor_data.groupby(factory_col)
                             
-                            # 💡 破解限制：使用 openpyxl 強制把第一欄(自動產生的 index 欄) 刪除
-                            writer.sheets['PO GRID'].delete_cols(1)
+                            for factory_name, factory_data in grouped_factory:
+                                # Excel 的 Tab 名稱限制最多 31 個字元
+                                safe_factory_name = str(factory_name).replace('/', '_').replace('\\', '_')[:31] 
+                                
+                                # 匯出時隱藏作為分群依據的 Vendor 與 Factory 欄位，讓畫面更簡潔
+                                export_data = factory_data.drop(columns=[vendor_col, factory_col])
+                                export_data_reset = export_data.reset_index(drop=True)
+                                
+                                export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
+                                writer.sheets[safe_factory_name].delete_cols(1) # 刪除自動產生的 Index 欄位
                         
+                        # 將完成的 Excel 檔寫入 ZIP
                         zip_file.writestr(f"PO_GRID_{safe_vendor_name}.xlsx", excel_buffer.getvalue())
                 
-                st.success("✨ 處理完成！多層次表頭與港口資訊已成功寫入。")
+                st.success("✨ 處理完成！已成功修復對齊問題，並完成「依供應商建檔、依工廠分子頁」的排版。")
                 st.download_button(
                     label="📦 點擊下載全廠商 PO GRID (ZIP壓縮檔)",
                     data=zip_buffer.getvalue(),
