@@ -42,7 +42,7 @@ if po_raw_file and prod_file and po_list_file:
     po_list = pd.read_csv(po_list_file)
     po_raw = pd.read_csv(po_raw_file)
     
-    # 💡 強制將 PO NUMBER 轉為乾淨的文字格式，避免 Unknown 匹配失敗
+    # 強制將 PO NUMBER 轉為乾淨的文字格式
     po_list['PO NUMBER'] = po_list['PO NUMBER'].astype(str).str.split('.').str[0].str.strip()
     po_raw['PO NUMBER'] = po_raw['PO NUMBER'].astype(str).str.split('.').str[0].str.strip()
     
@@ -90,8 +90,6 @@ if po_raw_file and prod_file and po_list_file:
 
                 # --- 合併港口並建立樞紐 ---
                 edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).map(PORT_MAP).fillna(edited_po_info['輸入港口代碼 (如:581)'])
-                
-                # 若未輸入代碼，顯示未指定
                 edited_po_info['PORT_NAME'] = edited_po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
 
                 po_raw_merged = po_raw.merge(edited_po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
@@ -109,12 +107,10 @@ if po_raw_file and prod_file and po_list_file:
                 
                 pivot_df[('PO TOTAL', '', '', '')] = pivot_df.sum(axis=1)
                 
-                # --- 準備左側靜態產品資料 (加入 Factory Name) ---
+                # --- 準備左側靜態產品資料 ---
                 prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
-                # 💡 在這裡加入了 'Factory Name' 欄位
                 left_columns = ['DPCI', 'Manufacturer Style # *', 'Product Description', 'Barcode', 'Primary Raw Material Type', 'Import Vendor Name', 'Factory Name', 'Inner Pack Unit Quantity', 'Case Unit Quantity']
                 
-                # 確認 Factory Name 欄位存在，若無則建立空白欄位
                 if 'Factory Name' not in prod_data.columns:
                     prod_data['Factory Name'] = '未提供工廠名稱'
                     
@@ -123,7 +119,7 @@ if po_raw_file and prod_file and po_list_file:
                 
                 final_df = left_data.join(pivot_df, how='inner')
 
-                # --- 拆檔與寫入 ZIP (外層 Vendor，內層 Tab 工廠) ---
+                # --- 拆檔與寫入 ZIP (修改為：產出一份合併檔案，內部依 Factory 分 Tab) ---
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                     
@@ -133,35 +129,54 @@ if po_raw_file and prod_file and po_list_file:
                     final_df[vendor_col] = final_df[vendor_col].fillna('未指定供應商')
                     final_df[factory_col] = final_df[factory_col].fillna('未指定工廠')
                     
-                    # 第一層：依照供應商 (Vendor) 拆分 Excel 檔案
-                    grouped_vendor = final_df.groupby(vendor_col)
+                    excel_buffer = io.BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        
+                        # 直接依照工廠 (Factory Name) 拆分 Tab 分頁
+                        grouped_factory = final_df.groupby(factory_col)
+                        
+                        for factory_name, factory_data in grouped_factory:
+                            # 清理 Tab 名稱，移除 Excel 不允許的特殊字元
+                            safe_factory_name = str(factory_name).replace('/', '_').replace('\\', '_')
+                            safe_factory_name = safe_factory_name.replace('[', '').replace(']', '').replace('*', '').replace(':', '').replace('?', '')[:31]
+                            
+                            export_data = factory_data.drop(columns=[vendor_col, factory_col])
+                            
+                            # 💡 需求 2：自動過濾數量為 0 的 PO 欄位
+                            cols_to_keep = []
+                            for col in export_data.columns:
+                                # 判斷是否為 PO 欄位 (多層表頭的第2層有 PO Number)
+                                if col[1] != '': 
+                                    # 如果該 PO 在此工廠總數 > 0，則保留
+                                    if pd.to_numeric(export_data[col], errors='coerce').sum() > 0:
+                                        cols_to_keep.append(col)
+                                else:
+                                    # 左側靜態產品資料與 PO TOTAL 一定保留
+                                    cols_to_keep.append(col)
+                                    
+                            export_data = export_data[cols_to_keep]
+                            
+                            # 💡 需求 3：加上隱形空白，強迫每個 PO 單獨顯示 PURPOSE 標籤
+                            unmerged_columns = []
+                            for i, col in enumerate(export_data.columns):
+                                if col[1] != '': # 如果是 PO 欄位
+                                    new_purpose = str(col[0]) + (" " * i) # 加上等同於索引值的隱形空白
+                                    unmerged_columns.append((new_purpose, col[1], col[2], col[3]))
+                                else:
+                                    unmerged_columns.append(col)
+                                    
+                            export_data.columns = pd.MultiIndex.from_tuples(unmerged_columns)
+                            export_data_reset = export_data.reset_index(drop=True)
+                            
+                            export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
+                            writer.sheets[safe_factory_name].delete_cols(1) # 刪除自動產生的 Index 欄位
                     
-                    for vendor_name, vendor_data in grouped_vendor:
-                        safe_vendor_name = str(vendor_name).replace('/', '_').replace('\\', '_')
-                        
-                        excel_buffer = io.BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            
-                            # 第二層：在同一個 Excel 檔案中，依照工廠 (Factory) 拆分 Tab 分頁
-                            grouped_factory = vendor_data.groupby(factory_col)
-                            
-                            for factory_name, factory_data in grouped_factory:
-                                # Excel 的 Tab 名稱限制最多 31 個字元
-                                safe_factory_name = str(factory_name).replace('/', '_').replace('\\', '_')[:31] 
-                                
-                                # 匯出時隱藏作為分群依據的 Vendor 與 Factory 欄位，讓畫面更簡潔
-                                export_data = factory_data.drop(columns=[vendor_col, factory_col])
-                                export_data_reset = export_data.reset_index(drop=True)
-                                
-                                export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
-                                writer.sheets[safe_factory_name].delete_cols(1) # 刪除自動產生的 Index 欄位
-                        
-                        # 將完成的 Excel 檔寫入 ZIP
-                        zip_file.writestr(f"PO_GRID_{safe_vendor_name}.xlsx", excel_buffer.getvalue())
+                    # 💡 需求 1：將所有資料包裝成單一個 Excel 檔案
+                    zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
                 
-                st.success("✨ 處理完成！已成功修復對齊問題，並完成「依供應商建檔、依工廠分子頁」的排版。")
+                st.success("✨ 處理完成！已成功合併為單一檔案，並完成『過濾空數量 PO』與『顯示獨立標籤』設定。")
                 st.download_button(
-                    label="📦 點擊下載全廠商 PO GRID (ZIP壓縮檔)",
+                    label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
                     data=zip_buffer.getvalue(),
                     file_name="PO_GRIDs_Output.zip",
                     mime="application/zip"
