@@ -122,3 +122,36 @@ if po_raw_file and prod_file and po_list_file:
                 left_data.columns = pd.MultiIndex.from_tuples([(col, '', '', '') for col in left_data.columns])
                 
                 # 💡 修正點 3: 使用 join 完美合併兩張多層表頭的表格
+                final_df = left_data.join(pivot_df, how='inner')
+
+                # --- 拆檔與寫入 ZIP ---
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                    
+                    # 注意：廠商名稱現在也是一個 4 層的欄位 Tuple 了
+                    vendor_col = ('Import Vendor Name', '', '', '')
+                    grouped = final_df.groupby(vendor_col)
+                    
+                    for vendor_name, group_data in grouped:
+                        safe_vendor_name = str(vendor_name).replace('/', '_').replace('\\', '_')
+                        
+                        # 刪除廠商欄位輔助欄
+                        export_data = group_data.drop(columns=[vendor_col])
+                        
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            # 輸出時 index=False，完美產出四層表頭
+                            export_data.to_excel(writer, index=False, sheet_name='PO GRID')
+                        
+                        zip_file.writestr(f"PO_GRID_{safe_vendor_name}.xlsx", excel_buffer.getvalue())
+                
+                st.success("✨ 處理完成！多層次表頭與港口資訊已成功寫入。")
+                st.download_button(
+                    label="📦 點擊下載全廠商 PO GRID (ZIP壓縮檔)",
+                    data=zip_buffer.getvalue(),
+                    file_name="PO_GRIDs_Output.zip",
+                    mime="application/zip"
+                )
+                
+            except Exception as e:
+                st.error(f"❌ 處理過程中發生錯誤: {e}")
