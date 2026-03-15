@@ -376,7 +376,7 @@ if po_raw_file and prod_file and po_list_file:
                     
                     zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
                 
-                st.success("✨ 處理完成！已成功將母 DPCI 的產品描述欄位 (D欄) 留白！")
+                st.success("✨ 處理完成！")
                 st.download_button(
                     label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
                     data=zip_buffer.getvalue(),
