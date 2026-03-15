@@ -2,11 +2,6 @@ import streamlit as st
 import pandas as pd
 import io
 import zipfile
-import re
-import copy
-import openpyxl
-from openpyxl.drawing.image import Image as OpenpyxlImage
-from openpyxl.utils import get_column_letter
 
 # 港口代碼對照表
 PORT_MAP = {
@@ -25,22 +20,20 @@ st.set_page_config(page_title="PO GRID 自動生成系統", layout="wide")
 st.title("🎃 季節性 PO GRID 自動生成器")
 
 st.markdown("""
-請依序上傳 **PO RAW DATA**、**PO List (訂單清單)**、**產品資料(PCN)**，以及 **Program Sheet (圖庫來源)**。
-上傳後，請在下方的表格中輸入對應的「目的地港口代碼」(如 581, 3891 等)，系統將自動生成多層表頭與含圖片的報表。
+請依序上傳 **PO RAW DATA**、**PO List (訂單清單)** 與 **產品資料(PCN)**。
+上傳後，請在下方的表格中輸入對應的「目的地港口代碼」(如 581, 3891 等)，系統將自動生成多層表頭。
 """)
 
 # ==========================================
-# 1. 檔案上傳區 (新增第4個 Program Sheet 區塊)
+# 1. 檔案上傳區
 # ==========================================
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3 = st.columns(3)
 with col1:
     po_raw_file = st.file_uploader("📁 1. PO RAW DATA (CSV)", type=['csv'])
 with col2:
-    po_list_file = st.file_uploader("📁 2. List of PO (CSV)", type=['csv'])
+    po_list_file = st.file_uploader("📁 2. List of Purchase Orders (CSV)", type=['csv'])
 with col3:
-    prod_file = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'])
-with col4:
-    program_sheet_file = st.file_uploader("📁 4. Program Sheet (含圖片之Excel)", type=['xlsx'])
+    prod_file = st.file_uploader("📁 3. 產品資料(PCN) (Excel/CSV)", type=['xlsx', 'csv'])
 
 # ==========================================
 # 2. 讀取並顯示「港口輸入互動表」
@@ -63,7 +56,7 @@ if po_raw_file and prod_file and po_list_file:
     po_info['輸入港口代碼 (如:581)'] = ""
     
     st.divider()
-    st.subheader("📍 步驟 5: 請為以下 PO 分配目的地港口代碼")
+    st.subheader("📍 步驟 4: 請為以下 PO 分配目的地港口代碼")
     st.info("✏️ 操作說明：請將滑鼠移到表格最右側「輸入港口代碼」的空白處【連點兩下】，即可直接打字輸入！\n\n支援代碼: 581(PSW), 3890(PNW), 584(ORF), 3891(SAV), 3851(NYC), 3850(OAK), 3887(HOU), 3758(CHARLESTON)")
     
     edited_po_info = st.data_editor(
@@ -74,48 +67,12 @@ if po_raw_file and prod_file and po_list_file:
     )
     
     # ==========================================
-    # 3. 執行產出按鈕與核心處理邏輯
+    # 3. 執行產出按鈕
     # ==========================================
     st.divider()
     if st.button("🚀 開始自動生成 PO GRID", type="primary"):
-        with st.spinner("資料處理與圖片擷取中，請稍候... (若圖片較多可能需要數十秒)"):
+        with st.spinner("資料處理中，請稍候..."):
             try:
-                # --- 圖片擷取邏輯 (Program Sheet) ---
-                image_dict = {}
-                if program_sheet_file:
-                    wb_source = openpyxl.load_workbook(program_sheet_file, data_only=True)
-                    dpci_pattern = re.compile(r'\d{3}-\d{2}-\d{4}')
-                    
-                    for sheet_name in wb_source.sheetnames:
-                        ws_source = wb_source[sheet_name]
-                        # 遍歷分頁中所有的浮動圖片
-                        for img in ws_source._images:
-                            # 取得圖片錨定位置 (openpyxl _from 是 0-indexed，我們轉為 1-indexed)
-                            anchor_row = img.anchor._from.row + 1
-                            anchor_col = img.anchor._from.col + 1
-                            
-                            # 在圖片周圍 (上2列~下15列，左2欄~右8欄) 尋找 DPCI 號碼
-                            start_r = max(1, anchor_row - 2)
-                            end_r = anchor_row + 15
-                            start_c = max(1, anchor_col - 2)
-                            end_c = anchor_col + 8
-                            
-                            found_dpci = None
-                            for r in range(start_r, end_r):
-                                for c in range(start_c, end_c):
-                                    cell_val = ws_source.cell(row=r, column=c).value
-                                    if cell_val and isinstance(cell_val, str):
-                                        match = dpci_pattern.search(cell_val)
-                                        if match:
-                                            found_dpci = match.group(0)
-                                            break
-                                if found_dpci: break
-                                
-                            # 如果找到 DPCI，將圖片存入字典中對應備用
-                            if found_dpci:
-                                image_dict[found_dpci] = img
-
-                # --- 讀取靜態產品資料 ---
                 if prod_file.name.endswith('.csv'):
                     prod_data = pd.read_csv(prod_file)
                 else:
@@ -241,7 +198,7 @@ if po_raw_file and prod_file and po_list_file:
                     prod_data['Barcode'] = prod_data['Barcode'].apply(format_upc)
                 else: prod_data['Barcode'] = ''
 
-                # 💡 將母 DPCI 建立並寫入左側資料庫
+                # 💡 將母 DPCI 建立並寫入左側資料庫 (同步 Factory ID 以確保 Maker 顯示正確)
                 for parent_dpci, info in parent_info_dict.items():
                     vendor_name, factory_name, factory_id = '', '', ''
                     
@@ -260,7 +217,7 @@ if po_raw_file and prod_file and po_list_file:
                             prod_data.at[i, 'DPCI'] = parent_dpci 
                             prod_data.at[i, 'Manufacturer Style # *'] = info['style']
                             prod_data.at[i, 'Barcode'] = format_upc(info['upc'])
-                            prod_data.at[i, 'Product Description'] = '' 
+                            prod_data.at[i, 'Product Description'] = '' # 💡 強制清空母 DPCI 的產品描述
                             if vendor_name: prod_data.at[i, 'Import Vendor Name'] = vendor_name
                             if factory_name: prod_data.at[i, 'Factory Name'] = factory_name
                             if pd.notna(factory_id): prod_data.at[i, 'Factory ID'] = factory_id
@@ -270,7 +227,7 @@ if po_raw_file and prod_file and po_list_file:
                         new_row['DPCI_MERGE'] = parent_dpci
                         new_row['Manufacturer Style # *'] = info['style']
                         new_row['Barcode'] = format_upc(info['upc'])
-                        new_row['Product Description'] = '' 
+                        new_row['Product Description'] = '' # 💡 強制清空母 DPCI 的產品描述
                         new_row['Import Vendor Name'] = vendor_name
                         new_row['Factory Name'] = factory_name
                         if pd.notna(factory_id): new_row['Factory ID'] = factory_id
@@ -332,6 +289,9 @@ if po_raw_file and prod_file and po_list_file:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                     
+                    vendor_col = ('', 'Import Vendor Name', '', '', '')
+                    factory_col = ('', 'Factory Name', '', '', '')
+                    
                     actual_vendor_col = [c for c in final_df.columns if c[1] == 'Import Vendor Name'][0]
                     actual_factory_col = [c for c in final_df.columns if c[1] == 'Factory Name'][0]
                     
@@ -375,17 +335,21 @@ if po_raw_file and prod_file and po_list_file:
                             
                             for p_dpci in parent_dpci_list:
                                 if p_dpci in available_dpcis:
+                                    # 寫入母 DPCI 行
                                     ordered_dfs.append(export_data.loc[[p_dpci]])
                                     added_dpcis.add(p_dpci)
                                     
+                                    # 寫入所有的子 ITEM 行
                                     for c_dpci in parent_to_children.get(p_dpci, set()):
                                         if c_dpci in available_dpcis:
                                             ordered_dfs.append(export_data.loc[[c_dpci]])
                                             added_dpcis.add(c_dpci)
                                             
+                                    # 💡 插入完全空白的分隔列 (無 PO TOTAL)
                                     blank = pd.DataFrame([[''] * len(export_data.columns)], columns=export_data.columns, index=[f'BLANK_{p_dpci}'])
                                     ordered_dfs.append(blank)
                             
+                            # 補上其他的非混裝商品
                             regular_dpcis = [d for d in available_dpcis if d not in added_dpcis]
                             if regular_dpcis:
                                 ordered_dfs.append(export_data.loc[regular_dpcis])
@@ -408,40 +372,11 @@ if po_raw_file and prod_file and po_list_file:
                             export_data_reset = export_data.reset_index(drop=True)
                             
                             export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
-                            
-                            ws = writer.sheets[safe_factory_name]
-                            ws.delete_cols(1) # 刪除 Pandas index 欄位
-                            
-                            # --- 執行圖片貼上與儲存格排版 ---
-                            if program_sheet_file and image_dict:
-                                # 尋找 DPCI 與 IMAGE 欄位的 Index
-                                dpci_col_idx = None
-                                img_col_idx = None
-                                for idx, col in enumerate(export_data_reset.columns):
-                                    if col[1] == 'DPCI': dpci_col_idx = idx + 1
-                                    if col[1] == 'IMAGE': img_col_idx = idx + 1
-                                
-                                if dpci_col_idx and img_col_idx:
-                                    img_col_letter = get_column_letter(img_col_idx)
-                                    ws.column_dimensions[img_col_letter].width = 13 # 撐開圖片欄寬
-                                    
-                                    # 因為前5列是表頭，資料從第6列開始
-                                    for r_idx in range(6, ws.max_row + 1):
-                                        cell_dpci_val = ws.cell(row=r_idx, column=dpci_col_idx).value
-                                        
-                                        if cell_dpci_val in image_dict:
-                                            # 複製圖片物件避免重複參照錯誤，並設定大小
-                                            img_obj = copy.copy(image_dict[cell_dpci_val])
-                                            img_obj.width = 90
-                                            img_obj.height = 90
-                                            
-                                            # 貼上圖片並撐開該列的列高
-                                            ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
-                                            ws.row_dimensions[r_idx].height = 70 
+                            writer.sheets[safe_factory_name].delete_cols(1) 
                     
                     zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
                 
-                st.success("✨ 處理完成！已為您自動填入商品圖片與排版。")
+                st.success("✨ 處理完成！")
                 st.download_button(
                     label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
                     data=zip_buffer.getvalue(),
