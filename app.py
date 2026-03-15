@@ -286,4 +286,103 @@ if po_raw_file and prod_file and po_list_file:
 
                 # --- 拆檔與寫入 ZIP ---
                 zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False)
+                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                    
+                    vendor_col = ('', 'Import Vendor Name', '', '', '')
+                    factory_col = ('', 'Factory Name', '', '', '')
+                    
+                    # 修正此處，尋找正確的供應商與工廠欄位名稱 (帶有隱形空白)
+                    actual_vendor_col = [c for c in final_df.columns if c[1] == 'Import Vendor Name'][0]
+                    actual_factory_col = [c for c in final_df.columns if c[1] == 'Factory Name'][0]
+                    
+                    final_df[actual_vendor_col] = final_df[actual_vendor_col].replace('', '未指定供應商')
+                    final_df[actual_factory_col] = final_df[actual_factory_col].replace('', '未指定工廠')
+                    
+                    excel_buffer = io.BytesIO()
+                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                        
+                        grouped_factory = final_df.groupby(actual_factory_col)
+                        
+                        for factory_name, factory_data in grouped_factory:
+                            safe_factory_name = str(factory_name).replace('/', '_').replace('\\', '_')
+                            safe_factory_name = safe_factory_name.replace('[', '').replace(']', '').replace('*', '').replace(':', '').replace('?', '')[:31]
+                            
+                            export_data = factory_data.drop(columns=[actual_vendor_col, actual_factory_col])
+                            
+                            # 過濾無數量欄位
+                            cols_to_keep = []
+                            for col in export_data.columns:
+                                if col[2] != '': 
+                                    keep = False
+                                    for val in export_data[col]:
+                                        if isinstance(val, (int, float)) and val > 0:
+                                            keep = True
+                                            break
+                                        elif isinstance(val, str) and val not in ('', '0', '0.0'):
+                                            keep = True
+                                            break
+                                    if keep:
+                                        cols_to_keep.append(col)
+                                else:
+                                    cols_to_keep.append(col)
+                                    
+                            export_data = export_data[cols_to_keep]
+                            
+                            # 💡 版面重排序邏輯：母項 -> 子項 -> 空白列 -> 其他
+                            available_dpcis = export_data.index.tolist()
+                            ordered_dfs = []
+                            added_dpcis = set()
+                            
+                            for p_dpci in parent_dpci_list:
+                                if p_dpci in available_dpcis:
+                                    # 寫入母 DPCI 行
+                                    ordered_dfs.append(export_data.loc[[p_dpci]])
+                                    added_dpcis.add(p_dpci)
+                                    
+                                    # 寫入所有的子 ITEM 行
+                                    for c_dpci in parent_to_children.get(p_dpci, set()):
+                                        if c_dpci in available_dpcis:
+                                            ordered_dfs.append(export_data.loc[[c_dpci]])
+                                            added_dpcis.add(c_dpci)
+                                            
+                                    # 💡 插入完全空白的分隔列 (無 PO TOTAL)
+                                    blank = pd.DataFrame([[''] * len(export_data.columns)], columns=export_data.columns, index=[f'BLANK_{p_dpci}'])
+                                    ordered_dfs.append(blank)
+                            
+                            # 補上其他的非混裝商品
+                            regular_dpcis = [d for d in available_dpcis if d not in added_dpcis]
+                            if regular_dpcis:
+                                ordered_dfs.append(export_data.loc[regular_dpcis])
+                                
+                            if ordered_dfs:
+                                export_data = pd.concat(ordered_dfs)
+                            
+                            # 強迫每個 PO 擁有獨立 PURPOSE 標籤
+                            unmerged_columns = []
+                            po_idx = 0
+                            for col in export_data.columns:
+                                if col[2] != '': 
+                                    new_purpose = str(col[0]) + (" " * po_idx) 
+                                    unmerged_columns.append((new_purpose, col[1], col[2], col[3], col[4]))
+                                    po_idx += 1
+                                else:
+                                    unmerged_columns.append(col)
+                                    
+                            export_data.columns = pd.MultiIndex.from_tuples(unmerged_columns)
+                            export_data_reset = export_data.reset_index(drop=True)
+                            
+                            export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
+                            writer.sheets[safe_factory_name].delete_cols(1) 
+                    
+                    zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
+                
+                st.success("✨ 處理完成！已成功取消標題合併、恢復第一筆 PURPOSE、同步 Maker 且完美隱藏所有不必要的 0 值！")
+                st.download_button(
+                    label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
+                    data=zip_buffer.getvalue(),
+                    file_name="PO_GRIDs_Output.zip",
+                    mime="application/zip"
+                )
+                
+            except Exception as e:
+                st.error(f"❌ 處理過程中發生錯誤: {e}")
