@@ -94,15 +94,22 @@ if po_raw_file and prod_file and po_list_file:
                     try: qty = float(str(row['TOTAL ITEM QTY']).replace(',', ''))
                     except: qty = 0.0
                         
+                    # 💡 修正點 1: 使用 .startswith() 來無視多餘空白與後綴字元
                     desc = str(row['ITEM DESCRIPTION']).strip().upper()
                     po_num = row['PO NUMBER']
                     
-                    if desc == 'ASSORTMENT':
+                    if desc.startswith('ASSORTMENT'):
                         # 處理母 DPCI
                         parent_dpci_list.add(dpci)
+                        
+                        # 💡 修正點 2: 自動為母 DPCI 的 Style 加上 "ASSORTMENT-" 前綴
+                        style_val = str(row['VENDOR STYLE']).strip() if pd.notna(row['VENDOR STYLE']) else ''
+                        if style_val and not style_val.upper().startswith('ASSORT'):
+                            style_val = f"ASSORTMENT-{style_val}"
+                            
                         parent_info_dict[dpci] = {
-                            'style': str(row['VENDOR STYLE']) if pd.notna(row['VENDOR STYLE']) else '',
-                            'upc': str(row['ITEM BAR CODE']) if pd.notna(row['ITEM BAR CODE']) else ''
+                            'style': style_val,
+                            'upc': str(row['ITEM BAR CODE']).strip() if pd.notna(row['ITEM BAR CODE']) else ''
                         }
                         
                         po_processed_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': dpci, 'QTY': qty, 'IS_PARENT': True})
@@ -128,7 +135,7 @@ if po_raw_file and prod_file and po_list_file:
                         po_processed_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': dpci, 'QTY': qty, 'IS_PARENT': False})
 
                 po_processed = pd.DataFrame(po_processed_records)
-                # 去除母商品多餘的重複行 (因為多個子 ITEM 會重複產出同一個母 DPCI 的同一筆 PO 行)
+                # 去除母商品多餘的重複行
                 parents = po_processed[po_processed['IS_PARENT']].drop_duplicates(subset=['PO NUMBER', 'DPCI_MERGE'])
                 children_and_regular = po_processed[~po_processed['IS_PARENT']]
                 po_processed_unique = pd.concat([parents, children_and_regular], ignore_index=True)
@@ -159,7 +166,7 @@ if po_raw_file and prod_file and po_list_file:
                 # 💡 加入 PO TOTAL 計算
                 pivot_df[('', 'PO TOTAL', '', '', '')] = pivot_df.sum(axis=1)
                 
-                # 💡 替換母 DPCI PO 的數值為文字 ("母DPCI")
+                # 💡 替換母 DPCI PO 的數值為文字 ("母DPCI" 實際號碼)
                 for parent_dpci in parent_dpci_list:
                     if parent_dpci in pivot_df.index:
                         for col in pivot_df.columns:
