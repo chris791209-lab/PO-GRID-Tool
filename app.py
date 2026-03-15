@@ -176,7 +176,7 @@ if po_raw_file and prod_file and po_list_file:
                                 if isinstance(val, (int, float)) and val > 0:
                                     pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val)})"
                                     
-                # 💡 將樞紐分析表中所有的 0 與 0.0 替換為空白 (不顯示 0，如 M7/N7/O7 等)
+                # 💡 將樞紐分析表中所有的 0 與 0.0 替換為空白 (不顯示 0)
                 pivot_df = pivot_df.replace({0: '', 0.0: ''})
 
                 # --- 準備左側靜態產品資料 ---
@@ -214,19 +214,20 @@ if po_raw_file and prod_file and po_list_file:
                     if parent_dpci in prod_data['DPCI_MERGE'].values:
                         idx = prod_data.index[prod_data['DPCI_MERGE'] == parent_dpci].tolist()
                         for i in idx:
-                            prod_data.at[i, 'DPCI'] = parent_dpci # 顯示實際母號碼
+                            prod_data.at[i, 'DPCI'] = parent_dpci 
                             prod_data.at[i, 'Manufacturer Style # *'] = info['style']
                             prod_data.at[i, 'Barcode'] = format_upc(info['upc'])
+                            prod_data.at[i, 'Product Description'] = '' # 💡 強制清空母 DPCI 的產品描述
                             if vendor_name: prod_data.at[i, 'Import Vendor Name'] = vendor_name
                             if factory_name: prod_data.at[i, 'Factory Name'] = factory_name
                             if pd.notna(factory_id): prod_data.at[i, 'Factory ID'] = factory_id
                     else:
                         new_row = {col: '' for col in prod_data.columns}
-                        new_row['DPCI'] = parent_dpci # 顯示實際母號碼
+                        new_row['DPCI'] = parent_dpci 
                         new_row['DPCI_MERGE'] = parent_dpci
                         new_row['Manufacturer Style # *'] = info['style']
                         new_row['Barcode'] = format_upc(info['upc'])
-                        new_row['Product Description'] = 'ASSORTMENT'
+                        new_row['Product Description'] = '' # 💡 強制清空母 DPCI 的產品描述
                         new_row['Import Vendor Name'] = vendor_name
                         new_row['Factory Name'] = factory_name
                         if pd.notna(factory_id): new_row['Factory ID'] = factory_id
@@ -291,7 +292,6 @@ if po_raw_file and prod_file and po_list_file:
                     vendor_col = ('', 'Import Vendor Name', '', '', '')
                     factory_col = ('', 'Factory Name', '', '', '')
                     
-                    # 修正此處，尋找正確的供應商與工廠欄位名稱 (帶有隱形空白)
                     actual_vendor_col = [c for c in final_df.columns if c[1] == 'Import Vendor Name'][0]
                     actual_factory_col = [c for c in final_df.columns if c[1] == 'Factory Name'][0]
                     
@@ -376,7 +376,7 @@ if po_raw_file and prod_file and po_list_file:
                     
                     zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
                 
-                st.success("✨ 處理完成！已成功取消標題合併、恢復第一筆 PURPOSE、同步 Maker 且完美隱藏所有不必要的 0 值！")
+                st.success("✨ 處理完成！已成功將母 DPCI 的產品描述欄位 (D欄) 留白！")
                 st.download_button(
                     label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
                     data=zip_buffer.getvalue(),
