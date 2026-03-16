@@ -6,6 +6,7 @@ import os
 import re
 import copy
 import openpyxl
+import xml.etree.ElementTree as ET
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
 
@@ -20,6 +21,17 @@ PORT_MAP = {
     '3887': 'HOU',
     '3758': 'CHARLESTON'
 }
+
+# --- 底層 ZIP 路徑解析輔助函數 ---
+def resolve_zip_path(base_dir, relative_path):
+    if relative_path.startswith('/'): return relative_path[1:]
+    parts = [p for p in base_dir.split('/') if p]
+    for part in relative_path.split('/'):
+        if part == '..':
+            if parts: parts.pop()
+        elif part and part != '.':
+            parts.append(part)
+    return '/'.join(parts)
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
@@ -88,9 +100,7 @@ with tab1:
                                     continue
                                 if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg')):
                                     base_name = os.path.basename(file_info.filename)
-                                    # 如果有 _2 這種多圖後綴，依然以 DPCI 作為 key 的基礎
                                     dpci_name = os.path.splitext(base_name)[0].strip()
-                                    # 在此系統中，我們優先取第一張圖來放進報表
                                     clean_dpci = dpci_name.split('_')[0] 
                                     if clean_dpci not in image_dict:
                                         image_dict[clean_dpci] = z.read(file_info.filename)
@@ -348,7 +358,6 @@ with tab1:
                                 ws = writer.sheets[safe_factory_name]
                                 ws.delete_cols(1) 
                                 
-                                # 💡 執行 100% 精準對位的圖片貼上邏輯
                                 if image_zip_file and image_dict:
                                     dpci_col_idx = None
                                     img_col_idx = None
@@ -385,91 +394,166 @@ with tab1:
                     st.error(f"❌ 處理過程中發生錯誤: {e}")
 
 # ==========================================
-# 分頁二：Program Sheet 圖片自動萃取與命名工具
+# 分頁二：Program Sheet 圖片自動萃取與命名工具 (究極 XML 暴力破解版)
 # ==========================================
 with tab2:
     st.markdown("""
-    ### 🪄 圖片自動命名法寶
-    這個工具能幫你「解剖」工廠提供的 Program Sheet，自動把裡面的圖片抓出來，並**智慧對位附近的 DPCI 號碼重新命名**。
-    你只需要把產出的 ZIP 檔，拿到【分頁一】上傳即可！
+    ### 🪄 圖片自動命名法寶 (底層暴力破解版)
+    此工具繞過了一般程式對群組化圖片的盲區，直接潛入 Excel 底層檔案架構中，將 **100% 所有的商品圖片** 硬抓出來，並智慧對位 DPCI 重新命名！
     """)
     
     ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx)", type=['xlsx'], key="ps_uploader")
     
     if ps_file and st.button("🪄 開始自動萃取並命名圖片", type="primary"):
-        with st.spinner("🕵️‍♂️ 正在掃描 Excel 並自動比對 DPCI，請稍候... (圖片越多耗時越長)"):
+        with st.spinner("🕵️‍♂️ 正在深入 Excel 底層架構暴力抓取圖片..."):
             try:
+                # ---------------------------------------------------------
+                # 1. 為了取得 DPCI 的文字座標，我們依然用 openpyxl 掃一次文字
+                # ---------------------------------------------------------
+                ps_file.seek(0)
                 wb_source = openpyxl.load_workbook(ps_file, data_only=True)
                 dpci_pattern = re.compile(r'\d{3}-\d{2}-\d{4}')
                 
+                # 儲存每個分頁的 DPCI 位置
+                dpci_locations_by_sheet = {}
+                for sheet_name in wb_source.sheetnames:
+                    ws_source = wb_source[sheet_name]
+                    dpci_locations_by_sheet[sheet_name] = []
+                    for r in range(1, ws_source.max_row + 1):
+                        for c in range(1, ws_source.max_column + 1):
+                            cell_val = ws_source.cell(row=r, column=c).value
+                            if cell_val and isinstance(cell_val, str):
+                                match = dpci_pattern.search(cell_val)
+                                if match:
+                                    dpci_locations_by_sheet[sheet_name].append({
+                                        'dpci': match.group(0),
+                                        'row': r,
+                                        'col': c
+                                    })
+                
+                # ---------------------------------------------------------
+                # 2. XML 暴力破解：直接把 .xlsx 當作 ZIP 解壓縮提取所有媒體
+                # ---------------------------------------------------------
+                ps_file.seek(0)
+                images_info = []
+                
+                with zipfile.ZipFile(ps_file, 'r') as z:
+                    namelist = z.namelist()
+                    # 抓出所有隱藏在媒體庫的實體圖片檔案
+                    media_files = {n: z.read(n) for n in namelist if n.startswith('xl/media/')}
+                    
+                    # 分析 XML 關聯表，把 圖片 -> 座標 -> 分頁 串起來
+                    wb_rels = {}
+                    if 'xl/_rels/workbook.xml.rels' in namelist:
+                        root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+                        for rel in root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                            wb_rels[rel.attrib['Id']] = rel.attrib['Target']
+                            
+                    sheet_name_to_path = {}
+                    if 'xl/workbook.xml' in namelist:
+                        root = ET.fromstring(z.read('xl/workbook.xml'))
+                        for sheet in root.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet'):
+                            rId = sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                            name = sheet.attrib.get('name')
+                            if rId and rId in wb_rels:
+                                target = wb_rels[rId]
+                                sheet_name_to_path[name] = resolve_zip_path('xl', target)
+
+                    for sheet_name, sheet_path in sheet_name_to_path.items():
+                        if sheet_path not in namelist: continue
+                        sheet_xml = ET.fromstring(z.read(sheet_path))
+                        drawing = sheet_xml.find('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}drawing')
+                        if drawing is None: continue
+                        draw_rId = drawing.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+
+                        sheet_rels_path = resolve_zip_path(os.path.dirname(sheet_path), '_rels/' + os.path.basename(sheet_path) + '.rels')
+                        drawing_path = None
+                        if sheet_rels_path in namelist:
+                            rels_root = ET.fromstring(z.read(sheet_rels_path))
+                            for rel in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                                if rel.attrib['Id'] == draw_rId:
+                                    drawing_path = resolve_zip_path(os.path.dirname(sheet_path), rel.attrib['Target'])
+                                    break
+
+                        if not drawing_path or drawing_path not in namelist: continue
+
+                        drawing_rels_path = resolve_zip_path(os.path.dirname(drawing_path), '_rels/' + os.path.basename(drawing_path) + '.rels')
+                        draw_rels = {}
+                        if drawing_rels_path in namelist:
+                            d_rels_root = ET.fromstring(z.read(drawing_rels_path))
+                            for rel in d_rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                                draw_rels[rel.attrib['Id']] = rel.attrib['Target']
+
+                        draw_root = ET.fromstring(z.read(drawing_path))
+                        ns_xdr = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
+                        ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                        ns_r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+                        for anchor in draw_root:
+                            if 'Anchor' not in anchor.tag: continue
+                            
+                            row, col = 0, 0
+                            from_marker = anchor.find(f'.//{{{ns_xdr}}}from')
+                            if from_marker is not None:
+                                col_elem = from_marker.find(f'{{{ns_xdr}}}col')
+                                row_elem = from_marker.find(f'{{{ns_xdr}}}row')
+                                if col_elem is not None: col = int(col_elem.text) + 1
+                                if row_elem is not None: row = int(row_elem.text) + 1
+
+                            blip = anchor.find(f'.//{{{ns_a}}}blip')
+                            if blip is not None:
+                                embed_id = blip.attrib.get(f'{{{ns_r}}}embed')
+                                if embed_id and embed_id in draw_rels:
+                                    media_target = draw_rels[embed_id]
+                                    media_path = resolve_zip_path(os.path.dirname(drawing_path), media_target)
+                                    if media_path in media_files:
+                                        ext = media_path.split('.')[-1]
+                                        if ext.lower() not in ['png', 'jpg', 'jpeg']: ext = 'png'
+                                        images_info.append({
+                                            'sheet': sheet_name,
+                                            'row': row,
+                                            'col': col,
+                                            'bytes': media_files[media_path],
+                                            'ext': ext
+                                        })
+
+                # ---------------------------------------------------------
+                # 3. 執行智慧綁定與打包 ZIP
+                # ---------------------------------------------------------
                 zip_buffer_images = io.BytesIO()
                 extracted_count = 0
-                extracted_dpcis_count = {} # 紀錄每個 DPCI 抓了幾張圖，防止覆蓋
+                extracted_dpcis_count = {}
                 
                 with zipfile.ZipFile(zip_buffer_images, "a", zipfile.ZIP_DEFLATED, False) as zip_file_img:
-                    for sheet_name in wb_source.sheetnames:
-                        ws_source = wb_source[sheet_name]
+                    for img in images_info:
+                        sheet_name = img['sheet']
+                        anchor_row = img['row']
+                        anchor_col = img['col']
                         
-                        # 💡 升級步驟 1：先找出這個分頁裡「所有」的 DPCI 及其精確座標
-                        dpci_locations = []
-                        for r in range(1, ws_source.max_row + 1):
-                            for c in range(1, ws_source.max_column + 1):
-                                cell_val = ws_source.cell(row=r, column=c).value
-                                if cell_val and isinstance(cell_val, str):
-                                    match = dpci_pattern.search(cell_val)
-                                    if match:
-                                        dpci_locations.append({
-                                            'dpci': match.group(0),
-                                            'row': r,
-                                            'col': c
-                                        })
+                        closest_dpci = None
+                        min_dist = float('inf')
                         
-                        # 💡 升級步驟 2：遍歷所有圖片，並透過「最短距離」找到對應的 DPCI
-                        for img in ws_source._images:
-                            try:
-                                anchor_row = img.anchor._from.row + 1
-                                anchor_col = img.anchor._from.col + 1
-                            except AttributeError:
-                                continue # 若為無法取得錨點的特殊圖形則跳過
-                                
-                            closest_dpci = None
-                            min_dist = float('inf')
-                            
-                            for loc in dpci_locations:
-                                # 計算曼哈頓距離 (行距 + 列距)
+                        # 找出該分頁中距離這張圖片最近的 DPCI
+                        if sheet_name in dpci_locations_by_sheet:
+                            for loc in dpci_locations_by_sheet[sheet_name]:
                                 dist = abs(loc['row'] - anchor_row) + abs(loc['col'] - anchor_col)
-                                # 限定最大距離 (距離超過 30 格就不算是這個產品的圖)
+                                # 允許搜尋的範圍擴大，只要在同一個產品區塊內 (30格內)
                                 if dist < min_dist and dist < 30:
                                     min_dist = dist
                                     closest_dpci = loc['dpci']
-                            
-                            if closest_dpci:
-                                # 取得圖片二進位資料
-                                try:
-                                    if hasattr(img.ref, 'getvalue'):
-                                        img_bytes = img.ref.getvalue()
-                                    else:
-                                        img.ref.seek(0)
-                                        img_bytes = img.ref.read()
-                                except:
-                                    img_bytes = img._data() if hasattr(img, '_data') else None
+                        
+                        if closest_dpci:
+                            extracted_dpcis_count[closest_dpci] = extracted_dpcis_count.get(closest_dpci, 0) + 1
+                            if extracted_dpcis_count[closest_dpci] == 1:
+                                file_name = f"{closest_dpci}.{img['ext']}"
+                            else:
+                                file_name = f"{closest_dpci}_{extracted_dpcis_count[closest_dpci]}.{img['ext']}"
                                 
-                                if img_bytes:
-                                    img_format = getattr(img, 'format', 'png').lower()
-                                    if img_format not in ['png', 'jpg', 'jpeg']: img_format = 'png'
-                                    
-                                    # 💡 升級步驟 3：防重複機制 (同一 DPCI 有多張圖時，命名為 _2, _3...)
-                                    extracted_dpcis_count[closest_dpci] = extracted_dpcis_count.get(closest_dpci, 0) + 1
-                                    if extracted_dpcis_count[closest_dpci] == 1:
-                                        file_name = f"{closest_dpci}.{img_format}"
-                                    else:
-                                        file_name = f"{closest_dpci}_{extracted_dpcis_count[closest_dpci]}.{img_format}"
-                                        
-                                    zip_file_img.writestr(file_name, img_bytes)
-                                    extracted_count += 1
+                            zip_file_img.writestr(file_name, img['bytes'])
+                            extracted_count += 1
                                     
                 if extracted_count > 0:
-                    st.success(f"✅ 大功告成！成功萃取並命名了 **{extracted_count}** 張商品圖片！")
+                    st.success(f"✅ 大功告成！透過底層解析，成功萃取並命名了 **{extracted_count}** 張商品圖片！\n(已為您破解原有的群組化/格式限制)")
                     st.download_button(
                         label="📦 點擊下載自動命名圖片包 (ZIP)",
                         data=zip_buffer_images.getvalue(),
@@ -477,7 +561,7 @@ with tab2:
                         mime="application/zip"
                     )
                 else:
-                    st.warning("⚠️ 系統沒有在檔案中找到任何與 DPCI 綁定的圖片，請確認 Excel 格式或是否有實體圖片。")
+                    st.warning("⚠️ 檔案底層真的找不到任何符合條件的圖片，請確認 Excel 檔案中是否含有實體插入的圖片。")
                     
             except Exception as e:
                 st.error(f"❌ 萃取過程中發生錯誤: {e}")
