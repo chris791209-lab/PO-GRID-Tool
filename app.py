@@ -88,8 +88,12 @@ with tab1:
                                     continue
                                 if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg')):
                                     base_name = os.path.basename(file_info.filename)
+                                    # 如果有 _2 這種多圖後綴，依然以 DPCI 作為 key 的基礎
                                     dpci_name = os.path.splitext(base_name)[0].strip()
-                                    image_dict[dpci_name] = z.read(file_info.filename)
+                                    # 在此系統中，我們優先取第一張圖來放進報表
+                                    clean_dpci = dpci_name.split('_')[0] 
+                                    if clean_dpci not in image_dict:
+                                        image_dict[clean_dpci] = z.read(file_info.filename)
 
                     # 讀取產品資料
                     if prod_file.name.endswith('.csv'):
@@ -393,41 +397,53 @@ with tab2:
     ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx)", type=['xlsx'], key="ps_uploader")
     
     if ps_file and st.button("🪄 開始自動萃取並命名圖片", type="primary"):
-        with st.spinner("🕵️‍♂️ 正在掃描 Excel 並自動比對 DPCI，請稍候..."):
+        with st.spinner("🕵️‍♂️ 正在掃描 Excel 並自動比對 DPCI，請稍候... (圖片越多耗時越長)"):
             try:
                 wb_source = openpyxl.load_workbook(ps_file, data_only=True)
                 dpci_pattern = re.compile(r'\d{3}-\d{2}-\d{4}')
                 
                 zip_buffer_images = io.BytesIO()
                 extracted_count = 0
-                extracted_dpcis = set()
+                extracted_dpcis_count = {} # 紀錄每個 DPCI 抓了幾張圖，防止覆蓋
                 
                 with zipfile.ZipFile(zip_buffer_images, "a", zipfile.ZIP_DEFLATED, False) as zip_file_img:
                     for sheet_name in wb_source.sheetnames:
                         ws_source = wb_source[sheet_name]
                         
+                        # 💡 升級步驟 1：先找出這個分頁裡「所有」的 DPCI 及其精確座標
+                        dpci_locations = []
+                        for r in range(1, ws_source.max_row + 1):
+                            for c in range(1, ws_source.max_column + 1):
+                                cell_val = ws_source.cell(row=r, column=c).value
+                                if cell_val and isinstance(cell_val, str):
+                                    match = dpci_pattern.search(cell_val)
+                                    if match:
+                                        dpci_locations.append({
+                                            'dpci': match.group(0),
+                                            'row': r,
+                                            'col': c
+                                        })
+                        
+                        # 💡 升級步驟 2：遍歷所有圖片，並透過「最短距離」找到對應的 DPCI
                         for img in ws_source._images:
-                            anchor_row = img.anchor._from.row + 1
-                            anchor_col = img.anchor._from.col + 1
-                            
-                            # 在圖片周圍尋找 DPCI (上2列~下15列，左2欄~右8欄)
-                            start_r = max(1, anchor_row - 2)
-                            end_r = anchor_row + 15
-                            start_c = max(1, anchor_col - 2)
-                            end_c = anchor_col + 8
-                            
-                            found_dpci = None
-                            for r in range(start_r, end_r):
-                                for c in range(start_c, end_c):
-                                    cell_val = ws_source.cell(row=r, column=c).value
-                                    if cell_val and isinstance(cell_val, str):
-                                        match = dpci_pattern.search(cell_val)
-                                        if match:
-                                            found_dpci = match.group(0)
-                                            break
-                                if found_dpci: break
+                            try:
+                                anchor_row = img.anchor._from.row + 1
+                                anchor_col = img.anchor._from.col + 1
+                            except AttributeError:
+                                continue # 若為無法取得錨點的特殊圖形則跳過
                                 
-                            if found_dpci and found_dpci not in extracted_dpcis:
+                            closest_dpci = None
+                            min_dist = float('inf')
+                            
+                            for loc in dpci_locations:
+                                # 計算曼哈頓距離 (行距 + 列距)
+                                dist = abs(loc['row'] - anchor_row) + abs(loc['col'] - anchor_col)
+                                # 限定最大距離 (距離超過 30 格就不算是這個產品的圖)
+                                if dist < min_dist and dist < 30:
+                                    min_dist = dist
+                                    closest_dpci = loc['dpci']
+                            
+                            if closest_dpci:
                                 # 取得圖片二進位資料
                                 try:
                                     if hasattr(img.ref, 'getvalue'):
@@ -440,12 +456,16 @@ with tab2:
                                 
                                 if img_bytes:
                                     img_format = getattr(img, 'format', 'png').lower()
-                                    # 防呆副檔名
                                     if img_format not in ['png', 'jpg', 'jpeg']: img_format = 'png'
                                     
-                                    file_name = f"{found_dpci}.{img_format}"
+                                    # 💡 升級步驟 3：防重複機制 (同一 DPCI 有多張圖時，命名為 _2, _3...)
+                                    extracted_dpcis_count[closest_dpci] = extracted_dpcis_count.get(closest_dpci, 0) + 1
+                                    if extracted_dpcis_count[closest_dpci] == 1:
+                                        file_name = f"{closest_dpci}.{img_format}"
+                                    else:
+                                        file_name = f"{closest_dpci}_{extracted_dpcis_count[closest_dpci]}.{img_format}"
+                                        
                                     zip_file_img.writestr(file_name, img_bytes)
-                                    extracted_dpcis.add(found_dpci)
                                     extracted_count += 1
                                     
                 if extracted_count > 0:
