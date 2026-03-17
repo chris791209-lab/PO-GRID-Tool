@@ -98,14 +98,13 @@ with tab1:
                             for file_info in z.infolist():
                                 if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'):
                                     continue
-                                if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                                if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
                                     base_name = os.path.basename(file_info.filename)
                                     dpci_name = os.path.splitext(base_name)[0].strip()
                                     clean_dpci = dpci_name.split('_')[0] 
                                     if clean_dpci not in image_dict:
                                         image_dict[clean_dpci] = z.read(file_info.filename)
 
-                    # 讀取產品資料
                     if prod_file.name.endswith('.csv'):
                         prod_data = pd.read_csv(prod_file)
                     else:
@@ -394,27 +393,25 @@ with tab1:
                     st.error(f"❌ 處理過程中發生錯誤: {e}")
 
 # ==========================================
-# 分頁二：Program Sheet 圖片自動萃取與命名工具 (究極 XML 暴力破解版)
+# 分頁二：Program Sheet 圖片自動萃取與命名工具 (全面無視命名空間版)
 # ==========================================
 with tab2:
     st.markdown("""
-    ### 🪄 圖片自動命名法寶 (底層暴力破解版)
-    此工具繞過了一般程式對群組化圖片的盲區，直接潛入 Excel 底層檔案架構中，將 **100% 所有的商品圖片** 硬抓出來，並智慧對位 DPCI 重新命名！
+    ### 🪄 圖片自動命名法寶 (無差別抓取版)
+    此工具繞過了一般程式對「圖片群組化」的盲區，直接潛入 Excel 底層，將 **100% 所有的實體圖片** 硬抓出來。
+    如有無法自動比對 DPCI 的游離圖片，系統也會自動命名為 `Unmatched_Image_X` 確保一併匯出給你！
     """)
     
     ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx)", type=['xlsx'], key="ps_uploader")
     
     if ps_file and st.button("🪄 開始自動萃取並命名圖片", type="primary"):
-        with st.spinner("🕵️‍♂️ 正在深入 Excel 底層架構暴力抓取圖片..."):
+        with st.spinner("🕵️‍♂️ 正在深入 Excel 底層架構暴力抓取所有圖片..."):
             try:
-                # ---------------------------------------------------------
-                # 1. 為了取得 DPCI 的文字座標，我們依然用 openpyxl 掃一次文字
-                # ---------------------------------------------------------
+                # 1. 抓取所有 DPCI 的文字座標
                 ps_file.seek(0)
                 wb_source = openpyxl.load_workbook(ps_file, data_only=True)
                 dpci_pattern = re.compile(r'\d{3}-\d{2}-\d{4}')
                 
-                # 儲存每個分頁的 DPCI 位置
                 dpci_locations_by_sheet = {}
                 for sheet_name in wb_source.sheetnames:
                     ws_source = wb_source[sheet_name]
@@ -431,117 +428,121 @@ with tab2:
                                         'col': c
                                     })
                 
-                # ---------------------------------------------------------
-                # 2. XML 暴力破解：直接把 .xlsx 當作 ZIP 解壓縮提取所有媒體
-                # ---------------------------------------------------------
+                # 2. ZIP 暴力拆解：尋找所有圖片連結並萃取
                 ps_file.seek(0)
                 images_info = []
                 
                 with zipfile.ZipFile(ps_file, 'r') as z:
                     namelist = z.namelist()
-                    # 抓出所有隱藏在媒體庫的實體圖片檔案
+                    # 抓出隱藏在 xl/media/ 裡的所有實體圖
                     media_files = {n: z.read(n) for n in namelist if n.startswith('xl/media/')}
                     
-                    # 分析 XML 關聯表，把 圖片 -> 座標 -> 分頁 串起來
+                    # 建立檔案關聯表
                     wb_rels = {}
                     if 'xl/_rels/workbook.xml.rels' in namelist:
                         root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
-                        for rel in root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
-                            wb_rels[rel.attrib['Id']] = rel.attrib['Target']
+                        for rel in root.iter():
+                            if rel.tag.endswith('}Relationship'):
+                                wb_rels[rel.attrib.get('Id')] = rel.attrib.get('Target')
                             
                     sheet_name_to_path = {}
                     if 'xl/workbook.xml' in namelist:
                         root = ET.fromstring(z.read('xl/workbook.xml'))
-                        for sheet in root.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet'):
-                            rId = sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
-                            name = sheet.attrib.get('name')
-                            if rId and rId in wb_rels:
-                                target = wb_rels[rId]
-                                sheet_name_to_path[name] = resolve_zip_path('xl', target)
+                        for sheet in root.iter():
+                            if sheet.tag.endswith('}sheet'):
+                                rId = sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                                name = sheet.attrib.get('name')
+                                if rId and rId in wb_rels:
+                                    sheet_name_to_path[name] = resolve_zip_path('xl', wb_rels[rId])
 
+                    # 逐一掃描每個分頁底層的 Drawing.xml
                     for sheet_name, sheet_path in sheet_name_to_path.items():
                         if sheet_path not in namelist: continue
                         sheet_xml = ET.fromstring(z.read(sheet_path))
-                        drawing = sheet_xml.find('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}drawing')
-                        if drawing is None: continue
-                        draw_rId = drawing.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                        
+                        for drawing in sheet_xml.iter():
+                            if drawing.tag.endswith('}drawing'):
+                                draw_rId = drawing.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                                if not draw_rId: continue
+                                
+                                sheet_rels_path = resolve_zip_path(os.path.dirname(sheet_path), '_rels/' + os.path.basename(sheet_path) + '.rels')
+                                drawing_path = None
+                                if sheet_rels_path in namelist:
+                                    rels_root = ET.fromstring(z.read(sheet_rels_path))
+                                    for rel in rels_root.iter():
+                                        if rel.tag.endswith('}Relationship') and rel.attrib.get('Id') == draw_rId:
+                                            drawing_path = resolve_zip_path(os.path.dirname(sheet_path), rel.attrib.get('Target'))
+                                            break
+                                            
+                                if not drawing_path or drawing_path not in namelist: continue
+                                
+                                drawing_rels_path = resolve_zip_path(os.path.dirname(drawing_path), '_rels/' + os.path.basename(drawing_path) + '.rels')
+                                draw_rels = {}
+                                if drawing_rels_path in namelist:
+                                    d_rels_root = ET.fromstring(z.read(drawing_rels_path))
+                                    for rel in d_rels_root.iter():
+                                        if rel.tag.endswith('}Relationship'):
+                                            draw_rels[rel.attrib.get('Id')] = rel.attrib.get('Target')
+                                            
+                                draw_root = ET.fromstring(z.read(drawing_path))
+                                
+                                # 無差別迭代：只要是錨點就開始挖
+                                for anchor in draw_root:
+                                    if 'Anchor' not in anchor.tag: continue
+                                    
+                                    row, col = 0, 0
+                                    for from_marker in anchor.iter():
+                                        if from_marker.tag.endswith('}from'):
+                                            for child in from_marker.iter():
+                                                if child.tag.endswith('}col'):
+                                                    col = int(child.text) + 1 if child.text else 0
+                                                elif child.tag.endswith('}row'):
+                                                    row = int(child.text) + 1 if child.text else 0
+                                            break
+                                    
+                                    # 破解圖片群組化：把該錨點裡面的『所有圖片』都一次抓出來
+                                    for elem in anchor.iter():
+                                        if elem.tag.endswith('}blip'):
+                                            embed_id = elem.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                                            if embed_id and embed_id in draw_rels:
+                                                media_target = draw_rels[embed_id]
+                                                media_path = resolve_zip_path(os.path.dirname(drawing_path), media_target)
+                                                if media_path in media_files:
+                                                    ext = media_path.split('.')[-1]
+                                                    images_info.append({
+                                                        'sheet': sheet_name,
+                                                        'row': row,
+                                                        'col': col,
+                                                        'media_path': media_path,
+                                                        'bytes': media_files[media_path],
+                                                        'ext': ext
+                                                    })
 
-                        sheet_rels_path = resolve_zip_path(os.path.dirname(sheet_path), '_rels/' + os.path.basename(sheet_path) + '.rels')
-                        drawing_path = None
-                        if sheet_rels_path in namelist:
-                            rels_root = ET.fromstring(z.read(sheet_rels_path))
-                            for rel in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
-                                if rel.attrib['Id'] == draw_rId:
-                                    drawing_path = resolve_zip_path(os.path.dirname(sheet_path), rel.attrib['Target'])
-                                    break
-
-                        if not drawing_path or drawing_path not in namelist: continue
-
-                        drawing_rels_path = resolve_zip_path(os.path.dirname(drawing_path), '_rels/' + os.path.basename(drawing_path) + '.rels')
-                        draw_rels = {}
-                        if drawing_rels_path in namelist:
-                            d_rels_root = ET.fromstring(z.read(drawing_rels_path))
-                            for rel in d_rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
-                                draw_rels[rel.attrib['Id']] = rel.attrib['Target']
-
-                        draw_root = ET.fromstring(z.read(drawing_path))
-                        ns_xdr = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
-                        ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
-                        ns_r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-
-                        for anchor in draw_root:
-                            if 'Anchor' not in anchor.tag: continue
-                            
-                            row, col = 0, 0
-                            from_marker = anchor.find(f'.//{{{ns_xdr}}}from')
-                            if from_marker is not None:
-                                col_elem = from_marker.find(f'{{{ns_xdr}}}col')
-                                row_elem = from_marker.find(f'{{{ns_xdr}}}row')
-                                if col_elem is not None: col = int(col_elem.text) + 1
-                                if row_elem is not None: row = int(row_elem.text) + 1
-
-                            blip = anchor.find(f'.//{{{ns_a}}}blip')
-                            if blip is not None:
-                                embed_id = blip.attrib.get(f'{{{ns_r}}}embed')
-                                if embed_id and embed_id in draw_rels:
-                                    media_target = draw_rels[embed_id]
-                                    media_path = resolve_zip_path(os.path.dirname(drawing_path), media_target)
-                                    if media_path in media_files:
-                                        ext = media_path.split('.')[-1]
-                                        if ext.lower() not in ['png', 'jpg', 'jpeg']: ext = 'png'
-                                        images_info.append({
-                                            'sheet': sheet_name,
-                                            'row': row,
-                                            'col': col,
-                                            'bytes': media_files[media_path],
-                                            'ext': ext
-                                        })
-
-                # ---------------------------------------------------------
-                # 3. 執行智慧綁定與打包 ZIP
-                # ---------------------------------------------------------
+                # 3. 智慧對位與 Zip 打包
                 zip_buffer_images = io.BytesIO()
                 extracted_count = 0
                 extracted_dpcis_count = {}
+                matched_media = set() # 用來記錄哪些圖已經成功配對
                 
                 with zipfile.ZipFile(zip_buffer_images, "a", zipfile.ZIP_DEFLATED, False) as zip_file_img:
                     for img in images_info:
                         sheet_name = img['sheet']
                         anchor_row = img['row']
                         anchor_col = img['col']
+                        media_path = img['media_path']
                         
                         closest_dpci = None
                         min_dist = float('inf')
                         
-                        # 找出該分頁中距離這張圖片最近的 DPCI
-                        if sheet_name in dpci_locations_by_sheet:
+                        # 如果找得到座標，才進行 DPCI 距離比對 (範圍放寬到 40 格內)
+                        if anchor_row > 0 and anchor_col > 0 and sheet_name in dpci_locations_by_sheet:
                             for loc in dpci_locations_by_sheet[sheet_name]:
                                 dist = abs(loc['row'] - anchor_row) + abs(loc['col'] - anchor_col)
-                                # 允許搜尋的範圍擴大，只要在同一個產品區塊內 (30格內)
-                                if dist < min_dist and dist < 30:
+                                if dist < min_dist and dist < 40:
                                     min_dist = dist
                                     closest_dpci = loc['dpci']
                         
+                        # 成功配對的寫入
                         if closest_dpci:
                             extracted_dpcis_count[closest_dpci] = extracted_dpcis_count.get(closest_dpci, 0) + 1
                             if extracted_dpcis_count[closest_dpci] == 1:
@@ -551,17 +552,30 @@ with tab2:
                                 
                             zip_file_img.writestr(file_name, img['bytes'])
                             extracted_count += 1
+                            matched_media.add(media_path)
+                            
+                    # 🛡️ 終極防漏抓：把無法配對的「剩餘圖片」全部吐出來
+                    unmatched_count = 0
+                    for p, b in media_files.items():
+                        if p not in matched_media and p.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                            unmatched_count += 1
+                            ext = p.split('.')[-1]
+                            zip_file_img.writestr(f"Unmatched_Image_{unmatched_count}.{ext}", b)
                                     
-                if extracted_count > 0:
-                    st.success(f"✅ 大功告成！透過底層解析，成功萃取並命名了 **{extracted_count}** 張商品圖片！\n(已為您破解原有的群組化/格式限制)")
+                if extracted_count > 0 or unmatched_count > 0:
+                    msg = f"✅ 大功告成！成功自動命名 **{extracted_count}** 張商品圖片！"
+                    if unmatched_count > 0:
+                        msg += f"\n⚠️ 另外發現 **{unmatched_count}** 張因格式或距離太遠無法對位的圖片，已命名為 `Unmatched_Image` 一併匯出給您檢查。"
+                    st.success(msg)
+                    
                     st.download_button(
-                        label="📦 點擊下載自動命名圖片包 (ZIP)",
+                        label="📦 點擊下載完整圖片包 (ZIP)",
                         data=zip_buffer_images.getvalue(),
                         file_name="Auto_Extracted_Images.zip",
                         mime="application/zip"
                     )
                 else:
-                    st.warning("⚠️ 檔案底層真的找不到任何符合條件的圖片，請確認 Excel 檔案中是否含有實體插入的圖片。")
+                    st.warning("⚠️ 檔案底層完全找不到任何圖片，請確認 Excel 檔案中是否含有實體插入的圖片。")
                     
             except Exception as e:
-                st.error(f"❌ 萃取過程中發生錯誤: {e}")
+                st.error(f"❌ 萃取過程中發生底層錯誤: {e}")
