@@ -35,7 +35,7 @@ def resolve_zip_path(base_dir, relative_path):
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-st.title("🎯 Target 季節性專案自動化系統")
+st.title("🎯 D240 PO GRID 自動化系統")
 
 # 建立雙分頁 UI
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
