@@ -41,15 +41,14 @@ st.title("🎯 Target 季節性專案自動化系統")
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
 
 # ==========================================
-# 分頁一：PO GRID 自動生成器 (加入港口自動辨識)
+# 分頁一：PO GRID 自動生成器
 # ==========================================
 with tab1:
     st.markdown("""
     請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
-    💡 **進階技巧**：若上傳 `documentDownloads (EDI總表)`，系統將為您自動解析並填入所有港口代碼！
+    💡 **進階技巧**：若上傳 `港口對照表 (TXT/CSV)`，系統將為您自動解析並填入所有港口代碼！
     """)
 
-    # 將上傳區塊改為 5 欄，新增選傳的 EDI 總表
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         po_raw_file = st.file_uploader("📁 1. PO RAW DATA", type=['csv'])
@@ -58,9 +57,9 @@ with tab1:
     with col3:
         prod_file = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'])
     with col4:
-        image_zip_file = st.file_uploader("📁 4. 產品圖片包 (ZIP)", type=['zip'])
+        image_zip_file = st.file_uploader("📁 4. 產品圖片包(ZIP)", type=['zip'])
     with col5:
-        edi_file = st.file_uploader("📁 5. EDI 總表 (選傳)\n自動帶入港口", type=['csv'])
+        port_mapping_file = st.file_uploader("📁 5. 港口對照表\n(TXT 或 CSV 皆可)", type=['csv', 'txt'])
 
     if po_raw_file and prod_file and po_list_file:
         po_list = pd.read_csv(po_list_file)
@@ -77,34 +76,84 @@ with tab1:
         active_pos = po_raw['PO NUMBER'].unique()
         po_info = po_info[po_info['PO NUMBER'].isin(active_pos)].copy()
         
-        # --- 💡 全新功能：自動從 EDI 總表解析港口代碼 ---
+        # 💡 將原始資料的 PO 洗乾淨 (去空白、去前導 0) 確保能 100% 成功配對
+        po_info['PO_CLEAN'] = po_info['PO NUMBER'].astype(str).str.strip().str.lstrip('0')
+        
+        # --- 💡 全新功能：支援 TXT 萬用格式與英數字混合港口 ---
         auto_port_dict = {}
-        if edi_file:
+        if port_mapping_file:
             try:
-                edi_df = pd.read_csv(edi_file, low_memory=False)
-                if 'PO Number' in edi_df.columns:
-                    for val in edi_df['PO Number'].dropna().unique():
-                        parts = str(val).split('-')
-                        if len(parts) >= 3:
-                            po_part = parts[1].strip()
-                            # 移除前面的 0 (例如 0581 轉為 581)
-                            port_part = parts[2].strip().lstrip('0') 
+                # 若為純文字檔 (TXT)
+                if port_mapping_file.name.lower().endswith('.txt'):
+                    content = port_mapping_file.getvalue().decode("utf-8").splitlines()
+                    for line in content:
+                        line = line.strip()
+                        if not line: continue
+                        
+                        # 1. 優先判斷是否為 EDI 格式 (如 0240-8779244-P5)
+                        match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
+                        if match:
+                            po_part = str(match.group(1)).strip().lstrip('0') # 去除前導0
+                            port_part = str(match.group(2)).strip().lstrip('0').upper()
                             auto_port_dict[po_part] = port_part
+                            continue
+                            
+                        # 2. 當作自訂格式 (如 "8779244 P5" 或 "PO:8779244, Port:P5")
+                        clean_line = re.sub(r'(?i)(po|port|no|num|number|code|港口|代碼|代號|:|：)', ' ', line)
+                        tokens = [t.strip() for t in re.split(r'[\s,;\t]+', clean_line) if t.strip()]
+                        
+                        if len(tokens) >= 2:
+                            po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
+                            if po_candidates:
+                                po_part = str(po_candidates[0]).strip().lstrip('0')
+                                port_candidates = [t for t in tokens if t != po_candidates[0]]
+                                if port_candidates:
+                                    port_part = str(port_candidates[0]).strip().lstrip('0').upper()
+                                    auto_port_dict[po_part] = port_part
+                            else:
+                                po_part = str(tokens[0]).strip().lstrip('0')
+                                port_part = str(tokens[1]).strip().lstrip('0').upper()
+                                auto_port_dict[po_part] = port_part
+
+                # 若為龐大的 EDI CSV 檔或雙欄自製 CSV
+                elif port_mapping_file.name.lower().endswith('.csv'):
+                    edi_df = pd.read_csv(port_mapping_file, low_memory=False, dtype=str)
+                    
+                    po_col_found = False
+                    if 'PO Number' in edi_df.columns:
+                        po_col_found = True
+                        for val in edi_df['PO Number'].dropna().unique():
+                            parts = str(val).split('-')
+                            if len(parts) >= 3:
+                                po_part = str(parts[1]).strip().lstrip('0')
+                                port_part = str(parts[2]).strip().lstrip('0').upper()
+                                auto_port_dict[po_part] = port_part
+                                
+                    # 如果不是 EDI 格式而是簡單兩欄 CSV
+                    if not po_col_found and len(edi_df.columns) >= 2:
+                        for _, row in edi_df.iterrows():
+                            if pd.notna(row.iloc[0]) and pd.notna(row.iloc[1]):
+                                po_part = str(row.iloc[0]).split('.')[0].strip().lstrip('0')
+                                port_part = str(row.iloc[1]).split('.')[0].strip().lstrip('0').upper()
+                                auto_port_dict[po_part] = port_part
+                                
             except Exception as e:
                 st.warning(f"自動讀取港口失敗，請手動輸入 ({e})")
         
-        # 將自動抓取到的港口對應進表格，若找不到則留空
-        po_info['輸入港口代碼 (如:581)'] = po_info['PO NUMBER'].map(auto_port_dict).fillna("")
+        # 利用洗乾淨的 PO_CLEAN 來映射字典，保證絕對抓得到！
+        po_info['輸入港口代碼 (如:581)'] = po_info['PO_CLEAN'].map(auto_port_dict).fillna("")
         
         st.divider()
         st.subheader("📍 步驟 6: 確認目的地港口代碼")
-        if edi_file and auto_port_dict:
-            st.success("🤖 系統已從 EDI 總表中自動為您萃取並填入港口代碼！請確認無誤後即可產出。")
+        if port_mapping_file and auto_port_dict:
+            st.success("🤖 系統已成功自動為您萃取並填入港口代碼！如果仍有空白，代表來源檔中缺少該 PO。")
         else:
             st.info("✏️ 操作說明：請將滑鼠移到表格最右側空白處【連點兩下】手動輸入港口代碼。")
         
+        # 顯示時將用不到的輔助欄位藏起來
+        display_cols = ["PO NUMBER", "PURPOSE", "SHIP_DATES", "輸入港口代碼 (如:581)"]
         edited_po_info = st.data_editor(
-            po_info.reset_index(drop=True),
+            po_info[display_cols].reset_index(drop=True),
             use_container_width=True,
             hide_index=True,
             disabled=["PO NUMBER", "PURPOSE", "SHIP_DATES"]
@@ -114,7 +163,6 @@ with tab1:
         if st.button("🚀 開始自動生成 PO GRID", type="primary"):
             with st.spinner("資料處理與圖片載入中，請稍候..."):
                 try:
-                    # 讀取 ZIP 圖片包
                     image_dict = {}
                     if image_zip_file:
                         with zipfile.ZipFile(image_zip_file, 'r') as z:
@@ -188,7 +236,8 @@ with tab1:
                     children_and_regular = po_processed[~po_processed['IS_PARENT']]
                     po_processed_unique = pd.concat([parents, children_and_regular], ignore_index=True)
 
-                    edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).map(PORT_MAP).fillna(edited_po_info['輸入港口代碼 (如:581)'])
+                    # 💡 若港口代碼不在 PORT_MAP 裡面 (例如 P5)，就會直接保留原文字 P5，不再顯示未指定港口！
+                    edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).str.strip().map(PORT_MAP).fillna(edited_po_info['輸入港口代碼 (如:581)'])
                     edited_po_info['PORT_NAME'] = edited_po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
 
                     po_raw_merged = po_processed_unique.merge(edited_po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
@@ -430,7 +479,6 @@ with tab2:
     if ps_file and st.button("🪄 開始自動萃取並命名圖片", type="primary"):
         with st.spinner("🕵️‍♂️ 正在深入 Excel 底層架構暴力抓取所有圖片..."):
             try:
-                # 1. 抓取所有 DPCI 的文字座標
                 ps_file.seek(0)
                 wb_source = openpyxl.load_workbook(ps_file, data_only=True)
                 dpci_pattern = re.compile(r'\d{3}-\d{2}-\d{4}')
@@ -451,16 +499,13 @@ with tab2:
                                         'col': c
                                     })
                 
-                # 2. ZIP 暴力拆解：尋找所有圖片連結並萃取
                 ps_file.seek(0)
                 images_info = []
                 
                 with zipfile.ZipFile(ps_file, 'r') as z:
                     namelist = z.namelist()
-                    # 抓出隱藏在 xl/media/ 裡的所有實體圖
                     media_files = {n: z.read(n) for n in namelist if n.startswith('xl/media/')}
                     
-                    # 建立檔案關聯表
                     wb_rels = {}
                     if 'xl/_rels/workbook.xml.rels' in namelist:
                         root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
@@ -478,7 +523,6 @@ with tab2:
                                 if rId and rId in wb_rels:
                                     sheet_name_to_path[name] = resolve_zip_path('xl', wb_rels[rId])
 
-                    # 逐一掃描每個分頁底層的 Drawing.xml
                     for sheet_name, sheet_path in sheet_name_to_path.items():
                         if sheet_path not in namelist: continue
                         sheet_xml = ET.fromstring(z.read(sheet_path))
@@ -509,7 +553,6 @@ with tab2:
                                             
                                 draw_root = ET.fromstring(z.read(drawing_path))
                                 
-                                # 無差別迭代：只要是錨點就開始挖
                                 for anchor in draw_root:
                                     if 'Anchor' not in anchor.tag: continue
                                     
@@ -523,7 +566,6 @@ with tab2:
                                                     row = int(child.text) + 1 if child.text else 0
                                             break
                                     
-                                    # 破解圖片群組化：把該錨點裡面的『所有圖片』都一次抓出來
                                     for elem in anchor.iter():
                                         if elem.tag.endswith('}blip'):
                                             embed_id = elem.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
@@ -541,11 +583,10 @@ with tab2:
                                                         'ext': ext
                                                     })
 
-                # 3. 智慧對位與 Zip 打包
                 zip_buffer_images = io.BytesIO()
                 extracted_count = 0
                 extracted_dpcis_count = {}
-                matched_media = set() # 用來記錄哪些圖已經成功配對
+                matched_media = set()
                 
                 with zipfile.ZipFile(zip_buffer_images, "a", zipfile.ZIP_DEFLATED, False) as zip_file_img:
                     for img in images_info:
@@ -557,7 +598,6 @@ with tab2:
                         closest_dpci = None
                         min_dist = float('inf')
                         
-                        # 如果找得到座標，才進行 DPCI 距離比對 (範圍放寬到 40 格內)
                         if anchor_row > 0 and anchor_col > 0 and sheet_name in dpci_locations_by_sheet:
                             for loc in dpci_locations_by_sheet[sheet_name]:
                                 dist = abs(loc['row'] - anchor_row) + abs(loc['col'] - anchor_col)
@@ -565,7 +605,6 @@ with tab2:
                                     min_dist = dist
                                     closest_dpci = loc['dpci']
                         
-                        # 成功配對的寫入
                         if closest_dpci:
                             extracted_dpcis_count[closest_dpci] = extracted_dpcis_count.get(closest_dpci, 0) + 1
                             if extracted_dpcis_count[closest_dpci] == 1:
@@ -577,7 +616,6 @@ with tab2:
                             extracted_count += 1
                             matched_media.add(media_path)
                             
-                    # 🛡️ 終極防漏抓：把無法配對的「剩餘圖片」全部吐出來
                     unmatched_count = 0
                     for p, b in media_files.items():
                         if p not in matched_media and p.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
