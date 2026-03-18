@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
 
-# 港口代碼對照表 (僅供介面提示參考)
+# 港口代碼對照表
 PORT_MAP = {
     '581': 'PSW',
     '3890': 'PNW',
@@ -35,7 +35,7 @@ def resolve_zip_path(base_dir, relative_path):
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-st.title("🎯 D240 PO GRID自動化系統")
+st.title("🎯 Target 季節性專案自動化系統")
 
 # 建立雙分頁 UI
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
@@ -45,21 +45,22 @@ tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖
 # ==========================================
 with tab1:
     st.markdown("""
-    請依序上傳 **PO DATA(GreenField ITEM DETAIL)**、**PO DATA(GreenField PO HEADER)**、**產品資料(PCN)** 與 **圖片包(命名為DPCI後的圖片打包為ZIP)**。
-    💡 港口代碼可上傳SPS匯出的csv自動更新(須注意不同Vendor#)
+    請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
+    💡 **進階技巧**：若上傳 `港口對照表 (TXT/CSV)`，系統將為您自動解析並填入所有港口代碼！(支援多檔上傳)
     """)
 
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        po_raw_file = st.file_uploader("📁 1. GF ITEM DETAIL", type=['csv'])
+        po_raw_file = st.file_uploader("📁 1. PO RAW DATA", type=['csv'])
     with col2:
-        po_list_file = st.file_uploader("📁 2. GF PO HEADER", type=['csv'])
+        po_list_file = st.file_uploader("📁 2. List of PO", type=['csv'])
     with col3:
         prod_file = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'])
     with col4:
-        image_zip_file = st.file_uploader("📁 4. 圖片包(ZIP)", type=['zip'])
+        image_zip_file = st.file_uploader("📁 4. 產品圖片包(ZIP)", type=['zip'])
     with col5:
-        port_mapping_file = st.file_uploader("📁 5. 港口對照表\n", type=['csv', 'txt'])
+        # 💡 加入 accept_multiple_files=True 支援多檔上傳
+        port_mapping_files = st.file_uploader("📁 5. 港口對照表\n(TXT/CSV 皆可, 可多選)", type=['csv', 'txt'], accept_multiple_files=True)
 
     if po_raw_file and prod_file and po_list_file:
         po_list = pd.read_csv(po_list_file)
@@ -78,68 +79,69 @@ with tab1:
         
         po_info['PO_CLEAN'] = po_info['PO NUMBER'].astype(str).str.strip().str.lstrip('0')
         
-        # --- 自動解析港口代碼 ---
+        # --- 💡 全新功能：支援多個 TXT/CSV 檔案合併解析 ---
         auto_port_dict = {}
-        if port_mapping_file:
-            try:
-                if port_mapping_file.name.lower().endswith('.txt'):
-                    content = port_mapping_file.getvalue().decode("utf-8").splitlines()
-                    for line in content:
-                        line = line.strip()
-                        if not line: continue
-                        
-                        match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
-                        if match:
-                            po_part = str(match.group(1)).strip().lstrip('0') 
-                            port_part = str(match.group(2)).strip().lstrip('0').upper()
-                            auto_port_dict[po_part] = port_part
-                            continue
+        if port_mapping_files:
+            for port_file in port_mapping_files:
+                try:
+                    if port_file.name.lower().endswith('.txt'):
+                        content = port_file.getvalue().decode("utf-8").splitlines()
+                        for line in content:
+                            line = line.strip()
+                            if not line: continue
                             
-                        clean_line = re.sub(r'(?i)(po|port|no|num|number|code|港口|代碼|代號|:|：)', ' ', line)
-                        tokens = [t.strip() for t in re.split(r'[\s,;\t]+', clean_line) if t.strip()]
-                        
-                        if len(tokens) >= 2:
-                            po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
-                            if po_candidates:
-                                po_part = str(po_candidates[0]).strip().lstrip('0')
-                                port_candidates = [t for t in tokens if t != po_candidates[0]]
-                                if port_candidates:
-                                    port_part = str(port_candidates[0]).strip().lstrip('0').upper()
+                            match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
+                            if match:
+                                po_part = str(match.group(1)).strip().lstrip('0') 
+                                port_part = str(match.group(2)).strip().lstrip('0').upper()
+                                auto_port_dict[po_part] = port_part
+                                continue
+                                
+                            clean_line = re.sub(r'(?i)(po|port|no|num|number|code|港口|代碼|代號|:|：)', ' ', line)
+                            tokens = [t.strip() for t in re.split(r'[\s,;\t]+', clean_line) if t.strip()]
+                            
+                            if len(tokens) >= 2:
+                                po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
+                                if po_candidates:
+                                    po_part = str(po_candidates[0]).strip().lstrip('0')
+                                    port_candidates = [t for t in tokens if t != po_candidates[0]]
+                                    if port_candidates:
+                                        port_part = str(port_candidates[0]).strip().lstrip('0').upper()
+                                        auto_port_dict[po_part] = port_part
+                                else:
+                                    po_part = str(tokens[0]).strip().lstrip('0')
+                                    port_part = str(tokens[1]).strip().lstrip('0').upper()
                                     auto_port_dict[po_part] = port_part
-                            else:
-                                po_part = str(tokens[0]).strip().lstrip('0')
-                                port_part = str(tokens[1]).strip().lstrip('0').upper()
-                                auto_port_dict[po_part] = port_part
 
-                elif port_mapping_file.name.lower().endswith('.csv'):
-                    edi_df = pd.read_csv(port_mapping_file, low_memory=False, dtype=str)
-                    
-                    po_col_found = False
-                    if 'PO Number' in edi_df.columns:
-                        po_col_found = True
-                        for val in edi_df['PO Number'].dropna().unique():
-                            parts = str(val).split('-')
-                            if len(parts) >= 3:
-                                po_part = str(parts[1]).strip().lstrip('0')
-                                port_part = str(parts[2]).strip().lstrip('0').upper()
-                                auto_port_dict[po_part] = port_part
-                                
-                    if not po_col_found and len(edi_df.columns) >= 2:
-                        for _, row in edi_df.iterrows():
-                            if pd.notna(row.iloc[0]) and pd.notna(row.iloc[1]):
-                                po_part = str(row.iloc[0]).split('.')[0].strip().lstrip('0')
-                                port_part = str(row.iloc[1]).split('.')[0].strip().lstrip('0').upper()
-                                auto_port_dict[po_part] = port_part
-                                
-            except Exception as e:
-                st.warning(f"自動讀取港口失敗，請手動輸入 ({e})")
+                    elif port_file.name.lower().endswith('.csv'):
+                        edi_df = pd.read_csv(port_file, low_memory=False, dtype=str)
+                        
+                        po_col_found = False
+                        if 'PO Number' in edi_df.columns:
+                            po_col_found = True
+                            for val in edi_df['PO Number'].dropna().unique():
+                                parts = str(val).split('-')
+                                if len(parts) >= 3:
+                                    po_part = str(parts[1]).strip().lstrip('0')
+                                    port_part = str(parts[2]).strip().lstrip('0').upper()
+                                    auto_port_dict[po_part] = port_part
+                                    
+                        if not po_col_found and len(edi_df.columns) >= 2:
+                            for _, row in edi_df.iterrows():
+                                if pd.notna(row.iloc[0]) and pd.notna(row.iloc[1]):
+                                    po_part = str(row.iloc[0]).split('.')[0].strip().lstrip('0')
+                                    port_part = str(row.iloc[1]).split('.')[0].strip().lstrip('0').upper()
+                                    auto_port_dict[po_part] = port_part
+                                    
+                except Exception as e:
+                    st.warning(f"檔案 {port_file.name} 讀取港口失敗 ({e})")
         
         po_info['輸入港口代碼 (如:581)'] = po_info['PO_CLEAN'].map(auto_port_dict).fillna("")
         
         st.divider()
         st.subheader("📍 步驟 6: 確認目的地港口代碼")
-        if port_mapping_file and auto_port_dict:
-            st.success("🤖 系統已成功自動為您萃取並填入港口代碼！如果仍有空白，代表來源檔中缺少該 PO。")
+        if port_mapping_files and auto_port_dict:
+            st.success("🤖 系統已成功自動為您萃取並合併填入港口代碼！如果仍有空白，代表來源檔中缺少該 PO。")
         else:
             st.info("✏️ 操作說明：請將滑鼠移到表格最右側空白處【連點兩下】手動輸入港口代碼。")
         
@@ -228,7 +230,6 @@ with tab1:
                     children_and_regular = po_processed[~po_processed['IS_PARENT']]
                     po_processed_unique = pd.concat([parents, children_and_regular], ignore_index=True)
 
-                    # 💡 【修改重點】：移除 .map(PORT_MAP) 邏輯，直接保留輸入的港口代碼 (如 581, P5)
                     edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).str.strip()
                     edited_po_info['PORT_NAME'] = edited_po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
 
@@ -461,8 +462,9 @@ with tab1:
 # ==========================================
 with tab2:
     st.markdown("""
-    ### 🪄 圖片自動命名
-    如有無法自動比對 DPCI 的游離圖片，系統也會自動命名為 `Unmatched_Image_X` 確保一併匯出！
+    ### 🪄 圖片自動命名法寶 (無差別抓取版)
+    此工具繞過了一般程式對「圖片群組化」的盲區，直接潛入 Excel 底層，將 **100% 所有的實體圖片** 硬抓出來。
+    如有無法自動比對 DPCI 的游離圖片，系統也會自動命名為 `Unmatched_Image_X` 確保一併匯出給你！
     """)
     
     ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx)", type=['xlsx'], key="ps_uploader")
