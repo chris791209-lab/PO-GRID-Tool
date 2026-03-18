@@ -59,7 +59,7 @@ with tab1:
     with col4:
         image_zip_file = st.file_uploader("📁 4. 產品圖片包(ZIP)", type=['zip'])
     with col5:
-        port_mapping_file = st.file_uploader("📁 5. 港口對照表\n(TXT 或 CSV 皆可)", type=['csv', 'txt'])
+        port_mapping_file = st.file_uploader("📁 5. 港口對照表\n(包含PO及港口代碼的TXT 或 CSV 皆可)", type=['csv', 'txt'])
 
     if po_raw_file and prod_file and po_list_file:
         po_list = pd.read_csv(po_list_file)
@@ -461,9 +461,8 @@ with tab1:
 # ==========================================
 with tab2:
     st.markdown("""
-    ### 🪄 圖片自動命名法寶 (無差別抓取版)
-    此工具繞過了一般程式對「圖片群組化」的盲區，直接潛入 Excel 底層，將 **100% 所有的實體圖片** 硬抓出來。
-    如有無法自動比對 DPCI 的游離圖片，系統也會自動命名為 `Unmatched_Image_X` 確保一併匯出給你！
+    ### 🪄 圖片自動命名
+    如有無法自動比對 DPCI 的游離圖片，系統也會自動命名為 `Unmatched_Image_X` 確保一併匯出！
     """)
     
     ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx)", type=['xlsx'], key="ps_uploader")
