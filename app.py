@@ -10,7 +10,7 @@ import xml.etree.ElementTree as ET
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
 
-# 港口代碼對照表
+# 港口代碼對照表 (僅供介面提示參考)
 PORT_MAP = {
     '581': 'PSW',
     '3890': 'PNW',
@@ -35,7 +35,7 @@ def resolve_zip_path(base_dir, relative_path):
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-st.title("🎯 Target 季節性專案自動化系統")
+st.title("🎯 D240 季節性專案自動化系統")
 
 # 建立雙分頁 UI
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
@@ -46,7 +46,7 @@ tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖
 with tab1:
     st.markdown("""
     請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
-    💡 **進階技巧**：若上傳 `港口對照表 (TXT/CSV)`，系統將為您自動解析並填入所有港口代碼！
+    💡 港口代碼可上傳SPS匯出的csv自動更新(須注意不同Vendor#)
     """)
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -76,29 +76,25 @@ with tab1:
         active_pos = po_raw['PO NUMBER'].unique()
         po_info = po_info[po_info['PO NUMBER'].isin(active_pos)].copy()
         
-        # 💡 將原始資料的 PO 洗乾淨 (去空白、去前導 0) 確保能 100% 成功配對
         po_info['PO_CLEAN'] = po_info['PO NUMBER'].astype(str).str.strip().str.lstrip('0')
         
-        # --- 💡 全新功能：支援 TXT 萬用格式與英數字混合港口 ---
+        # --- 自動解析港口代碼 ---
         auto_port_dict = {}
         if port_mapping_file:
             try:
-                # 若為純文字檔 (TXT)
                 if port_mapping_file.name.lower().endswith('.txt'):
                     content = port_mapping_file.getvalue().decode("utf-8").splitlines()
                     for line in content:
                         line = line.strip()
                         if not line: continue
                         
-                        # 1. 優先判斷是否為 EDI 格式 (如 0240-8779244-P5)
                         match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
                         if match:
-                            po_part = str(match.group(1)).strip().lstrip('0') # 去除前導0
+                            po_part = str(match.group(1)).strip().lstrip('0') 
                             port_part = str(match.group(2)).strip().lstrip('0').upper()
                             auto_port_dict[po_part] = port_part
                             continue
                             
-                        # 2. 當作自訂格式 (如 "8779244 P5" 或 "PO:8779244, Port:P5")
                         clean_line = re.sub(r'(?i)(po|port|no|num|number|code|港口|代碼|代號|:|：)', ' ', line)
                         tokens = [t.strip() for t in re.split(r'[\s,;\t]+', clean_line) if t.strip()]
                         
@@ -115,7 +111,6 @@ with tab1:
                                 port_part = str(tokens[1]).strip().lstrip('0').upper()
                                 auto_port_dict[po_part] = port_part
 
-                # 若為龐大的 EDI CSV 檔或雙欄自製 CSV
                 elif port_mapping_file.name.lower().endswith('.csv'):
                     edi_df = pd.read_csv(port_mapping_file, low_memory=False, dtype=str)
                     
@@ -129,7 +124,6 @@ with tab1:
                                 port_part = str(parts[2]).strip().lstrip('0').upper()
                                 auto_port_dict[po_part] = port_part
                                 
-                    # 如果不是 EDI 格式而是簡單兩欄 CSV
                     if not po_col_found and len(edi_df.columns) >= 2:
                         for _, row in edi_df.iterrows():
                             if pd.notna(row.iloc[0]) and pd.notna(row.iloc[1]):
@@ -140,7 +134,6 @@ with tab1:
             except Exception as e:
                 st.warning(f"自動讀取港口失敗，請手動輸入 ({e})")
         
-        # 利用洗乾淨的 PO_CLEAN 來映射字典，保證絕對抓得到！
         po_info['輸入港口代碼 (如:581)'] = po_info['PO_CLEAN'].map(auto_port_dict).fillna("")
         
         st.divider()
@@ -150,7 +143,6 @@ with tab1:
         else:
             st.info("✏️ 操作說明：請將滑鼠移到表格最右側空白處【連點兩下】手動輸入港口代碼。")
         
-        # 顯示時將用不到的輔助欄位藏起來
         display_cols = ["PO NUMBER", "PURPOSE", "SHIP_DATES", "輸入港口代碼 (如:581)"]
         edited_po_info = st.data_editor(
             po_info[display_cols].reset_index(drop=True),
@@ -236,8 +228,8 @@ with tab1:
                     children_and_regular = po_processed[~po_processed['IS_PARENT']]
                     po_processed_unique = pd.concat([parents, children_and_regular], ignore_index=True)
 
-                    # 💡 若港口代碼不在 PORT_MAP 裡面 (例如 P5)，就會直接保留原文字 P5，不再顯示未指定港口！
-                    edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).str.strip().map(PORT_MAP).fillna(edited_po_info['輸入港口代碼 (如:581)'])
+                    # 💡 【修改重點】：移除 .map(PORT_MAP) 邏輯，直接保留輸入的港口代碼 (如 581, P5)
+                    edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).str.strip()
                     edited_po_info['PORT_NAME'] = edited_po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
 
                     po_raw_merged = po_processed_unique.merge(edited_po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
