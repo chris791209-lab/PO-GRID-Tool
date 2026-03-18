@@ -57,7 +57,7 @@ with tab1:
     with col3:
         prod_file = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'])
     with col4:
-        image_zip_file = st.file_uploader("📁 4. 產品圖片包(ZIP)", type=['zip'])
+        image_zip_file = st.file_uploader("📁 4. 圖片包(ZIP)", type=['zip'])
     with col5:
         port_mapping_file = st.file_uploader("📁 5. 港口對照表\n", type=['csv', 'txt'])
 
