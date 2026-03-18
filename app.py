@@ -23,18 +23,18 @@ def resolve_zip_path(base_dir, relative_path):
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-st.title("🎯 D240 PO GRID自動化系統")
+st.title("🎯 PO GRID 自動化系統")
 
 # 建立雙分頁 UI
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
 
 # ==========================================
-# 分頁一：PO GRID 自動生成器
+# 分頁一：PO GRID 自動生成器 
 # ==========================================
 with tab1:
     st.markdown("""
     請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
-    💡 若上傳 `港口對照表 (TXT/CSV)`，系統將在背景自動為您解析並填入所有港口代碼！
+    💡若上傳 `港口對照表 (TXT/CSV)`，系統將在背景自動為您解析並填入所有港口代碼！
     """)
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -67,60 +67,49 @@ with tab1:
         
         po_info['PO_CLEAN'] = po_info['PO NUMBER'].astype(str).str.strip().str.lstrip('0')
         
-        # --- 自動解析港口代碼 ---
+        # --- 💡 全域降維打擊：將 CSV/TXT 視為純文字進行暴力掃描 ---
         auto_port_dict = {}
         if port_mapping_files:
             for port_file in port_mapping_files:
                 try:
-                    if port_file.name.lower().endswith('.txt'):
-                        content = port_file.getvalue().decode("utf-8").splitlines()
-                        for line in content:
-                            line = line.strip()
-                            if not line: continue
-                            
-                            match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
-                            if match:
-                                po_part = str(match.group(1)).strip().lstrip('0') 
-                                port_part = str(match.group(2)).strip().lstrip('0').upper()
-                                auto_port_dict[po_part] = port_part
-                                continue
-                                
-                            clean_line = re.sub(r'(?i)(po|port|no|num|number|code|港口|代碼|代號|:|：)', ' ', line)
-                            tokens = [t.strip() for t in re.split(r'[\s,;\t]+', clean_line) if t.strip()]
-                            
-                            if len(tokens) >= 2:
-                                po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
-                                if po_candidates:
-                                    po_part = str(po_candidates[0]).strip().lstrip('0')
-                                    port_candidates = [t for t in tokens if t != po_candidates[0]]
-                                    if port_candidates:
-                                        port_part = str(port_candidates[0]).strip().lstrip('0').upper()
-                                        auto_port_dict[po_part] = port_part
-                                else:
-                                    po_part = str(tokens[0]).strip().lstrip('0')
-                                    port_part = str(tokens[1]).strip().lstrip('0').upper()
-                                    auto_port_dict[po_part] = port_part
-
-                    elif port_file.name.lower().endswith('.csv'):
-                        edi_df = pd.read_csv(port_file, low_memory=False, dtype=str)
+                    # 智慧解碼機制：遇到奇葩的系統匯出檔也能順利解讀
+                    raw_bytes = port_file.getvalue()
+                    try:
+                        content = raw_bytes.decode("utf-8").splitlines()
+                    except UnicodeDecodeError:
+                        content = raw_bytes.decode("big5", errors="ignore").splitlines()
                         
-                        po_col_found = False
-                        if 'PO Number' in edi_df.columns:
-                            po_col_found = True
-                            for val in edi_df['PO Number'].dropna().unique():
-                                parts = str(val).split('-')
-                                if len(parts) >= 3:
-                                    po_part = str(parts[1]).strip().lstrip('0')
-                                    port_part = str(parts[2]).strip().lstrip('0').upper()
+                    for line in content:
+                        line = line.strip()
+                        if not line: continue
+                        
+                        # 1. 優先判斷 EDI 標準格式 (精準抓出 0240-8779244-P5 的 8779244 與 P5)
+                        match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
+                        if match:
+                            po_part = str(match.group(1)).strip().lstrip('0') 
+                            port_part = str(match.group(2)).strip().lstrip('0').upper()
+                            auto_port_dict[po_part] = port_part
+                            continue
+                            
+                        # 2. 萬用備用解析器 (處理手刻的雙欄 CSV 或任何雜亂文字)
+                        clean_line = re.sub(r'(?i)\b(po|port|no|num|number|code|港口|代碼|代號)\b|[:："\'#]', ' ', line)
+                        tokens = [t.strip() for t in re.split(r'[\s,;\t\-]+', clean_line) if t.strip()]
+                        
+                        if len(tokens) >= 2:
+                            # 找出長度>=5且全為數字的當作 PO 號碼
+                            po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
+                            if po_candidates:
+                                po_part = str(po_candidates[0]).strip().lstrip('0')
+                                # 取剩下的第一個字串當作港口代碼
+                                port_candidates = [t for t in tokens if t != po_candidates[0]]
+                                if port_candidates:
+                                    port_part = str(port_candidates[0]).strip().lstrip('0').upper()
                                     auto_port_dict[po_part] = port_part
-                                    
-                        if not po_col_found and len(edi_df.columns) >= 2:
-                            for _, row in edi_df.iterrows():
-                                if pd.notna(row.iloc[0]) and pd.notna(row.iloc[1]):
-                                    po_part = str(row.iloc[0]).split('.')[0].strip().lstrip('0')
-                                    port_part = str(row.iloc[1]).split('.')[0].strip().lstrip('0').upper()
-                                    auto_port_dict[po_part] = port_part
-                                    
+                            else:
+                                po_part = str(tokens[0]).strip().lstrip('0')
+                                port_part = str(tokens[1]).strip().lstrip('0').upper()
+                                auto_port_dict[po_part] = port_part
+
                 except Exception as e:
                     st.warning(f"檔案 {port_file.name} 讀取港口失敗 ({e})")
         
@@ -161,9 +150,10 @@ with tab1:
                     parent_dpci_list = set()
                     child_assort_qty_dict = {}
                     parent_info_dict = {}
+                    item_info_dict = {} # 記錄所有商品的 Style 與 UPC 確保不遺漏
                     parent_to_children = {}
 
-                    # 解析 PO RAW DATA 進行母子分離
+                    # 解析 PO RAW DATA 進行資料萃取
                     for idx, row in po_raw.iterrows():
                         dept = str(int(row['DEPARTMENT'])) if pd.notna(row['DEPARTMENT']) else '0'
                         cls = str(int(row['CLASS'])).zfill(2) if pd.notna(row['CLASS']) else '00'
@@ -176,22 +166,35 @@ with tab1:
                         desc = str(row['ITEM DESCRIPTION']).strip().upper()
                         po_num = row['PO NUMBER']
                         
+                        raw_style = str(row['VENDOR STYLE']).strip() if pd.notna(row['VENDOR STYLE']) else ''
+                        raw_upc = str(row['ITEM BAR CODE']).strip() if pd.notna(row['ITEM BAR CODE']) else ''
+                        
+                        if dpci not in item_info_dict and raw_style:
+                            item_info_dict[dpci] = {'style': raw_style, 'upc': raw_upc}
+                        
                         if desc.startswith('ASSORTMENT'):
                             parent_dpci_list.add(dpci)
-                            style_val = str(row['VENDOR STYLE']).strip() if pd.notna(row['VENDOR STYLE']) else ''
+                            style_val = raw_style
                             if style_val and not style_val.upper().startswith('ASSORT'):
                                 style_val = f"ASSORTMENT-{style_val}"
                                 
                             parent_info_dict[dpci] = {
                                 'style': style_val,
-                                'upc': str(row['ITEM BAR CODE']).strip() if pd.notna(row['ITEM BAR CODE']) else ''
+                                'upc': raw_upc
                             }
+                            if dpci in item_info_dict:
+                                item_info_dict[dpci]['style'] = style_val
+                                
                             po_processed_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': dpci, 'QTY': qty, 'IS_PARENT': True})
                             
                             c_dept = str(int(row['COMPONENT DEPARTMENT'])) if pd.notna(row['COMPONENT DEPARTMENT']) else '0'
                             c_cls = str(int(row['COMPONENT CLASS'])).zfill(2) if pd.notna(row['COMPONENT CLASS']) else '00'
                             c_itm = str(int(row['COMPONENT ITEM'])).zfill(4) if pd.notna(row['COMPONENT ITEM']) else '0000'
                             c_dpci = f"{c_dept}-{c_cls}-{c_itm}"
+                            
+                            c_style = str(row['COMPONENT STYLE']).strip() if 'COMPONENT STYLE' in row and pd.notna(row['COMPONENT STYLE']) else ''
+                            if c_dpci not in item_info_dict and c_style:
+                                item_info_dict[c_dpci] = {'style': c_style, 'upc': ''}
                             
                             try: c_qty = float(str(row['COMPONENT ITEM TOTAL QTY']).replace(',', ''))
                             except: c_qty = 0.0
@@ -213,7 +216,7 @@ with tab1:
                     children_and_regular = po_processed[~po_processed['IS_PARENT']]
                     po_processed_unique = pd.concat([parents, children_and_regular], ignore_index=True)
 
-                    # 將剛才背景處理好的港口資料套用 (原封不動顯示 581, P5 等)
+                    # 港口資料套用 (原封不動顯示 581, P5 等)
                     po_info['PORT_NAME'] = po_info['輸入港口代碼 (如:581)'].astype(str).str.strip()
                     po_info['PORT_NAME'] = po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
 
@@ -251,6 +254,9 @@ with tab1:
                         
                     prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
                     
+                    if 'Manufacturer Style # *' not in prod_data.columns:
+                        prod_data['Manufacturer Style # *'] = ''
+                        
                     def format_upc(val):
                         if pd.isna(val) or val == '': return ''
                         try: 
@@ -260,6 +266,20 @@ with tab1:
                     
                     if 'Barcode' in prod_data.columns: prod_data['Barcode'] = prod_data['Barcode'].apply(format_upc)
                     else: prod_data['Barcode'] = ''
+
+                    # 將 PO RAW DATA 中抓到的所有 Style 與 UPC 自動補回 PCN 空白處
+                    for dpci_key, info_dict in item_info_dict.items():
+                        if dpci_key in prod_data['DPCI_MERGE'].values:
+                            idx_list = prod_data.index[prod_data['DPCI_MERGE'] == dpci_key].tolist()
+                            for i in idx_list:
+                                curr_style = str(prod_data.at[i, 'Manufacturer Style # *']).strip()
+                                if curr_style in ('', 'nan') and info_dict['style']:
+                                    prod_data.at[i, 'Manufacturer Style # *'] = info_dict['style']
+                                    
+                                if info_dict['upc']:
+                                    curr_upc = str(prod_data.at[i, 'Barcode']).strip()
+                                    if curr_upc in ('', 'nan'):
+                                        prod_data.at[i, 'Barcode'] = format_upc(info_dict['upc'])
 
                     for parent_dpci, info in parent_info_dict.items():
                         vendor_name, factory_name, factory_id = '', '', ''
