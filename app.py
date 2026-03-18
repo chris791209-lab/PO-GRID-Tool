@@ -23,13 +23,13 @@ def resolve_zip_path(base_dir, relative_path):
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-st.title("🎯 PO GRID 自動化系統")
+st.title("🎯 D240 PO GRID自動化系統")
 
 # 建立雙分頁 UI
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
 
 # ==========================================
-# 分頁一：PO GRID 自動生成器 
+# 分頁一：PO GRID 自動生成器
 # ==========================================
 with tab1:
     st.markdown("""
@@ -67,12 +67,11 @@ with tab1:
         
         po_info['PO_CLEAN'] = po_info['PO NUMBER'].astype(str).str.strip().str.lstrip('0')
         
-        # --- 💡 全域降維打擊：將 CSV/TXT 視為純文字進行暴力掃描 ---
+        # --- 全域降維打擊：將 CSV/TXT 視為純文字進行暴力掃描 ---
         auto_port_dict = {}
         if port_mapping_files:
             for port_file in port_mapping_files:
                 try:
-                    # 智慧解碼機制：遇到奇葩的系統匯出檔也能順利解讀
                     raw_bytes = port_file.getvalue()
                     try:
                         content = raw_bytes.decode("utf-8").splitlines()
@@ -83,7 +82,6 @@ with tab1:
                         line = line.strip()
                         if not line: continue
                         
-                        # 1. 優先判斷 EDI 標準格式 (精準抓出 0240-8779244-P5 的 8779244 與 P5)
                         match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
                         if match:
                             po_part = str(match.group(1)).strip().lstrip('0') 
@@ -91,16 +89,13 @@ with tab1:
                             auto_port_dict[po_part] = port_part
                             continue
                             
-                        # 2. 萬用備用解析器 (處理手刻的雙欄 CSV 或任何雜亂文字)
                         clean_line = re.sub(r'(?i)\b(po|port|no|num|number|code|港口|代碼|代號)\b|[:："\'#]', ' ', line)
                         tokens = [t.strip() for t in re.split(r'[\s,;\t\-]+', clean_line) if t.strip()]
                         
                         if len(tokens) >= 2:
-                            # 找出長度>=5且全為數字的當作 PO 號碼
                             po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
                             if po_candidates:
                                 po_part = str(po_candidates[0]).strip().lstrip('0')
-                                # 取剩下的第一個字串當作港口代碼
                                 port_candidates = [t for t in tokens if t != po_candidates[0]]
                                 if port_candidates:
                                     port_part = str(port_candidates[0]).strip().lstrip('0').upper()
@@ -113,8 +108,28 @@ with tab1:
                 except Exception as e:
                     st.warning(f"檔案 {port_file.name} 讀取港口失敗 ({e})")
         
-        # 綁定港口代碼到內部 DataFrame (不再顯示於前端)
+        # 綁定自動解析出的港口代碼
         po_info['輸入港口代碼 (如:581)'] = po_info['PO_CLEAN'].map(auto_port_dict).fillna("")
+        
+        # --- 💡 智慧防漏機制 (Smart Fallback UI) ---
+        missing_ports_count = (po_info['輸入港口代碼 (如:581)'] == "").sum()
+        
+        st.divider()
+        if missing_ports_count > 0:
+            st.warning(f"⚠️ 注意：有 **{missing_ports_count}** 筆 PO 在您上傳的「對照表/EDI」中找不到對應的港口！請直接在下方表格的空白處【連點兩下】**手動補齊**，否則報表將顯示為「未指定港口」。")
+            
+            display_cols = ["PO NUMBER", "PURPOSE", "SHIP_DATES", "輸入港口代碼 (如:581)"]
+            edited_po_info = st.data_editor(
+                po_info[display_cols].reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True,
+                disabled=["PO NUMBER", "PURPOSE", "SHIP_DATES"]
+            )
+            # 將手動補齊的資料寫回記憶體
+            po_info['輸入港口代碼 (如:581)'] = edited_po_info['輸入港口代碼 (如:581)']
+        else:
+            if port_mapping_files and auto_port_dict:
+                st.success("🤖 完美！系統已從對照表中成功為您萃取並填入 **100%** 的港口代碼，完全不需手動檢查！")
         
         st.divider()
         if st.button("🚀 開始自動生成 PO GRID", type="primary"):
@@ -150,10 +165,9 @@ with tab1:
                     parent_dpci_list = set()
                     child_assort_qty_dict = {}
                     parent_info_dict = {}
-                    item_info_dict = {} # 記錄所有商品的 Style 與 UPC 確保不遺漏
+                    item_info_dict = {} 
                     parent_to_children = {}
 
-                    # 解析 PO RAW DATA 進行資料萃取
                     for idx, row in po_raw.iterrows():
                         dept = str(int(row['DEPARTMENT'])) if pd.notna(row['DEPARTMENT']) else '0'
                         cls = str(int(row['CLASS'])).zfill(2) if pd.notna(row['CLASS']) else '00'
@@ -216,7 +230,6 @@ with tab1:
                     children_and_regular = po_processed[~po_processed['IS_PARENT']]
                     po_processed_unique = pd.concat([parents, children_and_regular], ignore_index=True)
 
-                    # 港口資料套用 (原封不動顯示 581, P5 等)
                     po_info['PORT_NAME'] = po_info['輸入港口代碼 (如:581)'].astype(str).str.strip()
                     po_info['PORT_NAME'] = po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
 
@@ -267,7 +280,6 @@ with tab1:
                     if 'Barcode' in prod_data.columns: prod_data['Barcode'] = prod_data['Barcode'].apply(format_upc)
                     else: prod_data['Barcode'] = ''
 
-                    # 將 PO RAW DATA 中抓到的所有 Style 與 UPC 自動補回 PCN 空白處
                     for dpci_key, info_dict in item_info_dict.items():
                         if dpci_key in prod_data['DPCI_MERGE'].values:
                             idx_list = prod_data.index[prod_data['DPCI_MERGE'] == dpci_key].tolist()
