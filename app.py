@@ -51,15 +51,15 @@ with tab1:
 
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        po_raw_file = st.file_uploader("📁 1. PO RAW DATA", type=['csv'])
+        po_raw_file = st.file_uploader("📁 1. GF ITEM DETAIL", type=['csv'])
     with col2:
-        po_list_file = st.file_uploader("📁 2. List of PO", type=['csv'])
+        po_list_file = st.file_uploader("📁 2. GF PO HEADER", type=['csv'])
     with col3:
         prod_file = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'])
     with col4:
         image_zip_file = st.file_uploader("📁 4. 產品圖片包(ZIP)", type=['zip'])
     with col5:
-        port_mapping_file = st.file_uploader("📁 5. 港口對照表\n(包含PO及港口代碼的TXT 或 CSV 皆可)", type=['csv', 'txt'])
+        port_mapping_file = st.file_uploader("📁 5. 港口對照表\n", type=['csv', 'txt'])
 
     if po_raw_file and prod_file and po_list_file:
         po_list = pd.read_csv(po_list_file)
