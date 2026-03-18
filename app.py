@@ -10,18 +10,6 @@ import xml.etree.ElementTree as ET
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
 
-# 港口代碼對照表
-PORT_MAP = {
-    '581': 'PSW',
-    '3890': 'PNW',
-    '584': 'ORF',
-    '3891': 'SAV',
-    '3851': 'NYC',
-    '3850': 'OAK',
-    '3887': 'HOU',
-    '3758': 'CHARLESTON'
-}
-
 # --- 底層 ZIP 路徑解析輔助函數 ---
 def resolve_zip_path(base_dir, relative_path):
     if relative_path.startswith('/'): return relative_path[1:]
@@ -46,7 +34,7 @@ tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖
 with tab1:
     st.markdown("""
     請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
-    💡 若上傳 `港口對照表 (TXT/CSV)`，系統將為您自動解析並填入所有港口代碼！
+    💡 若上傳 `港口對照表 (TXT/CSV)`，系統將在背景自動為您解析並填入所有港口代碼！
     """)
 
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -55,14 +43,14 @@ with tab1:
     with col2:
         po_list_file = st.file_uploader("📁 2. List of PO", type=['csv'])
     with col3:
-        # 💡 升級：支援多份 PCN 檔案上傳
-        prod_files = st.file_uploader("📁 3. 產品資料(PCN)\n(支援多檔上傳)", type=['xlsx', 'csv'], accept_multiple_files=True)
+        prod_files = st.file_uploader("📁 3. 產品資料(PCN)\n(支援多檔)", type=['xlsx', 'csv'], accept_multiple_files=True)
     with col4:
-        image_zip_files = st.file_uploader("📁 4. 產品圖片包(ZIP)\n(支援多檔上傳)", type=['zip'], accept_multiple_files=True)
+        image_zip_files = st.file_uploader("📁 4. 產品圖片包(ZIP)\n(支援多檔)", type=['zip'], accept_multiple_files=True)
     with col5:
         port_mapping_files = st.file_uploader("📁 5. 港口對照表\n(TXT/CSV 皆可, 可多選)", type=['csv', 'txt'], accept_multiple_files=True)
 
     if po_raw_file and prod_files and po_list_file:
+        # 背景處理 PO 基礎資料
         po_list = pd.read_csv(po_list_file)
         po_raw = pd.read_csv(po_raw_file)
         
@@ -136,27 +124,14 @@ with tab1:
                 except Exception as e:
                     st.warning(f"檔案 {port_file.name} 讀取港口失敗 ({e})")
         
+        # 綁定港口代碼到內部 DataFrame (不再顯示於前端)
         po_info['輸入港口代碼 (如:581)'] = po_info['PO_CLEAN'].map(auto_port_dict).fillna("")
         
         st.divider()
-        st.subheader("📍 步驟 6: 確認目的地港口代碼")
-        if port_mapping_files and auto_port_dict:
-            st.success("🤖 系統已成功自動為您萃取並合併填入港口代碼！如果仍有空白，代表來源檔中缺少該 PO。")
-        else:
-            st.info("✏️ 操作說明：請將滑鼠移到表格最右側空白處【連點兩下】手動輸入港口代碼。")
-        
-        display_cols = ["PO NUMBER", "PURPOSE", "SHIP_DATES", "輸入港口代碼 (如:581)"]
-        edited_po_info = st.data_editor(
-            po_info[display_cols].reset_index(drop=True),
-            use_container_width=True,
-            hide_index=True,
-            disabled=["PO NUMBER", "PURPOSE", "SHIP_DATES"]
-        )
-        
-        st.divider()
         if st.button("🚀 開始自動生成 PO GRID", type="primary"):
-            with st.spinner("資料處理與圖片載入中，請稍候..."):
+            with st.spinner("資料處理與圖片載入中，這可能需要幾十秒鐘，請稍候..."):
                 try:
+                    # 處理圖片 ZIP 包
                     image_dict = {}
                     if image_zip_files:
                         for zip_file_obj in image_zip_files:
@@ -171,7 +146,7 @@ with tab1:
                                         if clean_dpci not in image_dict:
                                             image_dict[clean_dpci] = z.read(file_info.filename)
 
-                    # 💡 升級：讀取並合併多份 PCN 產品資料
+                    # 讀取並合併 PCN
                     prod_data_list = []
                     for p_file in prod_files:
                         if p_file.name.lower().endswith('.csv'):
@@ -188,6 +163,7 @@ with tab1:
                     parent_info_dict = {}
                     parent_to_children = {}
 
+                    # 解析 PO RAW DATA 進行母子分離
                     for idx, row in po_raw.iterrows():
                         dept = str(int(row['DEPARTMENT'])) if pd.notna(row['DEPARTMENT']) else '0'
                         cls = str(int(row['CLASS'])).zfill(2) if pd.notna(row['CLASS']) else '00'
@@ -237,10 +213,11 @@ with tab1:
                     children_and_regular = po_processed[~po_processed['IS_PARENT']]
                     po_processed_unique = pd.concat([parents, children_and_regular], ignore_index=True)
 
-                    edited_po_info['PORT_NAME'] = edited_po_info['輸入港口代碼 (如:581)'].astype(str).str.strip()
-                    edited_po_info['PORT_NAME'] = edited_po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
+                    # 將剛才背景處理好的港口資料套用 (原封不動顯示 581, P5 等)
+                    po_info['PORT_NAME'] = po_info['輸入港口代碼 (如:581)'].astype(str).str.strip()
+                    po_info['PORT_NAME'] = po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
 
-                    po_raw_merged = po_processed_unique.merge(edited_po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
+                    po_raw_merged = po_processed_unique.merge(po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
                     po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('標籤遺失')
                     po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('日期遺失')
                     po_raw_merged['PORT_NAME'] = po_raw_merged['PORT_NAME'].fillna('未指定港口')
@@ -453,7 +430,7 @@ with tab1:
                         
                         zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
                     
-                    st.success("✨ 處理完成！已為您成功合併多份 PCN 並產出報表。")
+                    st.success("✨ 處理完成！已為您產出合併版 PO GRID 表格。")
                     st.download_button(
                         label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
                         data=zip_buffer.getvalue(),
@@ -465,7 +442,7 @@ with tab1:
                     st.error(f"❌ 處理過程中發生錯誤: {e}")
 
 # ==========================================
-# 分頁二：Program Sheet 圖片自動萃取與命名工具 (全面無視命名空間版)
+# 分頁二：Program Sheet 圖片自動萃取與命名工具 (無差別抓取版)
 # ==========================================
 with tab2:
     st.markdown("""
