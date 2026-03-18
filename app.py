@@ -46,7 +46,7 @@ tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖
 with tab1:
     st.markdown("""
     請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
-    💡 **進階技巧**：若上傳 `港口對照表 (TXT/CSV)`，系統將為您自動解析並填入所有港口代碼！
+    💡 ****：若上傳 `港口對照表 (TXT/CSV)`，系統將為您自動解析並填入所有港口代碼！
     """)
 
     col1, col2, col3, col4, col5 = st.columns(5)
