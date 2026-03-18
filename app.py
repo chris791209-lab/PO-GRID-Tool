@@ -35,7 +35,7 @@ def resolve_zip_path(base_dir, relative_path):
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-st.title("🎯 D240 PO GRID 自動化系統")
+st.title("🎯 D240 PO GRID自動化系統")
 
 # 建立雙分頁 UI
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
@@ -55,14 +55,14 @@ with tab1:
     with col2:
         po_list_file = st.file_uploader("📁 2. List of PO", type=['csv'])
     with col3:
-        prod_file = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'])
+        # 💡 升級：支援多份 PCN 檔案上傳
+        prod_files = st.file_uploader("📁 3. 產品資料(PCN)\n(支援多檔上傳)", type=['xlsx', 'csv'], accept_multiple_files=True)
     with col4:
-        # 💡 加入 accept_multiple_files=True 支援多 ZIP 上傳
         image_zip_files = st.file_uploader("📁 4. 產品圖片包(ZIP)\n(支援多檔上傳)", type=['zip'], accept_multiple_files=True)
     with col5:
         port_mapping_files = st.file_uploader("📁 5. 港口對照表\n(TXT/CSV 皆可, 可多選)", type=['csv', 'txt'], accept_multiple_files=True)
 
-    if po_raw_file and prod_file and po_list_file:
+    if po_raw_file and prod_files and po_list_file:
         po_list = pd.read_csv(po_list_file)
         po_raw = pd.read_csv(po_raw_file)
         
@@ -157,7 +157,6 @@ with tab1:
         if st.button("🚀 開始自動生成 PO GRID", type="primary"):
             with st.spinner("資料處理與圖片載入中，請稍候..."):
                 try:
-                    # 💡 升級為迴圈處理所有上傳的 ZIP 檔案
                     image_dict = {}
                     if image_zip_files:
                         for zip_file_obj in image_zip_files:
@@ -172,10 +171,16 @@ with tab1:
                                         if clean_dpci not in image_dict:
                                             image_dict[clean_dpci] = z.read(file_info.filename)
 
-                    if prod_file.name.endswith('.csv'):
-                        prod_data = pd.read_csv(prod_file)
-                    else:
-                        prod_data = pd.read_excel(prod_file)
+                    # 💡 升級：讀取並合併多份 PCN 產品資料
+                    prod_data_list = []
+                    for p_file in prod_files:
+                        if p_file.name.lower().endswith('.csv'):
+                            df_temp = pd.read_csv(p_file)
+                        else:
+                            df_temp = pd.read_excel(p_file)
+                        prod_data_list.append(df_temp)
+                    
+                    prod_data = pd.concat(prod_data_list, ignore_index=True)
 
                     po_processed_records = []
                     parent_dpci_list = set()
@@ -264,7 +269,7 @@ with tab1:
                     pivot_df = pivot_df.replace({0: '', 0.0: ''})
 
                     if 'DPCI' not in prod_data.columns:
-                        st.error("❌ 產品資料(PCN) 中找不到必要的 'DPCI' 欄位。")
+                        st.error("❌ 產品資料(PCN) 中找不到必要的 'DPCI' 欄位。請檢查上傳的檔案格式。")
                         st.stop()
                         
                     prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
@@ -448,7 +453,7 @@ with tab1:
                         
                         zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
                     
-                    st.success("✨ 處理完成！已透過 DPCI 精準匹配並填入商品圖片。")
+                    st.success("✨ 處理完成！已為您成功合併多份 PCN 並產出報表。")
                     st.download_button(
                         label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
                         data=zip_buffer.getvalue(),
@@ -460,7 +465,7 @@ with tab1:
                     st.error(f"❌ 處理過程中發生錯誤: {e}")
 
 # ==========================================
-# 分頁二：Program Sheet 圖片自動萃取與命名工具
+# 分頁二：Program Sheet 圖片自動萃取與命名工具 (全面無視命名空間版)
 # ==========================================
 with tab2:
     st.markdown("""
