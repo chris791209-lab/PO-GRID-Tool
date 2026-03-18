@@ -57,9 +57,9 @@ with tab1:
     with col3:
         prod_file = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'])
     with col4:
-        image_zip_file = st.file_uploader("📁 4. 產品圖片包(ZIP)", type=['zip'])
+        # 💡 加入 accept_multiple_files=True 支援多 ZIP 上傳
+        image_zip_files = st.file_uploader("📁 4. 產品圖片包(ZIP)\n(支援多檔上傳)", type=['zip'], accept_multiple_files=True)
     with col5:
-        # 💡 加入 accept_multiple_files=True 支援多檔上傳
         port_mapping_files = st.file_uploader("📁 5. 港口對照表\n(TXT/CSV 皆可, 可多選)", type=['csv', 'txt'], accept_multiple_files=True)
 
     if po_raw_file and prod_file and po_list_file:
@@ -79,7 +79,7 @@ with tab1:
         
         po_info['PO_CLEAN'] = po_info['PO NUMBER'].astype(str).str.strip().str.lstrip('0')
         
-        # --- 💡 全新功能：支援多個 TXT/CSV 檔案合併解析 ---
+        # --- 自動解析港口代碼 ---
         auto_port_dict = {}
         if port_mapping_files:
             for port_file in port_mapping_files:
@@ -157,18 +157,20 @@ with tab1:
         if st.button("🚀 開始自動生成 PO GRID", type="primary"):
             with st.spinner("資料處理與圖片載入中，請稍候..."):
                 try:
+                    # 💡 升級為迴圈處理所有上傳的 ZIP 檔案
                     image_dict = {}
-                    if image_zip_file:
-                        with zipfile.ZipFile(image_zip_file, 'r') as z:
-                            for file_info in z.infolist():
-                                if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'):
-                                    continue
-                                if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                                    base_name = os.path.basename(file_info.filename)
-                                    dpci_name = os.path.splitext(base_name)[0].strip()
-                                    clean_dpci = dpci_name.split('_')[0] 
-                                    if clean_dpci not in image_dict:
-                                        image_dict[clean_dpci] = z.read(file_info.filename)
+                    if image_zip_files:
+                        for zip_file_obj in image_zip_files:
+                            with zipfile.ZipFile(zip_file_obj, 'r') as z:
+                                for file_info in z.infolist():
+                                    if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'):
+                                        continue
+                                    if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                                        base_name = os.path.basename(file_info.filename)
+                                        dpci_name = os.path.splitext(base_name)[0].strip()
+                                        clean_dpci = dpci_name.split('_')[0] 
+                                        if clean_dpci not in image_dict:
+                                            image_dict[clean_dpci] = z.read(file_info.filename)
 
                     if prod_file.name.endswith('.csv'):
                         prod_data = pd.read_csv(prod_file)
@@ -422,7 +424,7 @@ with tab1:
                                 ws = writer.sheets[safe_factory_name]
                                 ws.delete_cols(1) 
                                 
-                                if image_zip_file and image_dict:
+                                if image_zip_files and image_dict:
                                     dpci_col_idx = None
                                     img_col_idx = None
                                     for idx, col in enumerate(export_data_reset.columns):
@@ -458,7 +460,7 @@ with tab1:
                     st.error(f"❌ 處理過程中發生錯誤: {e}")
 
 # ==========================================
-# 分頁二：Program Sheet 圖片自動萃取與命名工具 (全面無視命名空間版)
+# 分頁二：Program Sheet 圖片自動萃取與命名工具
 # ==========================================
 with tab2:
     st.markdown("""
