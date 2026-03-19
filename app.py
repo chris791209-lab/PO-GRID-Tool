@@ -23,18 +23,18 @@ def resolve_zip_path(base_dir, relative_path):
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-st.title("🎯 Target 季節性專案自動化系統")
+st.title("🎯 D240 PO GRID 自動化系統")
 
 # 建立雙分頁 UI
 tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
 
 # ==========================================
-# 分頁一：PO GRID 自動生成器 (智慧防漏版)
+# 分頁一：PO GRID 自動生成器
 # ==========================================
 with tab1:
     st.markdown("""
     請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
-    💡 **進階技巧**：若上傳 `港口對照表 (TXT/CSV)`，系統將在背景自動為您解析並填入所有港口代碼！
+    💡若上傳 `港口對照表 (TXT/CSV)`，系統將在背景自動為您解析並填入所有港口代碼！
     """)
 
     col1, col2, col3, col4, col5 = st.columns(5)
