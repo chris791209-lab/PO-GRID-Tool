@@ -1,0 +1,13 @@
+# 忽略所有的 Excel 與 CSV 檔案
+*.xlsx
+*.xlsm
+*.csv
+
+# 忽略圖片資料夾與壓縮檔
+Extracted_Images/
+*.zip
+*.jpg
+*.png
+
+# 忽略 Python 產生的暫存檔
+__pycache__/
