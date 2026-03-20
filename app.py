@@ -1,4 +1,57 @@
 import streamlit as st
+import streamlit as st
+
+def check_password():
+    """回傳 True 代表使用者輸入了正確的密碼"""
+
+    def password_entered():
+        """檢查使用者輸入的密碼是否與 Streamlit Secrets 中的密碼相符"""
+        if st.session_state["password"] == st.secrets["app_password"]:
+            st.session_state["password_correct"] = True
+            # 密碼正確後，刪除 session_state 中的密碼紀錄以策安全
+            del st.session_state["password"]  
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # 第一次進入網頁，顯示密碼輸入框
+        st.text_input(
+            "🔒 請輸入 AE 部門共用密碼以啟用工具：", 
+            type="password", 
+            on_change=password_entered, 
+            key="password"
+        )
+        return False
+    
+    elif not st.session_state["password_correct"]:
+        # 密碼輸入錯誤，顯示錯誤訊息並重新要求輸入
+        st.text_input(
+            "🔒 請輸入 AE 部門共用密碼以啟用工具：", 
+            type="password", 
+            on_change=password_entered, 
+            key="password"
+        )
+        st.error("❌ 密碼錯誤，請重新輸入。")
+        return False
+    
+    else:
+        # 密碼正確
+        return True
+
+# ==========================================
+# 下方開始才是您原本的 App 邏輯
+# ==========================================
+
+# 利用 if 判斷式，只有密碼正確才會執行區塊內的程式碼
+if check_password():
+    st.success("成功登入！")
+    
+    # 請將您原本寫好的工具程式碼（例如 PO 單驗證、萬聖節專案的資料比對邏輯）
+    # 全部縮排 (Indent) 放入這個 if 區塊下方
+    
+    st.title("自動化資料處理工具")
+    st.write("這裡是內部工具介面，您可以開始上傳檔案了...")
+    # ... 您原本的程式碼 ...
 import pandas as pd
 import io
 import zipfile
