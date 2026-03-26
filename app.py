@@ -223,6 +223,7 @@ if check_password():
                 if st.button("🚀 開始自動生成 PO GRID", type="primary"):
                     with st.spinner("資料處理與圖片載入中，這可能需要幾十秒鐘，請稍候..."):
                         try:
+                            # 處理圖片 ZIP 包
                             image_dict = {}
                             if image_zip_files:
                                 for zip_file_obj in image_zip_files:
@@ -237,6 +238,7 @@ if check_password():
                                                 if clean_dpci not in image_dict:
                                                     image_dict[clean_dpci] = z.read(file_info.filename)
 
+                            # 讀取並合併 PCN
                             prod_data_list = []
                             for p_file in prod_files:
                                 if p_file.name.lower().endswith('.csv'):
@@ -556,8 +558,8 @@ if check_password():
                                 mime="application/zip"
                             )
                             
-                    except Exception as e:
-                        st.error(f"❌ 處理過程中發生錯誤: {e}")
+                        except Exception as e:
+                            st.error(f"❌ 處理過程中發生錯誤: {e}")
 
     # ------------------------------------------
     # 分頁二：Program Sheet 圖片自動萃取與命名工具 
