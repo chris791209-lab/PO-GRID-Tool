@@ -9,6 +9,7 @@ import openpyxl
 import xml.etree.ElementTree as ET
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
+from PIL import Image as PILImage
 
 # ==========================================
 # 1. 密碼保護機制定義
@@ -42,7 +43,6 @@ def check_password():
     else:
         return True
 
-
 # ==========================================
 # 2. 共用常數與輔助函數定義
 # ==========================================
@@ -62,7 +62,7 @@ def resolve_zip_path(base_dir, relative_path):
     return '/'.join(parts)
 
 def extract_port_mapping(port_mapping_files):
-    """共用邏輯：將多個 TXT/CSV 降維打擊為純文字字典 (保留給舊版引擎使用)"""
+    """共用邏輯：將多個 TXT/CSV 降維打擊為純文字字典"""
     auto_port_dict = {}
     if not port_mapping_files: return auto_port_dict
     
@@ -95,8 +95,7 @@ def extract_port_mapping(port_mapping_files):
                             auto_port_dict[po_part] = str(port_candidates[0]).strip().lstrip('0').upper()
                     else:
                         auto_port_dict[str(tokens[0]).strip().lstrip('0')] = str(tokens[1]).strip().lstrip('0').upper()
-        except:
-            pass
+        except: pass
     return auto_port_dict
 
 def format_upc(val):
@@ -105,7 +104,6 @@ def format_upc(val):
         v = str(int(float(val)))
         return v.zfill(12) if len(v) < 12 else v
     except: return str(val).strip()
-
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
@@ -119,7 +117,7 @@ if check_password():
     tab1, tab3, tab2 = st.tabs(["🎃 舊版引擎 (PO RAW DATA)", "🚀 新版引擎 (Modern PO Visibility)", "🖼️ 圖片自動萃取器"])
 
     # ------------------------------------------
-    # 分頁一：舊版 PO GRID (PO RAW DATA) - 保持原樣不變
+    # 分頁一：舊版 PO GRID (PO RAW DATA)
     # ------------------------------------------
     with tab1:
         st.markdown("""
@@ -140,6 +138,9 @@ if check_password():
             
             po_list['PO NUMBER'] = po_list['PO NUMBER'].astype(str).str.split('.').str[0].str.strip()
             po_raw['PO NUMBER'] = po_raw['PO NUMBER'].astype(str).str.split('.').str[0].str.strip()
+            
+            po_list = po_list[(po_list['PO NUMBER'] != 'nan') & (po_list['PO NUMBER'] != '')]
+            po_raw = po_raw[(po_raw['PO NUMBER'] != 'nan') & (po_raw['PO NUMBER'] != '')]
             
             po_list['SHIP BEGIN DATE'] = pd.to_datetime(po_list['SHIP BEGIN DATE'], errors='coerce')
             po_list['SHIP END DATE'] = pd.to_datetime(po_list['SHIP END DATE'], errors='coerce')
@@ -428,12 +429,19 @@ if check_password():
                                                 for r_idx in range(6, ws.max_row + 1):
                                                     cell_dpci_val = str(ws.cell(row=r_idx, column=dpci_col_idx).value).strip()
                                                     if cell_dpci_val in image_dict:
-                                                        img_bytes = io.BytesIO(image_dict[cell_dpci_val])
-                                                        img_obj = OpenpyxlImage(img_bytes)
-                                                        img_obj.width = 90
-                                                        img_obj.height = 90
-                                                        ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
-                                                        ws.row_dimensions[r_idx].height = 70 
+                                                        try:
+                                                            img_bytes = io.BytesIO(image_dict[cell_dpci_val])
+                                                            with PILImage.open(img_bytes) as pil_img:
+                                                                if pil_img.mode != 'RGB': pil_img = pil_img.convert('RGB')
+                                                                clean_img_io = io.BytesIO()
+                                                                pil_img.save(clean_img_io, format='JPEG')
+                                                                clean_img_io.seek(0)
+                                                            img_obj = OpenpyxlImage(clean_img_io)
+                                                            img_obj.width = 90
+                                                            img_obj.height = 90
+                                                            ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
+                                                            ws.row_dimensions[r_idx].height = 70 
+                                                        except: pass 
                                 
                                 zip_file.writestr("PO_GRID_Merged_Old.xlsx", excel_buffer.getvalue())
                             
@@ -445,20 +453,20 @@ if check_password():
                                 mime="application/zip"
                             )
                         except Exception as e:
-                            st.error(f"❌ 處理過程中發生錯誤: {e}")
+                            st.error(f"❌ 舊版處理過程中發生錯誤: {e}")
 
     # ------------------------------------------
     # 分頁二：新版 PO GRID (Modern PO Visibility)
     # ------------------------------------------
     with tab3:
         st.markdown("""
-        此為 **全新 Modern PO** 專屬通道！直接讀取內建的港口 (LOCATION)，無需再上傳港口對照表！
-        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC Level` 三份 Modern CSV 同時上傳至第一個框框，系統會自動在背後幫您縫合資料！
+        此為 **全新 Modern PO** 專屬通道！只需上傳 3 份檔案即可自動運算！
+        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `PO_DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
         """)
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次上傳 PO / Item / DC 三份檔案)", type=['csv'], accept_multiple_files=True, key="m_po")
+            modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次上傳 3 份 CSV 檔案)", type=['csv'], accept_multiple_files=True, key="m_po")
         with col2:
             m_prod_files = st.file_uploader("📁 2. 產品資料(PCN)\n(支援多檔)", type=['xlsx', 'csv'], accept_multiple_files=True, key="m_pcn")
         with col3:
@@ -467,7 +475,7 @@ if check_password():
         if modern_po_files and m_prod_files:
             df_po_level, df_item_level, df_dc_level = None, None, None
             
-            # 💡 智慧辨識上傳的 3 份檔案
+            # 💡 智慧辨識上傳的 3 份檔案 (更精準排除不需要的 PO_DC Level 廢檔)
             for f in modern_po_files:
                 try:
                     df_temp = pd.read_csv(f, dtype=str, nrows=5)
@@ -477,17 +485,22 @@ if check_password():
                         df_po_level = pd.read_csv(f, dtype=str)
                     elif 'MANUFACTURER STYLE' in cols:
                         df_item_level = pd.read_csv(f, dtype=str)
-                    elif 'LOCATION' in cols and 'REVISED QUANTITY' in cols:
+                    elif 'LOCATION' in cols and 'DPCI' in cols: # 確保抓到的是有 DPCI 的 PO_DC_Item Level
                         df_dc_level = pd.read_csv(f, dtype=str)
                 except Exception as e:
                     st.warning(f"檔案讀取失敗 {f.name}: {e}")
 
             if df_po_level is None or df_item_level is None or df_dc_level is None:
-                st.error("❌ 系統未能集齊 3 份必要的 Modern 報表。請確認您同時上傳了 PO Level、Item Level 與 DC/Item Level 三份檔案！")
+                st.error("❌ 系統未能集齊 3 份必要的 Modern 報表。請確認您同時上傳了含有 PO PURPOSE (PO Level)、MANUFACTURER STYLE (Item Level) 與 DPCI+LOCATION (DC_Item Level) 的 3 份 CSV 檔案！")
             else:
                 df_po_level['PO NUMBER'] = df_po_level['PO #'].astype(str).str.split('.').str[0].str.strip()
                 df_item_level['PO NUMBER'] = df_item_level['PO #'].astype(str).str.split('.').str[0].str.strip()
                 df_dc_level['PO NUMBER'] = df_dc_level['PO #'].astype(str).str.split('.').str[0].str.strip()
+
+                # 自動過濾 nan 幽靈列
+                df_po_level = df_po_level[(df_po_level['PO NUMBER'] != 'nan') & (df_po_level['PO NUMBER'] != '')]
+                df_item_level = df_item_level[(df_item_level['PO NUMBER'] != 'nan') & (df_item_level['PO NUMBER'] != '')]
+                df_dc_level = df_dc_level[(df_dc_level['PO NUMBER'] != 'nan') & (df_dc_level['PO NUMBER'] != '')]
 
                 df_po_level['SHIP BEGIN DATE'] = pd.to_datetime(df_po_level['ORIG SHIP BEGIN'], errors='coerce')
                 df_po_level['SHIP END DATE'] = pd.to_datetime(df_po_level['ORIG SHIP END'], errors='coerce')
@@ -542,7 +555,6 @@ if check_password():
                     df_dc_level['DPCI_MERGE'] = df_dc_level['DPCI'].astype(str).str.strip()
                     df_dc_level['QTY'] = pd.to_numeric(df_dc_level['REVISED QUANTITY'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
                     
-                    # 💡 完全捨棄外部港口對照，直接讀取內建的 LOCATION
                     df_dc_level['NATIVE_PORT'] = df_dc_level['LOCATION'].astype(str).str.replace(r'\.0$', '', regex=True).replace({'nan': '', 'None': ''}).str.strip()
                     
                     unique_po_ports = df_dc_level[['PO NUMBER', 'NATIVE_PORT']].drop_duplicates(subset=['PO NUMBER']).copy()
@@ -713,12 +725,19 @@ if check_password():
                                                     for r_idx in range(6, ws.max_row + 1):
                                                         cell_dpci_val = str(ws.cell(row=r_idx, column=dpci_col_idx).value).strip()
                                                         if cell_dpci_val in image_dict:
-                                                            img_bytes = io.BytesIO(image_dict[cell_dpci_val])
-                                                            img_obj = OpenpyxlImage(img_bytes)
-                                                            img_obj.width = 90
-                                                            img_obj.height = 90
-                                                            ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
-                                                            ws.row_dimensions[r_idx].height = 70 
+                                                            try:
+                                                                img_bytes = io.BytesIO(image_dict[cell_dpci_val])
+                                                                with PILImage.open(img_bytes) as pil_img:
+                                                                    if pil_img.mode != 'RGB': pil_img = pil_img.convert('RGB')
+                                                                    clean_img_io = io.BytesIO()
+                                                                    pil_img.save(clean_img_io, format='JPEG')
+                                                                    clean_img_io.seek(0)
+                                                                img_obj = OpenpyxlImage(clean_img_io)
+                                                                img_obj.width = 90
+                                                                img_obj.height = 90
+                                                                ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
+                                                                ws.row_dimensions[r_idx].height = 70 
+                                                            except: pass 
                                     
                                     zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
                                 
@@ -733,7 +752,7 @@ if check_password():
                                 st.error(f"❌ 新版處理過程中發生錯誤: {e}")
 
     # ------------------------------------------
-    # 分頁三：Program Sheet 圖片自動萃取與命名工具 
+    # 分頁三：Program Sheet 圖片自動萃取與命名工具
     # ------------------------------------------
     with tab2:
         st.markdown("""
