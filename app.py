@@ -15,18 +15,14 @@ from openpyxl.utils import get_column_letter
 # ==========================================
 def check_password():
     """回傳 True 代表使用者輸入了正確的密碼"""
-
     def password_entered():
-        """檢查使用者輸入的密碼是否與 Streamlit Secrets 中的密碼相符"""
         if st.session_state["password"] == st.secrets["app_password"]:
             st.session_state["password_correct"] = True
-            # 密碼正確後，刪除 session_state 中的密碼紀錄以策安全
             del st.session_state["password"]  
         else:
             st.session_state["password_correct"] = False
 
     if "password_correct" not in st.session_state:
-        # 第一次進入網頁，顯示密碼輸入框
         st.text_input(
             "🔒 請輸入 AE 部門共用密碼以啟用工具：", 
             type="password", 
@@ -34,9 +30,7 @@ def check_password():
             key="password"
         )
         return False
-    
     elif not st.session_state["password_correct"]:
-        # 密碼輸入錯誤，顯示錯誤訊息並重新要求輸入
         st.text_input(
             "🔒 請輸入 AE 部門共用密碼以啟用工具：", 
             type="password", 
@@ -45,29 +39,19 @@ def check_password():
         )
         st.error("❌ 密碼錯誤，請重新輸入。")
         return False
-    
     else:
-        # 密碼正確
         return True
 
 
 # ==========================================
 # 2. 共用常數與輔助函數定義
 # ==========================================
-# 港口代碼對照表
 PORT_MAP = {
-    '581': 'PSW',
-    '3890': 'PNW',
-    '584': 'ORF',
-    '3891': 'SAV',
-    '3851': 'NYC',
-    '3850': 'OAK',
-    '3887': 'HOU',
-    '3758': 'CHARLESTON'
+    '581': 'PSW', '3890': 'PNW', '584': 'ORF', '3891': 'SAV',
+    '3851': 'NYC', '3850': 'OAK', '3887': 'HOU', '3758': 'CHARLESTON'
 }
 
 def resolve_zip_path(base_dir, relative_path):
-    """底層 ZIP 路徑解析輔助函數"""
     if relative_path.startswith('/'): return relative_path[1:]
     parts = [p for p in base_dir.split('/') if p]
     for part in relative_path.split('/'):
@@ -77,41 +61,79 @@ def resolve_zip_path(base_dir, relative_path):
             parts.append(part)
     return '/'.join(parts)
 
+def extract_port_mapping(port_mapping_files):
+    """共用邏輯：將多個 TXT/CSV 降維打擊為純文字字典"""
+    auto_port_dict = {}
+    if not port_mapping_files: return auto_port_dict
+    
+    for port_file in port_mapping_files:
+        try:
+            raw_bytes = port_file.getvalue()
+            try: content = raw_bytes.decode("utf-8").splitlines()
+            except UnicodeDecodeError: content = raw_bytes.decode("big5", errors="ignore").splitlines()
+                
+            for line in content:
+                line = line.strip()
+                if not line: continue
+                
+                match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
+                if match:
+                    po_part = str(match.group(1)).strip().lstrip('0') 
+                    port_part = str(match.group(2)).strip().lstrip('0').upper()
+                    auto_port_dict[po_part] = port_part
+                    continue
+                    
+                clean_line = re.sub(r'(?i)\b(po|port|no|num|number|code|港口|代碼|代號)\b|[:："\'#]', ' ', line)
+                tokens = [t.strip() for t in re.split(r'[\s,;\t\-]+', clean_line) if t.strip()]
+                
+                if len(tokens) >= 2:
+                    po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
+                    if po_candidates:
+                        po_part = str(po_candidates[0]).strip().lstrip('0')
+                        port_candidates = [t for t in tokens if t != po_candidates[0]]
+                        if port_candidates:
+                            auto_port_dict[po_part] = str(port_candidates[0]).strip().lstrip('0').upper()
+                    else:
+                        auto_port_dict[str(tokens[0]).strip().lstrip('0')] = str(tokens[1]).strip().lstrip('0').upper()
+        except:
+            pass
+    return auto_port_dict
+
+def format_upc(val):
+    if pd.isna(val) or val == '': return ''
+    try: 
+        v = str(int(float(val)))
+        return v.zfill(12) if len(v) < 12 else v
+    except: return str(val).strip()
+
 
 st.set_page_config(page_title="PO GRID & 圖片萃取系統", layout="wide")
 
-
 # ==========================================
-# 3. 系統主程式 (密碼通過後才會執行)
+# 3. 系統主程式
 # ==========================================
 if check_password():
     st.success("✅ 成功登入！歡迎使用 AE 部門專屬工具。")
     st.title("🎯 Target 季節性專案自動化系統")
 
-    # 建立雙分頁 UI
-    tab1, tab2 = st.tabs(["🎃 PO GRID 自動生成器", "🖼️ Program Sheet 圖片自動萃取器"])
+    # 💡 新增 3 個 Tab 實現新舊雙軌並行
+    tab1, tab3, tab2 = st.tabs(["🎃 舊版引擎 (PO RAW DATA)", "🚀 新版引擎 (Modern PO Visibility)", "🖼️ 圖片自動萃取器"])
 
     # ------------------------------------------
-    # 分頁一：PO GRID 自動生成器 (加入 SW 篩選版)
+    # 分頁一：舊版 PO GRID (PO RAW DATA) - 保持原樣不變
     # ------------------------------------------
     with tab1:
         st.markdown("""
-        請依序上傳 **PO RAW DATA**、**PO List**、**產品資料(PCN)** 與 **圖片包(ZIP)**。
-        💡 **進階技巧**：若上傳 `港口對照表`，系統將在背景自動為您解析並填入港口代碼！
-        📅 **全新功能**：現在可以啟用 **Ship Window (SW)** 範圍篩選，讓報表只顯示特定期間的訂單與商品！
+        此為 **舊版 PO RAW DATA** 專用通道。請依序上傳檔案。
+        💡 支援 **Ship Window (SW) 篩選** 與 **多檔港口對照表自動解析**。
         """)
 
         col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            po_raw_file = st.file_uploader("📁 1. PO RAW DATA", type=['csv'])
-        with col2:
-            po_list_file = st.file_uploader("📁 2. List of PO", type=['csv'])
-        with col3:
-            prod_files = st.file_uploader("📁 3. 產品資料(PCN)\n(支援多檔)", type=['xlsx', 'csv'], accept_multiple_files=True)
-        with col4:
-            image_zip_files = st.file_uploader("📁 4. 產品圖片包(ZIP)\n(支援多檔)", type=['zip'], accept_multiple_files=True)
-        with col5:
-            port_mapping_files = st.file_uploader("📁 5. 港口對照表\n(TXT/CSV 皆可, 可多選)", type=['csv', 'txt'], accept_multiple_files=True)
+        with col1: po_raw_file = st.file_uploader("📁 1. PO RAW DATA", type=['csv'], key="old_po1")
+        with col2: po_list_file = st.file_uploader("📁 2. List of PO", type=['csv'], key="old_po2")
+        with col3: prod_files = st.file_uploader("📁 3. 產品資料(PCN)", type=['xlsx', 'csv'], accept_multiple_files=True, key="old_pcn")
+        with col4: image_zip_files = st.file_uploader("📁 4. 產品圖片包(ZIP)", type=['zip'], accept_multiple_files=True, key="old_zip")
+        with col5: port_mapping_files = st.file_uploader("📁 5. 港口對照表", type=['csv', 'txt'], accept_multiple_files=True, key="old_port")
 
         if po_raw_file and prod_files and po_list_file:
             po_list = pd.read_csv(po_list_file)
@@ -123,31 +145,26 @@ if check_password():
             po_list['SHIP BEGIN DATE'] = pd.to_datetime(po_list['SHIP BEGIN DATE'], errors='coerce')
             po_list['SHIP END DATE'] = pd.to_datetime(po_list['SHIP END DATE'], errors='coerce')
             
-            # --- 步驟 6：Ship Window (SW) 範圍篩選 ---
             st.divider()
             st.subheader("📍 步驟 6: 篩選出貨期間 / Ship Window (選填)")
-            use_sw_filter = st.checkbox("📅 啟用 SW 範圍篩選 (僅產出落在該期間內的訂單與關聯商品)")
+            use_sw_filter = st.checkbox("📅 啟用 SW 範圍篩選", key="old_sw")
             
             can_proceed = True  
-            
             if use_sw_filter:
-                sw_range = st.date_input("請點擊選擇「開始」與「結束」日期 (Start Date - End Date)", value=[])
+                sw_range = st.date_input("請選擇範圍", value=[], key="old_sw_date")
                 if len(sw_range) == 2:
                     start_dt, end_dt = pd.to_datetime(sw_range[0]), pd.to_datetime(sw_range[1])
-                    
                     mask = (po_list['SHIP BEGIN DATE'] <= end_dt) & (po_list['SHIP END DATE'] >= start_dt)
                     valid_pos = po_list[mask]['PO NUMBER'].unique()
                     
                     po_list = po_list[po_list['PO NUMBER'].isin(valid_pos)]
                     po_raw = po_raw[po_raw['PO NUMBER'].isin(valid_pos)]
-                    
-                    if len(valid_pos) > 0:
-                        st.success(f"🔍 篩選完成：共保留 **{len(valid_pos)}** 筆符合此 SW 期間的 PO。")
-                    else:
-                        st.error("❌ 找不到符合此時間範圍的訂單，請重新選擇日期，或取消篩選。")
+                    if len(valid_pos) > 0: st.success(f"🔍 篩選完成：保留 {len(valid_pos)} 筆 PO。")
+                    else: 
+                        st.error("❌ 找不到符合此範圍的訂單。")
                         can_proceed = False
                 else:
-                    st.info("👈 請在日曆上點擊兩次，分別選擇範圍的起始與結束日。")
+                    st.info("👈 請選擇起始與結束日。")
                     can_proceed = False
 
             if can_proceed:
@@ -157,96 +174,38 @@ if check_password():
                 po_info = po_info[po_info['PO NUMBER'].isin(active_pos)].copy()
                 po_info['PO_CLEAN'] = po_info['PO NUMBER'].astype(str).str.strip().str.lstrip('0')
                 
-                # --- 港口對照表暴力掃描 ---
-                auto_port_dict = {}
-                if port_mapping_files:
-                    for port_file in port_mapping_files:
-                        try:
-                            raw_bytes = port_file.getvalue()
-                            try:
-                                content = raw_bytes.decode("utf-8").splitlines()
-                            except UnicodeDecodeError:
-                                content = raw_bytes.decode("big5", errors="ignore").splitlines()
-                                
-                            for line in content:
-                                line = line.strip()
-                                if not line: continue
-                                
-                                match = re.search(r'\d{3,4}-(\d+)-([A-Za-z0-9]+)', line)
-                                if match:
-                                    po_part = str(match.group(1)).strip().lstrip('0') 
-                                    port_part = str(match.group(2)).strip().lstrip('0').upper()
-                                    auto_port_dict[po_part] = port_part
-                                    continue
-                                    
-                                clean_line = re.sub(r'(?i)\b(po|port|no|num|number|code|港口|代碼|代號)\b|[:："\'#]', ' ', line)
-                                tokens = [t.strip() for t in re.split(r'[\s,;\t\-]+', clean_line) if t.strip()]
-                                
-                                if len(tokens) >= 2:
-                                    po_candidates = [t for t in tokens if t.isdigit() and len(t) >= 5]
-                                    if po_candidates:
-                                        po_part = str(po_candidates[0]).strip().lstrip('0')
-                                        port_candidates = [t for t in tokens if t != po_candidates[0]]
-                                        if port_candidates:
-                                            port_part = str(port_candidates[0]).strip().lstrip('0').upper()
-                                            auto_port_dict[po_part] = port_part
-                                    else:
-                                        po_part = str(tokens[0]).strip().lstrip('0')
-                                        port_part = str(tokens[1]).strip().lstrip('0').upper()
-                                        auto_port_dict[po_part] = port_part
-
-                        except Exception as e:
-                            st.warning(f"檔案 {port_file.name} 讀取港口失敗 ({e})")
-                
+                auto_port_dict = extract_port_mapping(port_mapping_files)
                 po_info['輸入港口代碼 (如:581)'] = po_info['PO_CLEAN'].map(auto_port_dict).fillna("")
                 
                 missing_ports_count = (po_info['輸入港口代碼 (如:581)'] == "").sum()
-                
                 st.divider()
-                st.subheader("📍 步驟 7: 最終港口確認")
                 if missing_ports_count > 0:
-                    st.warning(f"⚠️ 注意：有 **{missing_ports_count}** 筆 PO 在您上傳的對照表中找不到港口代碼！請直接在下方表格【連點兩下】手動補齊，否則報表將留空。")
-                    
+                    st.warning(f"⚠️ 注意：有 **{missing_ports_count}** 筆 PO 找不到港口代碼！請在下方手動補齊。")
                     display_cols = ["PO NUMBER", "PURPOSE", "SHIP_DATES", "輸入港口代碼 (如:581)"]
-                    edited_po_info = st.data_editor(
-                        po_info[display_cols].reset_index(drop=True),
-                        use_container_width=True,
-                        hide_index=True,
-                        disabled=["PO NUMBER", "PURPOSE", "SHIP_DATES"]
-                    )
+                    edited_po_info = st.data_editor(po_info[display_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
                     po_info['輸入港口代碼 (如:581)'] = edited_po_info['輸入港口代碼 (如:581)']
                 else:
-                    if port_mapping_files and auto_port_dict:
-                        st.success("🤖 完美！系統已成功為您自動填入 **100%** 的港口代碼，完全不需人工檢查！")
+                    if port_mapping_files: st.success("🤖 完美！已自動填寫 100% 港口代碼。")
                 
                 st.divider()
-                if st.button("🚀 開始自動生成 PO GRID", type="primary"):
-                    with st.spinner("資料處理與圖片載入中，這可能需要幾十秒鐘，請稍候..."):
+                if st.button("🚀 開始自動生成 PO GRID (舊版引擎)", type="primary", key="btn_old"):
+                    with st.spinner("舊版引擎運算中，請稍候..."):
                         try:
-                            # 處理圖片 ZIP 包
                             image_dict = {}
                             if image_zip_files:
                                 for zip_file_obj in image_zip_files:
                                     with zipfile.ZipFile(zip_file_obj, 'r') as z:
                                         for file_info in z.infolist():
-                                            if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'):
-                                                continue
+                                            if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'): continue
                                             if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
                                                 base_name = os.path.basename(file_info.filename)
-                                                dpci_name = os.path.splitext(base_name)[0].strip()
-                                                clean_dpci = dpci_name.split('_')[0] 
-                                                if clean_dpci not in image_dict:
-                                                    image_dict[clean_dpci] = z.read(file_info.filename)
+                                                clean_dpci = os.path.splitext(base_name)[0].strip().split('_')[0] 
+                                                if clean_dpci not in image_dict: image_dict[clean_dpci] = z.read(file_info.filename)
 
-                            # 讀取並合併 PCN
                             prod_data_list = []
                             for p_file in prod_files:
-                                if p_file.name.lower().endswith('.csv'):
-                                    df_temp = pd.read_csv(p_file)
-                                else:
-                                    df_temp = pd.read_excel(p_file)
+                                df_temp = pd.read_csv(p_file) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file)
                                 prod_data_list.append(df_temp)
-                            
                             prod_data = pd.concat(prod_data_list, ignore_index=True)
 
                             po_processed_records = []
@@ -261,54 +220,36 @@ if check_password():
                                 cls = str(int(row['CLASS'])).zfill(2) if pd.notna(row['CLASS']) else '00'
                                 itm = str(int(row['ITEM'])).zfill(4) if pd.notna(row['ITEM']) else '0000'
                                 dpci = f"{dept}-{cls}-{itm}"
-                                
                                 try: qty = float(str(row['TOTAL ITEM QTY']).replace(',', ''))
                                 except: qty = 0.0
-                                    
                                 desc = str(row['ITEM DESCRIPTION']).strip().upper()
                                 po_num = row['PO NUMBER']
-                                
                                 raw_style = str(row['VENDOR STYLE']).strip() if pd.notna(row['VENDOR STYLE']) else ''
                                 raw_upc = str(row['ITEM BAR CODE']).strip() if pd.notna(row['ITEM BAR CODE']) else ''
                                 
-                                if dpci not in item_info_dict and raw_style:
-                                    item_info_dict[dpci] = {'style': raw_style, 'upc': raw_upc}
+                                if dpci not in item_info_dict and raw_style: item_info_dict[dpci] = {'style': raw_style, 'upc': raw_upc}
                                 
                                 if desc.startswith('ASSORTMENT'):
                                     parent_dpci_list.add(dpci)
                                     style_val = raw_style
-                                    if style_val and not style_val.upper().startswith('ASSORT'):
-                                        style_val = f"ASSORTMENT-{style_val}"
-                                        
-                                    parent_info_dict[dpci] = {
-                                        'style': style_val,
-                                        'upc': raw_upc
-                                    }
-                                    if dpci in item_info_dict:
-                                        item_info_dict[dpci]['style'] = style_val
-                                        
+                                    if style_val and not style_val.upper().startswith('ASSORT'): style_val = f"ASSORTMENT-{style_val}"
+                                    parent_info_dict[dpci] = {'style': style_val, 'upc': raw_upc}
+                                    if dpci in item_info_dict: item_info_dict[dpci]['style'] = style_val
                                     po_processed_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': dpci, 'QTY': qty, 'IS_PARENT': True})
                                     
                                     c_dept = str(int(row['COMPONENT DEPARTMENT'])) if pd.notna(row['COMPONENT DEPARTMENT']) else '0'
                                     c_cls = str(int(row['COMPONENT CLASS'])).zfill(2) if pd.notna(row['COMPONENT CLASS']) else '00'
                                     c_itm = str(int(row['COMPONENT ITEM'])).zfill(4) if pd.notna(row['COMPONENT ITEM']) else '0000'
                                     c_dpci = f"{c_dept}-{c_cls}-{c_itm}"
-                                    
                                     c_style = str(row['COMPONENT STYLE']).strip() if 'COMPONENT STYLE' in row and pd.notna(row['COMPONENT STYLE']) else ''
-                                    if c_dpci not in item_info_dict and c_style:
-                                        item_info_dict[c_dpci] = {'style': c_style, 'upc': ''}
-                                    
+                                    if c_dpci not in item_info_dict and c_style: item_info_dict[c_dpci] = {'style': c_style, 'upc': ''}
                                     try: c_qty = float(str(row['COMPONENT ITEM TOTAL QTY']).replace(',', ''))
                                     except: c_qty = 0.0
                                     try: c_assort = float(str(row['COMPONENT ASSORT QTY']).replace(',', ''))
                                     except: c_assort = 0.0
-                                        
                                     child_assort_qty_dict[c_dpci] = c_assort
-                                    
-                                    if dpci not in parent_to_children:
-                                        parent_to_children[dpci] = set()
+                                    if dpci not in parent_to_children: parent_to_children[dpci] = set()
                                     parent_to_children[dpci].add(c_dpci)
-                                    
                                     po_processed_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': c_dpci, 'QTY': c_qty, 'IS_PARENT': False})
                                 else:
                                     po_processed_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': dpci, 'QTY': qty, 'IS_PARENT': False})
@@ -320,22 +261,15 @@ if check_password():
 
                             po_info['PORT_NAME'] = po_info['輸入港口代碼 (如:581)'].astype(str).str.strip()
                             po_info['PORT_NAME'] = po_info['PORT_NAME'].replace({'': '未指定港口', 'nan': '未指定港口'})
-
                             po_raw_merged = po_processed_unique.merge(po_info[['PO NUMBER', 'PURPOSE', 'SHIP_DATES', 'PORT_NAME']], on='PO NUMBER', how='left')
                             po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('標籤遺失')
                             po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('日期遺失')
                             po_raw_merged['PORT_NAME'] = po_raw_merged['PORT_NAME'].fillna('未指定港口')
                             
-                            pivot_df_temp = po_raw_merged.pivot_table(
-                                index='DPCI_MERGE', columns=['PURPOSE', 'PO NUMBER', 'SHIP_DATES', 'PORT_NAME'], 
-                                values='QTY', aggfunc='sum'
-                            ).fillna(0)
+                            pivot_df_temp = po_raw_merged.pivot_table(index='DPCI_MERGE', columns=['PURPOSE', 'PO NUMBER', 'SHIP_DATES', 'PORT_NAME'], values='QTY', aggfunc='sum').fillna(0)
                             
-                            new_pivot_cols = []
-                            for col in pivot_df_temp.columns:
-                                new_pivot_cols.append((col[0], '', col[1], col[2], col[3]))
+                            new_pivot_cols = [(col[0], '', col[1], col[2], col[3]) for col in pivot_df_temp.columns]
                             pivot_df = pd.DataFrame(pivot_df_temp.values, index=pivot_df_temp.index, columns=pd.MultiIndex.from_tuples(new_pivot_cols))
-                            
                             pivot_df[('', 'PO TOTAL', '', '', '')] = pivot_df.sum(axis=1)
                             
                             for parent_dpci in parent_dpci_list:
@@ -344,27 +278,11 @@ if check_password():
                                     for col in pivot_df.columns:
                                         if col[1] != 'PO TOTAL': 
                                             val = pivot_df.loc[parent_dpci, col]
-                                            if isinstance(val, (int, float)) and val > 0:
-                                                pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val)})"
-                                                
+                                            if isinstance(val, (int, float)) and val > 0: pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val)})"
                             pivot_df = pivot_df.replace({0: '', 0.0: ''})
 
-                            if 'DPCI' not in prod_data.columns:
-                                st.error("❌ 產品資料(PCN) 中找不到必要的 'DPCI' 欄位。請檢查上傳的檔案格式。")
-                                st.stop()
-                                
                             prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
-                            
-                            if 'Manufacturer Style # *' not in prod_data.columns:
-                                prod_data['Manufacturer Style # *'] = ''
-                                
-                            def format_upc(val):
-                                if pd.isna(val) or val == '': return ''
-                                try: 
-                                    v = str(int(float(val)))
-                                    return v.zfill(12) if len(v) < 12 else v
-                                except: return str(val).strip()
-                            
+                            if 'Manufacturer Style # *' not in prod_data.columns: prod_data['Manufacturer Style # *'] = ''
                             if 'Barcode' in prod_data.columns: prod_data['Barcode'] = prod_data['Barcode'].apply(format_upc)
                             else: prod_data['Barcode'] = ''
 
@@ -373,13 +291,10 @@ if check_password():
                                     idx_list = prod_data.index[prod_data['DPCI_MERGE'] == dpci_key].tolist()
                                     for i in idx_list:
                                         curr_style = str(prod_data.at[i, 'Manufacturer Style # *']).strip()
-                                        if curr_style in ('', 'nan') and info_dict['style']:
-                                            prod_data.at[i, 'Manufacturer Style # *'] = info_dict['style']
-                                            
+                                        if curr_style in ('', 'nan') and info_dict['style']: prod_data.at[i, 'Manufacturer Style # *'] = info_dict['style']
                                         if info_dict['upc']:
                                             curr_upc = str(prod_data.at[i, 'Barcode']).strip()
-                                            if curr_upc in ('', 'nan'):
-                                                prod_data.at[i, 'Barcode'] = format_upc(info_dict['upc'])
+                                            if curr_upc in ('', 'nan'): prod_data.at[i, 'Barcode'] = format_upc(info_dict['upc'])
 
                             for parent_dpci, info in parent_info_dict.items():
                                 vendor_name, factory_name, factory_id = '', '', ''
@@ -390,7 +305,6 @@ if check_password():
                                         factory_name = child_rows.iloc[0].get('Factory Name', '')
                                         factory_id = child_rows.iloc[0].get('Factory ID', '')
                                         if vendor_name and factory_name: break
-                                        
                                 if parent_dpci in prod_data['DPCI_MERGE'].values:
                                     idx = prod_data.index[prod_data['DPCI_MERGE'] == parent_dpci].tolist()
                                     for i in idx:
@@ -419,8 +333,7 @@ if check_password():
                                     assort_qty = child_assort_qty_dict.get(child_dpci, 0)
                                     if child_dpci in prod_data['DPCI_MERGE'].values:
                                         idx = prod_data.index[prod_data['DPCI_MERGE'] == child_dpci].tolist()
-                                        for i in idx:
-                                            prod_data.at[i, 'Assortment'] = int(assort_qty) if float(assort_qty).is_integer() else float(assort_qty)
+                                        for i in idx: prod_data.at[i, 'Assortment'] = int(assort_qty) if float(assort_qty).is_integer() else float(assort_qty)
 
                             if 'Factory Name' not in prod_data.columns: prod_data['Factory Name'] = '未提供工廠名稱'
                             if 'Factory ID' not in prod_data.columns: prod_data['Factory ID'] = ''
@@ -428,24 +341,14 @@ if check_password():
                             def make_maker(row):
                                 fid = str(row.get('Factory ID', '')).replace('.0', '').strip()
                                 fname = str(row.get('Factory Name', '')).strip()
-                                if fid and fid != 'nan': return f"{fid}-{fname}"
-                                return fname
+                                return f"{fid}-{fname}" if fid and fid != 'nan' else fname
                             prod_data['Maker'] = prod_data.apply(make_maker, axis=1)
 
-                            if 'Retail Packaging Format (1) *' in prod_data.columns:
-                                prod_data['Packaging'] = prod_data['Retail Packaging Format (1) *'].fillna('')
-                            else: prod_data['Packaging'] = ''
-
+                            prod_data['Packaging'] = prod_data['Retail Packaging Format (1) *'].fillna('') if 'Retail Packaging Format (1) *' in prod_data.columns else ''
                             prod_data['IMAGE'] = ''
                             prod_data['Age'] = ''
 
-                            desired_left_columns = [
-                                'DPCI', 'Manufacturer Style # *', 'IMAGE', 'Product Description', 
-                                'Barcode', 'Primary Raw Material Type', 'Age', 'Maker', 
-                                'Packaging', 'Inner Pack Unit Quantity', 'Case Unit Quantity', 'Assortment',
-                                'Import Vendor Name', 'Factory Name'
-                            ]
-                            
+                            desired_left_columns = ['DPCI', 'Manufacturer Style # *', 'IMAGE', 'Product Description', 'Barcode', 'Primary Raw Material Type', 'Age', 'Maker', 'Packaging', 'Inner Pack Unit Quantity', 'Case Unit Quantity', 'Assortment', 'Import Vendor Name', 'Factory Name']
                             for col in desired_left_columns:
                                 if col not in prod_data.columns: prod_data[col] = ''
                                     
@@ -462,7 +365,6 @@ if check_password():
 
                             zip_buffer = io.BytesIO()
                             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                                
                                 actual_vendor_col = [c for c in final_df.columns if c[1] == 'Import Vendor Name'][0]
                                 actual_factory_col = [c for c in final_df.columns if c[1] == 'Factory Name'][0]
                                 final_df[actual_vendor_col] = final_df[actual_vendor_col].replace('', '未指定供應商')
@@ -471,22 +373,13 @@ if check_password():
                                 excel_buffer = io.BytesIO()
                                 with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
                                     grouped_factory = final_df.groupby(actual_factory_col)
-                                    
                                     for factory_name, factory_data in grouped_factory:
                                         safe_factory_name = str(factory_name).replace('/', '_').replace('\\', '_').replace('[', '').replace(']', '').replace('*', '').replace(':', '').replace('?', '')[:31]
                                         export_data = factory_data.drop(columns=[actual_vendor_col, actual_factory_col])
-                                        
                                         cols_to_keep = []
                                         for col in export_data.columns:
                                             if col[2] != '': 
-                                                keep = False
-                                                for val in export_data[col]:
-                                                    if isinstance(val, (int, float)) and val > 0:
-                                                        keep = True
-                                                        break
-                                                    elif isinstance(val, str) and val not in ('', '0', '0.0'):
-                                                        keep = True
-                                                        break
+                                                keep = any(isinstance(val, (int, float)) and val > 0 or isinstance(val, str) and val not in ('', '0', '0.0') for val in export_data[col])
                                                 if keep: cols_to_keep.append(col)
                                             else: cols_to_keep.append(col)
                                                 
@@ -522,24 +415,19 @@ if check_password():
                                         export_data.columns = pd.MultiIndex.from_tuples(unmerged_columns)
                                         export_data_reset = export_data.reset_index(drop=True)
                                         export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
-                                        
                                         ws = writer.sheets[safe_factory_name]
                                         ws.delete_cols(1) 
                                         
                                         if image_zip_files and image_dict:
-                                            dpci_col_idx = None
-                                            img_col_idx = None
+                                            dpci_col_idx, img_col_idx = None, None
                                             for idx, col in enumerate(export_data_reset.columns):
                                                 if col[1] == 'DPCI': dpci_col_idx = idx + 1
                                                 if col[1] == 'IMAGE': img_col_idx = idx + 1
-                                            
                                             if dpci_col_idx and img_col_idx:
                                                 img_col_letter = get_column_letter(img_col_idx)
                                                 ws.column_dimensions[img_col_letter].width = 13 
-                                                
                                                 for r_idx in range(6, ws.max_row + 1):
                                                     cell_dpci_val = str(ws.cell(row=r_idx, column=dpci_col_idx).value).strip()
-                                                    
                                                     if cell_dpci_val in image_dict:
                                                         img_bytes = io.BytesIO(image_dict[cell_dpci_val])
                                                         img_obj = OpenpyxlImage(img_bytes)
@@ -552,23 +440,318 @@ if check_password():
                             
                             st.success("✨ 處理完成！已為您產出合併版 PO GRID 表格。")
                             st.download_button(
-                                label="📦 點擊下載合併版 PO GRID (ZIP壓縮檔)",
+                                label="📦 點擊下載合併版 PO GRID (ZIP)",
                                 data=zip_buffer.getvalue(),
-                                file_name="PO_GRIDs_Output.zip",
+                                file_name="PO_GRIDs_Output_Old.zip",
                                 mime="application/zip"
                             )
-                            
                         except Exception as e:
                             st.error(f"❌ 處理過程中發生錯誤: {e}")
 
     # ------------------------------------------
-    # 分頁二：Program Sheet 圖片自動萃取與命名工具 
+    # 分頁二：新版 PO GRID (Modern PO Visibility)
+    # ------------------------------------------
+    with tab3:
+        st.markdown("""
+        此為 **全新 Modern PO** 專屬通道！由於資料來源不含子商品結構，排版會更為扁平俐落。
+        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC Level` 三份 Modern CSV 同時丟入第一格，系統會自動在背後幫您分類重組！
+        """)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次多選並上傳 3 份 PO 相關的 CSV)", type=['csv'], accept_multiple_files=True, key="m_po")
+        with col2:
+            m_prod_files = st.file_uploader("📁 2. 產品資料(PCN)\n(支援多檔)", type=['xlsx', 'csv'], accept_multiple_files=True, key="m_pcn")
+            m_image_zip_files = st.file_uploader("📁 3. 產品圖片包(ZIP)\n(支援多檔)", type=['zip'], accept_multiple_files=True, key="m_zip")
+        with col3:
+            m_port_mapping_files = st.file_uploader("📁 4. 港口對照表 (選傳)\n(可用來覆蓋預設港口)", type=['csv', 'txt'], accept_multiple_files=True, key="m_port")
+
+        if modern_po_files and m_prod_files:
+            df_po_level, df_item_level, df_dc_level = None, None, None
+            
+            # 💡 智慧辨識上傳的 3 份檔案
+            for f in modern_po_files:
+                try:
+                    df_temp = pd.read_csv(f, dtype=str, nrows=5)
+                    cols = df_temp.columns.tolist()
+                    f.seek(0)
+                    if 'PO PURPOSE' in cols or 'PO CREATE TYPE' in cols:
+                        df_po_level = pd.read_csv(f, dtype=str)
+                    elif 'MANUFACTURER STYLE' in cols:
+                        df_item_level = pd.read_csv(f, dtype=str)
+                    elif 'LOCATION' in cols and 'REVISED QUANTITY' in cols:
+                        df_dc_level = pd.read_csv(f, dtype=str)
+                except Exception as e:
+                    st.warning(f"檔案讀取失敗 {f.name}: {e}")
+
+            if df_po_level is None or df_item_level is None or df_dc_level is None:
+                st.error("❌ 系統未能集齊 3 份必要的 Modern 報表。請確認您同時上傳了 PO Level、Item Level 與 DC/Item Level 三份檔案！")
+            else:
+                # 正規化 PO NUMBER
+                df_po_level['PO NUMBER'] = df_po_level['PO #'].astype(str).str.split('.').str[0].str.strip()
+                df_item_level['PO NUMBER'] = df_item_level['PO #'].astype(str).str.split('.').str[0].str.strip()
+                df_dc_level['PO NUMBER'] = df_dc_level['PO #'].astype(str).str.split('.').str[0].str.strip()
+
+                df_po_level['SHIP BEGIN DATE'] = pd.to_datetime(df_po_level['ORIG SHIP BEGIN'], errors='coerce')
+                df_po_level['SHIP END DATE'] = pd.to_datetime(df_po_level['ORIG SHIP END'], errors='coerce')
+
+                st.divider()
+                st.subheader("📍 步驟 5: 篩選出貨期間 / Ship Window (選填)")
+                m_use_sw_filter = st.checkbox("📅 啟用 SW 範圍篩選", key="m_sw")
+                
+                can_proceed_m = True
+                if m_use_sw_filter:
+                    sw_range_m = st.date_input("請選擇範圍", value=[], key="m_sw_date")
+                    if len(sw_range_m) == 2:
+                        start_dt, end_dt = pd.to_datetime(sw_range_m[0]), pd.to_datetime(sw_range_m[1])
+                        mask = (df_po_level['SHIP BEGIN DATE'] <= end_dt) & (df_po_level['SHIP END DATE'] >= start_dt)
+                        valid_pos = df_po_level[mask]['PO NUMBER'].unique()
+                        
+                        df_po_level = df_po_level[df_po_level['PO NUMBER'].isin(valid_pos)]
+                        df_item_level = df_item_level[df_item_level['PO NUMBER'].isin(valid_pos)]
+                        df_dc_level = df_dc_level[df_dc_level['PO NUMBER'].isin(valid_pos)]
+                        
+                        if len(valid_pos) > 0: st.success(f"🔍 篩選完成：保留 {len(valid_pos)} 筆 PO。")
+                        else: 
+                            st.error("❌ 找不到符合此範圍的訂單。")
+                            can_proceed_m = False
+                    else:
+                        st.info("👈 請選擇起始與結束日。")
+                        can_proceed_m = False
+
+                if can_proceed_m:
+                    # 擷取 PURPOSE 與日期
+                    df_po_level['SHIP_DATES'] = df_po_level['SHIP BEGIN DATE'].dt.strftime('%m/%d') + '-' + df_po_level['SHIP END DATE'].dt.strftime('%m/%d')
+                    purp_col = 'PO PURPOSE' if 'PO PURPOSE' in df_po_level.columns else 'PURPOSE' if 'PURPOSE' in df_po_level.columns else None
+                    if purp_col: po_info = df_po_level[['PO NUMBER', purp_col, 'SHIP_DATES']].copy().rename(columns={purp_col: 'PURPOSE'})
+                    else: po_info = df_po_level[['PO NUMBER', 'SHIP_DATES']].copy().assign(PURPOSE='')
+                    po_info.drop_duplicates(inplace=True)
+
+                    # 整理 Item level (取得 Style 和 UPC)
+                    item_info_dict = {}
+                    parent_dpci_list = set()
+                    df_item_level['DPCI_MERGE'] = df_item_level['DPCI'].astype(str).str.strip()
+                    for _, row in df_item_level.iterrows():
+                        dpci = str(row['DPCI_MERGE'])
+                        style = str(row.get('MANUFACTURER STYLE', '')).strip()
+                        upc = str(row.get('UPC', '')).split('.')[0].strip()
+                        desc = str(row.get('ITEM DESCRIPTION', '')).strip().upper()
+                        if desc.startswith('ASSORT'): parent_dpci_list.add(dpci)
+                        if style == 'nan': style = ''
+                        if upc == 'nan': upc = ''
+                        if dpci not in item_info_dict: item_info_dict[dpci] = {'style': style, 'upc': upc}
+                        else:
+                            if style and not item_info_dict[dpci]['style']: item_info_dict[dpci]['style'] = style
+                            if upc and not item_info_dict[dpci]['upc']: item_info_dict[dpci]['upc'] = upc
+
+                    # 整理 DC Level (取得港口與數量)
+                    df_dc_level['DPCI_MERGE'] = df_dc_level['DPCI'].astype(str).str.strip()
+                    df_dc_level['QTY'] = pd.to_numeric(df_dc_level['REVISED QUANTITY'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
+                    df_dc_level['PO_CLEAN'] = df_dc_level['PO NUMBER'].str.lstrip('0')
+                    df_dc_level['NATIVE_PORT'] = df_dc_level['LOCATION'].astype(str).str.replace(r'\.0$', '', regex=True).replace({'nan': '', 'None': ''}).str.strip()
+
+                    # 解析港口
+                    auto_port_dict_m = extract_port_mapping(m_port_mapping_files)
+                    
+                    unique_po_ports = df_dc_level[['PO NUMBER', 'PO_CLEAN', 'NATIVE_PORT']].drop_duplicates(subset=['PO NUMBER'])
+                    unique_po_ports['輸入港口代碼 (如:581)'] = unique_po_ports['PO_CLEAN'].map(auto_port_dict_m).fillna(unique_po_ports['NATIVE_PORT']).replace({'nan': '', 'None': ''})
+                    
+                    missing_ports_count_m = (unique_po_ports['輸入港口代碼 (如:581)'] == "").sum()
+                    
+                    st.divider()
+                    if missing_ports_count_m > 0:
+                        st.warning(f"⚠️ 注意：有 **{missing_ports_count_m}** 筆 PO 找不到港口代碼！請在下方手動補齊。")
+                        display_cols = ["PO NUMBER", "NATIVE_PORT", "輸入港口代碼 (如:581)"]
+                        edited_unique = st.data_editor(unique_po_ports[display_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
+                        unique_po_ports['輸入港口代碼 (如:581)'] = edited_unique['輸入港口代碼 (如:581)'].values
+                    else:
+                        st.success("🤖 完美！已自動填寫 100% 港口代碼。")
+
+                    # 將確認好的港口 map 回 dc_level
+                    port_lookup = dict(zip(unique_po_ports['PO NUMBER'], unique_po_ports['輸入港口代碼 (如:581)']))
+                    df_dc_level['PORT_NAME'] = df_dc_level['PO NUMBER'].map(port_lookup).fillna('未指定港口').replace({'': '未指定港口'})
+
+                    # 合併成準備 Pivot 的格式
+                    po_raw_merged = df_dc_level.merge(po_info, on='PO NUMBER', how='left')
+                    po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('')
+                    po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('日期遺失')
+
+                    st.divider()
+                    if st.button("🚀 開始自動生成 PO GRID (新版引擎)", type="primary", key="btn_new"):
+                        with st.spinner("新版引擎運算中，這可能需要幾十秒鐘，請稍候..."):
+                            try:
+                                pivot_df_temp = po_raw_merged.pivot_table(index='DPCI_MERGE', columns=['PURPOSE', 'PO NUMBER', 'SHIP_DATES', 'PORT_NAME'], values='QTY', aggfunc='sum').fillna(0)
+                                new_pivot_cols = [(col[0], '', col[1], col[2], col[3]) for col in pivot_df_temp.columns]
+                                pivot_df = pd.DataFrame(pivot_df_temp.values, index=pivot_df_temp.index, columns=pd.MultiIndex.from_tuples(new_pivot_cols))
+                                pivot_df[('', 'PO TOTAL', '', '', '')] = pivot_df.sum(axis=1)
+                                
+                                for parent_dpci in parent_dpci_list:
+                                    if parent_dpci in pivot_df.index:
+                                        pivot_df.loc[parent_dpci, ('', 'PO TOTAL', '', '', '')] = '' 
+                                        for col in pivot_df.columns:
+                                            if col[1] != 'PO TOTAL': 
+                                                val = pivot_df.loc[parent_dpci, col]
+                                                if isinstance(val, (int, float)) and val > 0: pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val)})"
+                                pivot_df = pivot_df.replace({0: '', 0.0: ''})
+
+                                # 處理 PCN 
+                                prod_data_list = []
+                                for p_file in m_prod_files:
+                                    df_temp = pd.read_csv(p_file) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file)
+                                    prod_data_list.append(df_temp)
+                                prod_data = pd.concat(prod_data_list, ignore_index=True)
+                                
+                                if 'DPCI' not in prod_data.columns:
+                                    st.error("❌ 產品資料(PCN) 缺少 'DPCI' 欄位。")
+                                    st.stop()
+                                    
+                                prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
+                                if 'Manufacturer Style # *' not in prod_data.columns: prod_data['Manufacturer Style # *'] = ''
+                                if 'Barcode' in prod_data.columns: prod_data['Barcode'] = prod_data['Barcode'].apply(format_upc)
+                                else: prod_data['Barcode'] = ''
+
+                                # 回補 Style 與 UPC
+                                for dpci_key, info_dict in item_info_dict.items():
+                                    if dpci_key in prod_data['DPCI_MERGE'].values:
+                                        idx_list = prod_data.index[prod_data['DPCI_MERGE'] == dpci_key].tolist()
+                                        for i in idx_list:
+                                            curr_style = str(prod_data.at[i, 'Manufacturer Style # *']).strip()
+                                            if curr_style in ('', 'nan') and info_dict['style']: prod_data.at[i, 'Manufacturer Style # *'] = info_dict['style']
+                                            if info_dict['upc']:
+                                                curr_upc = str(prod_data.at[i, 'Barcode']).strip()
+                                                if curr_upc in ('', 'nan'): prod_data.at[i, 'Barcode'] = format_upc(info_dict['upc'])
+
+                                # 若 DPCI 存在於 PO 卻不在 PCN，主動新增空白列確保不漏印
+                                existing_pcn_dpcis = prod_data['DPCI_MERGE'].values
+                                missing_dpcis = [d for d in pivot_df.index if d not in existing_pcn_dpcis]
+                                new_rows = []
+                                for miss_dpci in missing_dpcis:
+                                    info = item_info_dict.get(miss_dpci, {'style': '', 'upc': ''})
+                                    match_item = df_item_level[df_item_level['DPCI_MERGE'] == miss_dpci]
+                                    vendor_name = str(match_item.iloc[0].get('VENDOR NAME', '')).strip() if not match_item.empty else ""
+                                    new_row = {c: '' for c in prod_data.columns}
+                                    new_row['DPCI'] = miss_dpci
+                                    new_row['DPCI_MERGE'] = miss_dpci
+                                    new_row['Manufacturer Style # *'] = info['style']
+                                    new_row['Barcode'] = format_upc(info['upc'])
+                                    new_row['Import Vendor Name'] = vendor_name
+                                    new_row['Factory Name'] = vendor_name 
+                                    new_rows.append(new_row)
+                                if new_rows: prod_data = pd.concat([prod_data, pd.DataFrame(new_rows)], ignore_index=True)
+
+                                if 'Factory Name' not in prod_data.columns: prod_data['Factory Name'] = '未提供工廠名稱'
+                                if 'Factory ID' not in prod_data.columns: prod_data['Factory ID'] = ''
+                                def make_maker(row):
+                                    fid = str(row.get('Factory ID', '')).replace('.0', '').strip()
+                                    fname = str(row.get('Factory Name', '')).strip()
+                                    return f"{fid}-{fname}" if fid and fid != 'nan' else fname
+                                prod_data['Maker'] = prod_data.apply(make_maker, axis=1)
+
+                                prod_data['Packaging'] = prod_data['Retail Packaging Format (1) *'].fillna('') if 'Retail Packaging Format (1) *' in prod_data.columns else ''
+                                prod_data['Assortment'] = '' 
+                                prod_data['IMAGE'] = ''
+                                prod_data['Age'] = ''
+
+                                desired_left_columns = ['DPCI', 'Manufacturer Style # *', 'IMAGE', 'Product Description', 'Barcode', 'Primary Raw Material Type', 'Age', 'Maker', 'Packaging', 'Inner Pack Unit Quantity', 'Case Unit Quantity', 'Assortment', 'Import Vendor Name', 'Factory Name']
+                                for col in desired_left_columns:
+                                    if col not in prod_data.columns: prod_data[col] = ''
+                                        
+                                left_data = prod_data[desired_left_columns + ['DPCI_MERGE']].drop_duplicates(subset=['DPCI_MERGE']).set_index('DPCI_MERGE')
+                                def get_left_tuple(col, idx):
+                                    spaces = " " * idx 
+                                    if col == 'DPCI': return ('Program Name', 'DPCI', '', '', '')
+                                    elif col == 'Barcode': return (spaces, 'UPC', '', '', '')
+                                    else: return (spaces, col, '', '', '')
+
+                                left_data.columns = pd.MultiIndex.from_tuples([get_left_tuple(col, i+1) for i, col in enumerate(left_data.columns)])
+                                final_df = left_data.join(pivot_df, how='inner')
+
+                                image_dict = {}
+                                if m_image_zip_files:
+                                    for zip_file_obj in m_image_zip_files:
+                                        with zipfile.ZipFile(zip_file_obj, 'r') as z:
+                                            for file_info in z.infolist():
+                                                if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'): continue
+                                                if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                                                    base_name = os.path.basename(file_info.filename)
+                                                    clean_dpci = os.path.splitext(base_name)[0].strip().split('_')[0] 
+                                                    if clean_dpci not in image_dict: image_dict[clean_dpci] = z.read(file_info.filename)
+
+                                zip_buffer = io.BytesIO()
+                                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                                    actual_vendor_col = [c for c in final_df.columns if c[1] == 'Import Vendor Name'][0]
+                                    actual_factory_col = [c for c in final_df.columns if c[1] == 'Factory Name'][0]
+                                    final_df[actual_vendor_col] = final_df[actual_vendor_col].replace('', '未指定供應商')
+                                    final_df[actual_factory_col] = final_df[actual_factory_col].replace('', '未指定工廠')
+                                    
+                                    excel_buffer = io.BytesIO()
+                                    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                                        grouped_factory = final_df.groupby(actual_factory_col)
+                                        for factory_name, factory_data in grouped_factory:
+                                            safe_factory_name = str(factory_name).replace('/', '_').replace('\\', '_').replace('[', '').replace(']', '').replace('*', '').replace(':', '').replace('?', '')[:31]
+                                            export_data = factory_data.drop(columns=[actual_vendor_col, actual_factory_col])
+                                            cols_to_keep = []
+                                            for col in export_data.columns:
+                                                if col[2] != '': 
+                                                    keep = any(isinstance(val, (int, float)) and val > 0 or isinstance(val, str) and val not in ('', '0', '0.0') for val in export_data[col])
+                                                    if keep: cols_to_keep.append(col)
+                                                else: cols_to_keep.append(col)
+                                                    
+                                            export_data = export_data[cols_to_keep]
+                                            
+                                            # 新版無子商品結構，直接輸出
+                                            unmerged_columns = []
+                                            po_idx = 0
+                                            for col in export_data.columns:
+                                                if col[2] != '': 
+                                                    new_purpose = str(col[0]) + (" " * po_idx) 
+                                                    unmerged_columns.append((new_purpose, col[1], col[2], col[3], col[4]))
+                                                    po_idx += 1
+                                                else: unmerged_columns.append(col)
+                                                    
+                                            export_data.columns = pd.MultiIndex.from_tuples(unmerged_columns)
+                                            export_data_reset = export_data.reset_index(drop=True)
+                                            export_data_reset.to_excel(writer, index=True, sheet_name=safe_factory_name)
+                                            ws = writer.sheets[safe_factory_name]
+                                            ws.delete_cols(1) 
+                                            
+                                            if m_image_zip_files and image_dict:
+                                                dpci_col_idx, img_col_idx = None, None
+                                                for idx, col in enumerate(export_data_reset.columns):
+                                                    if col[1] == 'DPCI': dpci_col_idx = idx + 1
+                                                    if col[1] == 'IMAGE': img_col_idx = idx + 1
+                                                if dpci_col_idx and img_col_idx:
+                                                    img_col_letter = get_column_letter(img_col_idx)
+                                                    ws.column_dimensions[img_col_letter].width = 13 
+                                                    for r_idx in range(6, ws.max_row + 1):
+                                                        cell_dpci_val = str(ws.cell(row=r_idx, column=dpci_col_idx).value).strip()
+                                                        if cell_dpci_val in image_dict:
+                                                            img_bytes = io.BytesIO(image_dict[cell_dpci_val])
+                                                            img_obj = OpenpyxlImage(img_bytes)
+                                                            img_obj.width = 90
+                                                            img_obj.height = 90
+                                                            ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
+                                                            ws.row_dimensions[r_idx].height = 70 
+                                    
+                                    zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
+                                
+                                st.success("✨ 處理完成！已為您產出新版 PO GRID 表格。")
+                                st.download_button(
+                                    label="📦 點擊下載合併版 PO GRID (ZIP)",
+                                    data=zip_buffer.getvalue(),
+                                    file_name="PO_GRIDs_Output_Modern.zip",
+                                    mime="application/zip"
+                                )
+                            except Exception as e:
+                                st.error(f"❌ 新版處理過程中發生錯誤: {e}")
+
+    # ------------------------------------------
+    # 分頁三：Program Sheet 圖片自動萃取與命名工具 
     # ------------------------------------------
     with tab2:
         st.markdown("""
         ### 🪄 圖片自動命名法寶 (無差別抓取版)
         此工具繞過了一般程式對「圖片群組化」的盲區，直接潛入 Excel 底層，將 **100% 所有的實體圖片** 硬抓出來。
-        如有無法自動比對 DPCI 的游離圖片，系統也會自動命名為 `Unmatched_Image_X` 確保一併匯出給你！
         """)
         
         ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx)", type=['xlsx'], key="ps_uploader")
@@ -590,11 +773,7 @@ if check_password():
                                 if cell_val and isinstance(cell_val, str):
                                     match = dpci_pattern.search(cell_val)
                                     if match:
-                                        dpci_locations_by_sheet[sheet_name].append({
-                                            'dpci': match.group(0),
-                                            'row': r,
-                                            'col': c
-                                        })
+                                        dpci_locations_by_sheet[sheet_name].append({'dpci': match.group(0), 'row': r, 'col': c})
                     
                     ps_file.seek(0)
                     images_info = []
@@ -602,13 +781,11 @@ if check_password():
                     with zipfile.ZipFile(ps_file, 'r') as z:
                         namelist = z.namelist()
                         media_files = {n: z.read(n) for n in namelist if n.startswith('xl/media/')}
-                        
                         wb_rels = {}
                         if 'xl/_rels/workbook.xml.rels' in namelist:
                             root = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
                             for rel in root.iter():
-                                if rel.tag.endswith('}Relationship'):
-                                    wb_rels[rel.attrib.get('Id')] = rel.attrib.get('Target')
+                                if rel.tag.endswith('}Relationship'): wb_rels[rel.attrib.get('Id')] = rel.attrib.get('Target')
                                 
                         sheet_name_to_path = {}
                         if 'xl/workbook.xml' in namelist:
@@ -617,13 +794,11 @@ if check_password():
                                 if sheet.tag.endswith('}sheet'):
                                     rId = sheet.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
                                     name = sheet.attrib.get('name')
-                                    if rId and rId in wb_rels:
-                                        sheet_name_to_path[name] = resolve_zip_path('xl', wb_rels[rId])
+                                    if rId and rId in wb_rels: sheet_name_to_path[name] = resolve_zip_path('xl', wb_rels[rId])
 
                         for sheet_name, sheet_path in sheet_name_to_path.items():
                             if sheet_path not in namelist: continue
                             sheet_xml = ET.fromstring(z.read(sheet_path))
-                            
                             for drawing in sheet_xml.iter():
                                 if drawing.tag.endswith('}drawing'):
                                     draw_rId = drawing.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
@@ -645,22 +820,17 @@ if check_password():
                                     if drawing_rels_path in namelist:
                                         d_rels_root = ET.fromstring(z.read(drawing_rels_path))
                                         for rel in d_rels_root.iter():
-                                            if rel.tag.endswith('}Relationship'):
-                                                draw_rels[rel.attrib.get('Id')] = rel.attrib.get('Target')
+                                            if rel.tag.endswith('}Relationship'): draw_rels[rel.attrib.get('Id')] = rel.attrib.get('Target')
                                                 
                                     draw_root = ET.fromstring(z.read(drawing_path))
-                                    
                                     for anchor in draw_root:
                                         if 'Anchor' not in anchor.tag: continue
-                                        
                                         row, col = 0, 0
                                         for from_marker in anchor.iter():
                                             if from_marker.tag.endswith('}from'):
                                                 for child in from_marker.iter():
-                                                    if child.tag.endswith('}col'):
-                                                        col = int(child.text) + 1 if child.text else 0
-                                                    elif child.tag.endswith('}row'):
-                                                        row = int(child.text) + 1 if child.text else 0
+                                                    if child.tag.endswith('}col'): col = int(child.text) + 1 if child.text else 0
+                                                    elif child.tag.endswith('}row'): row = int(child.text) + 1 if child.text else 0
                                                 break
                                         
                                         for elem in anchor.iter():
@@ -670,14 +840,9 @@ if check_password():
                                                     media_target = draw_rels[embed_id]
                                                     media_path = resolve_zip_path(os.path.dirname(drawing_path), media_target)
                                                     if media_path in media_files:
-                                                        ext = media_path.split('.')[-1]
                                                         images_info.append({
-                                                            'sheet': sheet_name,
-                                                            'row': row,
-                                                            'col': col,
-                                                            'media_path': media_path,
-                                                            'bytes': media_files[media_path],
-                                                            'ext': ext
+                                                            'sheet': sheet_name, 'row': row, 'col': col,
+                                                            'media_path': media_path, 'bytes': media_files[media_path], 'ext': media_path.split('.')[-1]
                                                         })
 
                     zip_buffer_images = io.BytesIO()
@@ -687,28 +852,17 @@ if check_password():
                     
                     with zipfile.ZipFile(zip_buffer_images, "a", zipfile.ZIP_DEFLATED, False) as zip_file_img:
                         for img in images_info:
-                            sheet_name = img['sheet']
-                            anchor_row = img['row']
-                            anchor_col = img['col']
-                            media_path = img['media_path']
-                            
-                            closest_dpci = None
-                            min_dist = float('inf')
+                            sheet_name, anchor_row, anchor_col, media_path = img['sheet'], img['row'], img['col'], img['media_path']
+                            closest_dpci, min_dist = None, float('inf')
                             
                             if anchor_row > 0 and anchor_col > 0 and sheet_name in dpci_locations_by_sheet:
                                 for loc in dpci_locations_by_sheet[sheet_name]:
                                     dist = abs(loc['row'] - anchor_row) + abs(loc['col'] - anchor_col)
-                                    if dist < min_dist and dist < 40:
-                                        min_dist = dist
-                                        closest_dpci = loc['dpci']
+                                    if dist < min_dist and dist < 40: min_dist, closest_dpci = dist, loc['dpci']
                             
                             if closest_dpci:
                                 extracted_dpcis_count[closest_dpci] = extracted_dpcis_count.get(closest_dpci, 0) + 1
-                                if extracted_dpcis_count[closest_dpci] == 1:
-                                    file_name = f"{closest_dpci}.{img['ext']}"
-                                else:
-                                    file_name = f"{closest_dpci}_{extracted_dpcis_count[closest_dpci]}.{img['ext']}"
-                                    
+                                file_name = f"{closest_dpci}.{img['ext']}" if extracted_dpcis_count[closest_dpci] == 1 else f"{closest_dpci}_{extracted_dpcis_count[closest_dpci]}.{img['ext']}"
                                 zip_file_img.writestr(file_name, img['bytes'])
                                 extracted_count += 1
                                 matched_media.add(media_path)
@@ -717,23 +871,14 @@ if check_password():
                         for p, b in media_files.items():
                             if p not in matched_media and p.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
                                 unmatched_count += 1
-                                ext = p.split('.')[-1]
-                                zip_file_img.writestr(f"Unmatched_Image_{unmatched_count}.{ext}", b)
+                                zip_file_img.writestr(f"Unmatched_Image_{unmatched_count}.{p.split('.')[-1]}", b)
                                         
                     if extracted_count > 0 or unmatched_count > 0:
                         msg = f"✅ 大功告成！成功自動命名 **{extracted_count}** 張商品圖片！"
-                        if unmatched_count > 0:
-                            msg += f"\n⚠️ 另外發現 **{unmatched_count}** 張因格式或距離太遠無法對位的圖片，已命名為 `Unmatched_Image` 一併匯出給您檢查。"
+                        if unmatched_count > 0: msg += f"\n⚠️ 另外發現 **{unmatched_count}** 張因格式或距離太遠無法對位的圖片，已命名為 `Unmatched_Image` 一併匯出給您檢查。"
                         st.success(msg)
-                        
-                        st.download_button(
-                            label="📦 點擊下載完整圖片包 (ZIP)",
-                            data=zip_buffer_images.getvalue(),
-                            file_name="Auto_Extracted_Images.zip",
-                            mime="application/zip"
-                        )
+                        st.download_button(label="📦 點擊下載完整圖片包 (ZIP)", data=zip_buffer_images.getvalue(), file_name="Auto_Extracted_Images.zip", mime="application/zip")
                     else:
                         st.warning("⚠️ 檔案底層完全找不到任何圖片，請確認 Excel 檔案中是否含有實體插入的圖片。")
-                        
                 except Exception as e:
                     st.error(f"❌ 萃取過程中發生底層錯誤: {e}")
