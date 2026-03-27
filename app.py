@@ -62,7 +62,7 @@ def resolve_zip_path(base_dir, relative_path):
     return '/'.join(parts)
 
 def extract_port_mapping(port_mapping_files):
-    """共用邏輯：將多個 TXT/CSV 降維打擊為純文字字典"""
+    """共用邏輯：將多個 TXT/CSV 降維打擊為純文字字典 (保留給舊版引擎使用)"""
     auto_port_dict = {}
     if not port_mapping_files: return auto_port_dict
     
@@ -116,7 +116,6 @@ if check_password():
     st.success("✅ 成功登入！歡迎使用 AE 部門專屬工具。")
     st.title("🎯 Target 季節性專案自動化系統")
 
-    # 💡 新增 3 個 Tab 實現新舊雙軌並行
     tab1, tab3, tab2 = st.tabs(["🎃 舊版引擎 (PO RAW DATA)", "🚀 新版引擎 (Modern PO Visibility)", "🖼️ 圖片自動萃取器"])
 
     # ------------------------------------------
@@ -436,9 +435,9 @@ if check_password():
                                                         ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
                                                         ws.row_dimensions[r_idx].height = 70 
                                 
-                                zip_file.writestr("PO_GRID_Merged_All.xlsx", excel_buffer.getvalue())
+                                zip_file.writestr("PO_GRID_Merged_Old.xlsx", excel_buffer.getvalue())
                             
-                            st.success("✨ 處理完成！已為您產出合併版 PO GRID 表格。")
+                            st.success("✨ 處理完成！已為您產出舊版 PO GRID 表格。")
                             st.download_button(
                                 label="📦 點擊下載合併版 PO GRID (ZIP)",
                                 data=zip_buffer.getvalue(),
@@ -453,18 +452,17 @@ if check_password():
     # ------------------------------------------
     with tab3:
         st.markdown("""
-        此為 **全新 Modern PO** 專屬通道！由於資料來源不含子商品結構，排版會更為扁平俐落。
-        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC Level` 三份 Modern CSV 同時丟入第一格，系統會自動在背後幫您分類重組！
+        此為 **全新 Modern PO** 專屬通道！直接讀取內建的港口 (LOCATION)，無需再上傳港口對照表！
+        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC Level` 三份 Modern CSV 同時上傳至第一個框框，系統會自動在背後幫您縫合資料！
         """)
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次多選並上傳 3 份 PO 相關的 CSV)", type=['csv'], accept_multiple_files=True, key="m_po")
+            modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次上傳 PO / Item / DC 三份檔案)", type=['csv'], accept_multiple_files=True, key="m_po")
         with col2:
             m_prod_files = st.file_uploader("📁 2. 產品資料(PCN)\n(支援多檔)", type=['xlsx', 'csv'], accept_multiple_files=True, key="m_pcn")
-            m_image_zip_files = st.file_uploader("📁 3. 產品圖片包(ZIP)\n(支援多檔)", type=['zip'], accept_multiple_files=True, key="m_zip")
         with col3:
-            m_port_mapping_files = st.file_uploader("📁 4. 港口對照表 (選傳)\n(可用來覆蓋預設港口)", type=['csv', 'txt'], accept_multiple_files=True, key="m_port")
+            m_image_zip_files = st.file_uploader("📁 3. 產品圖片包(ZIP)\n(支援多檔)", type=['zip'], accept_multiple_files=True, key="m_zip")
 
         if modern_po_files and m_prod_files:
             df_po_level, df_item_level, df_dc_level = None, None, None
@@ -487,7 +485,6 @@ if check_password():
             if df_po_level is None or df_item_level is None or df_dc_level is None:
                 st.error("❌ 系統未能集齊 3 份必要的 Modern 報表。請確認您同時上傳了 PO Level、Item Level 與 DC/Item Level 三份檔案！")
             else:
-                # 正規化 PO NUMBER
                 df_po_level['PO NUMBER'] = df_po_level['PO #'].astype(str).str.split('.').str[0].str.strip()
                 df_item_level['PO NUMBER'] = df_item_level['PO #'].astype(str).str.split('.').str[0].str.strip()
                 df_dc_level['PO NUMBER'] = df_dc_level['PO #'].astype(str).str.split('.').str[0].str.strip()
@@ -496,7 +493,7 @@ if check_password():
                 df_po_level['SHIP END DATE'] = pd.to_datetime(df_po_level['ORIG SHIP END'], errors='coerce')
 
                 st.divider()
-                st.subheader("📍 步驟 5: 篩選出貨期間 / Ship Window (選填)")
+                st.subheader("📍 步驟 4: 篩選出貨期間 / Ship Window (選填)")
                 m_use_sw_filter = st.checkbox("📅 啟用 SW 範圍篩選", key="m_sw")
                 
                 can_proceed_m = True
@@ -520,14 +517,12 @@ if check_password():
                         can_proceed_m = False
 
                 if can_proceed_m:
-                    # 擷取 PURPOSE 與日期
                     df_po_level['SHIP_DATES'] = df_po_level['SHIP BEGIN DATE'].dt.strftime('%m/%d') + '-' + df_po_level['SHIP END DATE'].dt.strftime('%m/%d')
                     purp_col = 'PO PURPOSE' if 'PO PURPOSE' in df_po_level.columns else 'PURPOSE' if 'PURPOSE' in df_po_level.columns else None
                     if purp_col: po_info = df_po_level[['PO NUMBER', purp_col, 'SHIP_DATES']].copy().rename(columns={purp_col: 'PURPOSE'})
                     else: po_info = df_po_level[['PO NUMBER', 'SHIP_DATES']].copy().assign(PURPOSE='')
                     po_info.drop_duplicates(inplace=True)
 
-                    # 整理 Item level (取得 Style 和 UPC)
                     item_info_dict = {}
                     parent_dpci_list = set()
                     df_item_level['DPCI_MERGE'] = df_item_level['DPCI'].astype(str).str.strip()
@@ -544,34 +539,30 @@ if check_password():
                             if style and not item_info_dict[dpci]['style']: item_info_dict[dpci]['style'] = style
                             if upc and not item_info_dict[dpci]['upc']: item_info_dict[dpci]['upc'] = upc
 
-                    # 整理 DC Level (取得港口與數量)
                     df_dc_level['DPCI_MERGE'] = df_dc_level['DPCI'].astype(str).str.strip()
                     df_dc_level['QTY'] = pd.to_numeric(df_dc_level['REVISED QUANTITY'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-                    df_dc_level['PO_CLEAN'] = df_dc_level['PO NUMBER'].str.lstrip('0')
-                    df_dc_level['NATIVE_PORT'] = df_dc_level['LOCATION'].astype(str).str.replace(r'\.0$', '', regex=True).replace({'nan': '', 'None': ''}).str.strip()
-
-                    # 解析港口
-                    auto_port_dict_m = extract_port_mapping(m_port_mapping_files)
                     
-                    unique_po_ports = df_dc_level[['PO NUMBER', 'PO_CLEAN', 'NATIVE_PORT']].drop_duplicates(subset=['PO NUMBER'])
-                    unique_po_ports['輸入港口代碼 (如:581)'] = unique_po_ports['PO_CLEAN'].map(auto_port_dict_m).fillna(unique_po_ports['NATIVE_PORT']).replace({'nan': '', 'None': ''})
+                    # 💡 完全捨棄外部港口對照，直接讀取內建的 LOCATION
+                    df_dc_level['NATIVE_PORT'] = df_dc_level['LOCATION'].astype(str).str.replace(r'\.0$', '', regex=True).replace({'nan': '', 'None': ''}).str.strip()
+                    
+                    unique_po_ports = df_dc_level[['PO NUMBER', 'NATIVE_PORT']].drop_duplicates(subset=['PO NUMBER']).copy()
+                    unique_po_ports['輸入港口代碼 (如:581)'] = unique_po_ports['NATIVE_PORT']
                     
                     missing_ports_count_m = (unique_po_ports['輸入港口代碼 (如:581)'] == "").sum()
                     
                     st.divider()
+                    st.subheader("📍 步驟 5: 最終港口確認")
                     if missing_ports_count_m > 0:
-                        st.warning(f"⚠️ 注意：有 **{missing_ports_count_m}** 筆 PO 找不到港口代碼！請在下方手動補齊。")
-                        display_cols = ["PO NUMBER", "NATIVE_PORT", "輸入港口代碼 (如:581)"]
+                        st.warning(f"⚠️ 注意：有 **{missing_ports_count_m}** 筆 PO 的原始檔案中沒有標示港口 (LOCATION 空白)！請在下方手動補齊。")
+                        display_cols = ["PO NUMBER", "輸入港口代碼 (如:581)"]
                         edited_unique = st.data_editor(unique_po_ports[display_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
                         unique_po_ports['輸入港口代碼 (如:581)'] = edited_unique['輸入港口代碼 (如:581)'].values
                     else:
-                        st.success("🤖 完美！已自動填寫 100% 港口代碼。")
+                        st.success("🤖 完美！系統已成功從 Modern PO 的 LOCATION 欄位直接載入 100% 的港口代碼。")
 
-                    # 將確認好的港口 map 回 dc_level
                     port_lookup = dict(zip(unique_po_ports['PO NUMBER'], unique_po_ports['輸入港口代碼 (如:581)']))
                     df_dc_level['PORT_NAME'] = df_dc_level['PO NUMBER'].map(port_lookup).fillna('未指定港口').replace({'': '未指定港口'})
 
-                    # 合併成準備 Pivot 的格式
                     po_raw_merged = df_dc_level.merge(po_info, on='PO NUMBER', how='left')
                     po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('')
                     po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('日期遺失')
@@ -594,7 +585,6 @@ if check_password():
                                                 if isinstance(val, (int, float)) and val > 0: pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val)})"
                                 pivot_df = pivot_df.replace({0: '', 0.0: ''})
 
-                                # 處理 PCN 
                                 prod_data_list = []
                                 for p_file in m_prod_files:
                                     df_temp = pd.read_csv(p_file) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file)
@@ -610,7 +600,6 @@ if check_password():
                                 if 'Barcode' in prod_data.columns: prod_data['Barcode'] = prod_data['Barcode'].apply(format_upc)
                                 else: prod_data['Barcode'] = ''
 
-                                # 回補 Style 與 UPC
                                 for dpci_key, info_dict in item_info_dict.items():
                                     if dpci_key in prod_data['DPCI_MERGE'].values:
                                         idx_list = prod_data.index[prod_data['DPCI_MERGE'] == dpci_key].tolist()
@@ -621,7 +610,6 @@ if check_password():
                                                 curr_upc = str(prod_data.at[i, 'Barcode']).strip()
                                                 if curr_upc in ('', 'nan'): prod_data.at[i, 'Barcode'] = format_upc(info_dict['upc'])
 
-                                # 若 DPCI 存在於 PO 卻不在 PCN，主動新增空白列確保不漏印
                                 existing_pcn_dpcis = prod_data['DPCI_MERGE'].values
                                 missing_dpcis = [d for d in pivot_df.index if d not in existing_pcn_dpcis]
                                 new_rows = []
@@ -699,7 +687,6 @@ if check_password():
                                                     
                                             export_data = export_data[cols_to_keep]
                                             
-                                            # 新版無子商品結構，直接輸出
                                             unmerged_columns = []
                                             po_idx = 0
                                             for col in export_data.columns:
