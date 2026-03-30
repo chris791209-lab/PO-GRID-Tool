@@ -7,8 +7,10 @@ import re
 import copy
 import openpyxl
 import xml.etree.ElementTree as ET
+import unicodedata  # 💡 新增：用來精準計算中英文寬度差異
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Border, Side, Alignment  # 💡 新增：Excel 排版美化套件
 from PIL import Image as PILImage
 
 # ==========================================
@@ -62,7 +64,6 @@ def resolve_zip_path(base_dir, relative_path):
     return '/'.join(parts)
 
 def extract_port_mapping(port_mapping_files):
-    """共用邏輯：將多個 TXT/CSV 降維打擊為純文字字典"""
     auto_port_dict = {}
     if not port_mapping_files: return auto_port_dict
     
@@ -189,7 +190,7 @@ if check_password():
                 
                 st.divider()
                 if st.button("🚀 開始自動生成 PO GRID (舊版引擎)", type="primary", key="btn_old"):
-                    with st.spinner("舊版引擎運算中，請稍候..."):
+                    with st.spinner("舊版引擎運算與排版美化中，請稍候..."):
                         try:
                             image_dict = {}
                             if image_zip_files:
@@ -364,6 +365,12 @@ if check_password():
                             final_df = left_data.join(pivot_df, how='inner')
 
                             zip_buffer = io.BytesIO()
+                            
+                            # --- 💡 全域排版與美化樣式設定 ---
+                            calibri_font = Font(name='Calibri', size=11)
+                            calibri_bold = Font(name='Calibri', size=11, bold=True)
+                            thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                            
                             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                                 actual_vendor_col = [c for c in final_df.columns if c[1] == 'Import Vendor Name'][0]
                                 actual_factory_col = [c for c in final_df.columns if c[1] == 'Factory Name'][0]
@@ -418,6 +425,18 @@ if check_password():
                                         ws = writer.sheets[safe_factory_name]
                                         ws.delete_cols(1) 
                                         
+                                        # --- 💡 全域自動排版套用 ---
+                                        for row in ws.iter_rows():
+                                            for cell in row:
+                                                cell.border = thin_border
+                                                if cell.row <= 5:  # 多層表頭佔用前 5 列
+                                                    cell.font = calibri_bold
+                                                    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                                                else:
+                                                    cell.font = calibri_font
+                                                    cell.alignment = Alignment(vertical='center')
+                                        
+                                        img_col_letter = None
                                         if image_zip_files and image_dict:
                                             dpci_col_idx, img_col_idx = None, None
                                             for idx, col in enumerate(export_data_reset.columns):
@@ -442,6 +461,25 @@ if check_password():
                                                             ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
                                                             ws.row_dimensions[r_idx].height = 70 
                                                         except: pass 
+                                                        
+                                        # --- 💡 自動計算並調整欄寬 ---
+                                        for col in ws.columns:
+                                            col_letter = col[0].column_letter
+                                            if img_col_letter and col_letter == img_col_letter:
+                                                continue  # 圖片欄位保持固定
+                                                
+                                            max_length = 0
+                                            for cell in col:
+                                                if cell.value is not None:
+                                                    cell_val_str = str(cell.value)
+                                                    for line in cell_val_str.split('\n'):
+                                                        # 精準計算寬度：全形(中文)算2，半形(英文)算1
+                                                        line_len = sum(2 if unicodedata.east_asian_width(c) in 'FWA' else 1 for c in line)
+                                                        if line_len > max_length:
+                                                            max_length = line_len
+                                            
+                                            adjusted_width = max(8, min(max_length + 2, 50)) # 設定上下限，避免欄位過窄或過寬
+                                            ws.column_dimensions[col_letter].width = adjusted_width
                                 
                                 zip_file.writestr("PO_GRID_Merged_Old.xlsx", excel_buffer.getvalue())
                             
@@ -475,7 +513,6 @@ if check_password():
         if modern_po_files and m_prod_files:
             df_po_level, df_item_level, df_dc_level = None, None, None
             
-            # 💡 智慧辨識上傳的 3 份檔案 (更精準排除不需要的 PO_DC Level 廢檔)
             for f in modern_po_files:
                 try:
                     df_temp = pd.read_csv(f, dtype=str, nrows=5)
@@ -485,7 +522,7 @@ if check_password():
                         df_po_level = pd.read_csv(f, dtype=str)
                     elif 'MANUFACTURER STYLE' in cols:
                         df_item_level = pd.read_csv(f, dtype=str)
-                    elif 'LOCATION' in cols and 'DPCI' in cols: # 確保抓到的是有 DPCI 的 PO_DC_Item Level
+                    elif 'LOCATION' in cols and 'DPCI' in cols: 
                         df_dc_level = pd.read_csv(f, dtype=str)
                 except Exception as e:
                     st.warning(f"檔案讀取失敗 {f.name}: {e}")
@@ -497,7 +534,6 @@ if check_password():
                 df_item_level['PO NUMBER'] = df_item_level['PO #'].astype(str).str.split('.').str[0].str.strip()
                 df_dc_level['PO NUMBER'] = df_dc_level['PO #'].astype(str).str.split('.').str[0].str.strip()
 
-                # 自動過濾 nan 幽靈列
                 df_po_level = df_po_level[(df_po_level['PO NUMBER'] != 'nan') & (df_po_level['PO NUMBER'] != '')]
                 df_item_level = df_item_level[(df_item_level['PO NUMBER'] != 'nan') & (df_item_level['PO NUMBER'] != '')]
                 df_dc_level = df_dc_level[(df_dc_level['PO NUMBER'] != 'nan') & (df_dc_level['PO NUMBER'] != '')]
@@ -581,7 +617,7 @@ if check_password():
 
                     st.divider()
                     if st.button("🚀 開始自動生成 PO GRID (新版引擎)", type="primary", key="btn_new"):
-                        with st.spinner("新版引擎運算中，這可能需要幾十秒鐘，請稍候..."):
+                        with st.spinner("新版引擎運算與排版美化中，請稍候..."):
                             try:
                                 pivot_df_temp = po_raw_merged.pivot_table(index='DPCI_MERGE', columns=['PURPOSE', 'PO NUMBER', 'SHIP_DATES', 'PORT_NAME'], values='QTY', aggfunc='sum').fillna(0)
                                 new_pivot_cols = [(col[0], '', col[1], col[2], col[3]) for col in pivot_df_temp.columns]
@@ -666,18 +702,13 @@ if check_password():
                                 left_data.columns = pd.MultiIndex.from_tuples([get_left_tuple(col, i+1) for i, col in enumerate(left_data.columns)])
                                 final_df = left_data.join(pivot_df, how='inner')
 
-                                image_dict = {}
-                                if m_image_zip_files:
-                                    for zip_file_obj in m_image_zip_files:
-                                        with zipfile.ZipFile(zip_file_obj, 'r') as z:
-                                            for file_info in z.infolist():
-                                                if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'): continue
-                                                if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
-                                                    base_name = os.path.basename(file_info.filename)
-                                                    clean_dpci = os.path.splitext(base_name)[0].strip().split('_')[0] 
-                                                    if clean_dpci not in image_dict: image_dict[clean_dpci] = z.read(file_info.filename)
-
                                 zip_buffer = io.BytesIO()
+                                
+                                # --- 💡 全域排版與美化樣式設定 ---
+                                calibri_font = Font(name='Calibri', size=11)
+                                calibri_bold = Font(name='Calibri', size=11, bold=True)
+                                thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                                
                                 with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                                     actual_vendor_col = [c for c in final_df.columns if c[1] == 'Import Vendor Name'][0]
                                     actual_factory_col = [c for c in final_df.columns if c[1] == 'Factory Name'][0]
@@ -714,7 +745,29 @@ if check_password():
                                             ws = writer.sheets[safe_factory_name]
                                             ws.delete_cols(1) 
                                             
-                                            if m_image_zip_files and image_dict:
+                                            # --- 💡 自動排版套用 ---
+                                            for row in ws.iter_rows():
+                                                for cell in row:
+                                                    cell.border = thin_border
+                                                    if cell.row <= 5:  
+                                                        cell.font = calibri_bold
+                                                        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                                                    else:
+                                                        cell.font = calibri_font
+                                                        cell.alignment = Alignment(vertical='center')
+                                            
+                                            img_col_letter = None
+                                            if m_image_zip_files:
+                                                image_dict = {}
+                                                for zip_file_obj in m_image_zip_files:
+                                                    with zipfile.ZipFile(zip_file_obj, 'r') as z:
+                                                        for file_info in z.infolist():
+                                                            if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'): continue
+                                                            if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                                                                base_name = os.path.basename(file_info.filename)
+                                                                clean_dpci = os.path.splitext(base_name)[0].strip().split('_')[0] 
+                                                                if clean_dpci not in image_dict: image_dict[clean_dpci] = z.read(file_info.filename)
+                                                
                                                 dpci_col_idx, img_col_idx = None, None
                                                 for idx, col in enumerate(export_data_reset.columns):
                                                     if col[1] == 'DPCI': dpci_col_idx = idx + 1
@@ -738,6 +791,24 @@ if check_password():
                                                                 ws.add_image(img_obj, f"{img_col_letter}{r_idx}")
                                                                 ws.row_dimensions[r_idx].height = 70 
                                                             except: pass 
+                                                            
+                                            # --- 💡 自動調整欄寬 ---
+                                            for col in ws.columns:
+                                                col_letter = col[0].column_letter
+                                                if img_col_letter and col_letter == img_col_letter:
+                                                    continue  
+                                                    
+                                                max_length = 0
+                                                for cell in col:
+                                                    if cell.value is not None:
+                                                        cell_val_str = str(cell.value)
+                                                        for line in cell_val_str.split('\n'):
+                                                            line_len = sum(2 if unicodedata.east_asian_width(c) in 'FWA' else 1 for c in line)
+                                                            if line_len > max_length:
+                                                                max_length = line_len
+                                                
+                                                adjusted_width = max(8, min(max_length + 2, 50))
+                                                ws.column_dimensions[col_letter].width = adjusted_width
                                     
                                     zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
                                 
