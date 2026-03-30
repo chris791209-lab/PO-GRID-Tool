@@ -7,10 +7,10 @@ import re
 import copy
 import openpyxl
 import xml.etree.ElementTree as ET
-import unicodedata  # 💡 新增：用來精準計算中英文寬度差異
+import unicodedata  
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, Border, Side, Alignment  # 💡 新增：Excel 排版美化套件
+from openpyxl.styles import Font, Border, Side, Alignment  
 from PIL import Image as PILImage
 
 # ==========================================
@@ -462,15 +462,17 @@ if check_password():
                                                             ws.row_dimensions[r_idx].height = 70 
                                                         except: pass 
                                                         
-                                        # --- 💡 自動計算並調整欄寬 ---
-                                        for col in ws.columns:
-                                            col_letter = col[0].column_letter
+                                        # --- 💡 修正後的安全欄寬調整模組 ---
+                                        for col_idx in range(1, ws.max_column + 1):
+                                            col_letter = get_column_letter(col_idx)
                                             if img_col_letter and col_letter == img_col_letter:
                                                 continue  # 圖片欄位保持固定
                                                 
                                             max_length = 0
-                                            for cell in col:
-                                                if cell.value is not None:
+                                            for row_idx in range(1, ws.max_row + 1):
+                                                cell = ws.cell(row=row_idx, column=col_idx)
+                                                # 避開 MergedCell 沒有 value 或屬性不同的問題
+                                                if type(cell).__name__ != 'MergedCell' and cell.value is not None:
                                                     cell_val_str = str(cell.value)
                                                     for line in cell_val_str.split('\n'):
                                                         # 精準計算寬度：全形(中文)算2，半形(英文)算1
@@ -792,15 +794,16 @@ if check_password():
                                                                 ws.row_dimensions[r_idx].height = 70 
                                                             except: pass 
                                                             
-                                            # --- 💡 自動調整欄寬 ---
-                                            for col in ws.columns:
-                                                col_letter = col[0].column_letter
+                                            # --- 💡 修正後的安全欄寬調整模組 ---
+                                            for col_idx in range(1, ws.max_column + 1):
+                                                col_letter = get_column_letter(col_idx)
                                                 if img_col_letter and col_letter == img_col_letter:
                                                     continue  
                                                     
                                                 max_length = 0
-                                                for cell in col:
-                                                    if cell.value is not None:
+                                                for row_idx in range(1, ws.max_row + 1):
+                                                    cell = ws.cell(row=row_idx, column=col_idx)
+                                                    if type(cell).__name__ != 'MergedCell' and cell.value is not None:
                                                         cell_val_str = str(cell.value)
                                                         for line in cell_val_str.split('\n'):
                                                             line_len = sum(2 if unicodedata.east_asian_width(c) in 'FWA' else 1 for c in line)
