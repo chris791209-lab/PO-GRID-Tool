@@ -279,7 +279,7 @@ if check_password():
                                     for col in pivot_df.columns:
                                         if col[1] != 'PO TOTAL': 
                                             val = pivot_df.loc[parent_dpci, col]
-                                            if isinstance(val, (int, float)) and val > 0: pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val)})"
+                                            if isinstance(val, (int, float)) and val > 0: pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val):,})"
                             pivot_df = pivot_df.replace({0: '', 0.0: ''})
 
                             prod_data['DPCI_MERGE'] = prod_data['DPCI'].astype(str).str.strip()
@@ -366,7 +366,6 @@ if check_password():
 
                             zip_buffer = io.BytesIO()
                             
-                            # --- 💡 全域排版與美化樣式設定 ---
                             calibri_font = Font(name='Calibri', size=11)
                             calibri_bold = Font(name='Calibri', size=11, bold=True)
                             thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
@@ -429,15 +428,28 @@ if check_password():
                                         for row in ws.iter_rows():
                                             for cell in row:
                                                 cell.border = thin_border
-                                                if cell.row <= 5:  # 多層表頭佔用前 5 列
+                                                if cell.row <= 5:  
                                                     cell.font = calibri_bold
                                                     cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
                                                 else:
                                                     cell.font = calibri_font
                                                     cell.alignment = Alignment(vertical='center')
+                                                    # 💡 只有第 15 欄以後 (PO 數量區塊) 才套用千分位
+                                                    if cell.column > 14 and isinstance(cell.value, (int, float)):
+                                                        cell.number_format = '#,##0'
                                         
                                         img_col_letter = None
-                                        if image_zip_files and image_dict:
+                                        if image_zip_files:
+                                            image_dict = {}
+                                            for zip_file_obj in image_zip_files:
+                                                with zipfile.ZipFile(zip_file_obj, 'r') as z:
+                                                    for file_info in z.infolist():
+                                                        if file_info.filename.startswith('__MACOSX/') or file_info.filename.startswith('.'): continue
+                                                        if file_info.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                                                            base_name = os.path.basename(file_info.filename)
+                                                            clean_dpci = os.path.splitext(base_name)[0].strip().split('_')[0] 
+                                                            if clean_dpci not in image_dict: image_dict[clean_dpci] = z.read(file_info.filename)
+                                            
                                             dpci_col_idx, img_col_idx = None, None
                                             for idx, col in enumerate(export_data_reset.columns):
                                                 if col[1] == 'DPCI': dpci_col_idx = idx + 1
@@ -462,25 +474,22 @@ if check_password():
                                                             ws.row_dimensions[r_idx].height = 70 
                                                         except: pass 
                                                         
-                                        # --- 💡 修正後的安全欄寬調整模組 ---
                                         for col_idx in range(1, ws.max_column + 1):
                                             col_letter = get_column_letter(col_idx)
                                             if img_col_letter and col_letter == img_col_letter:
-                                                continue  # 圖片欄位保持固定
+                                                continue  
                                                 
                                             max_length = 0
                                             for row_idx in range(1, ws.max_row + 1):
                                                 cell = ws.cell(row=row_idx, column=col_idx)
-                                                # 避開 MergedCell 沒有 value 或屬性不同的問題
                                                 if type(cell).__name__ != 'MergedCell' and cell.value is not None:
                                                     cell_val_str = str(cell.value)
                                                     for line in cell_val_str.split('\n'):
-                                                        # 精準計算寬度：全形(中文)算2，半形(英文)算1
                                                         line_len = sum(2 if unicodedata.east_asian_width(c) in 'FWA' else 1 for c in line)
                                                         if line_len > max_length:
                                                             max_length = line_len
                                             
-                                            adjusted_width = max(8, min(max_length + 2, 50)) # 設定上下限，避免欄位過窄或過寬
+                                            adjusted_width = max(8, min(max_length + 2, 50)) 
                                             ws.column_dimensions[col_letter].width = adjusted_width
                                 
                                 zip_file.writestr("PO_GRID_Merged_Old.xlsx", excel_buffer.getvalue())
@@ -603,7 +612,7 @@ if check_password():
                     st.divider()
                     st.subheader("📍 步驟 5: 最終港口確認")
                     if missing_ports_count_m > 0:
-                        st.warning(f"⚠️ 注意：有 **{missing_ports_count_m}** 筆 PO 的原始檔案中沒有標示港口 (LOCATION 空白)！請在下方手動補齊。")
+                        st.warning(f"⚠️ 注意：有 **{missing_ports_count_m}** 筆 PO 的原始檔案中沒有標示港口 (LOCATION 空白)！請在下方手手動補齊。")
                         display_cols = ["PO NUMBER", "輸入港口代碼 (如:581)"]
                         edited_unique = st.data_editor(unique_po_ports[display_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
                         unique_po_ports['輸入港口代碼 (如:581)'] = edited_unique['輸入港口代碼 (如:581)'].values
@@ -632,7 +641,7 @@ if check_password():
                                         for col in pivot_df.columns:
                                             if col[1] != 'PO TOTAL': 
                                                 val = pivot_df.loc[parent_dpci, col]
-                                                if isinstance(val, (int, float)) and val > 0: pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val)})"
+                                                if isinstance(val, (int, float)) and val > 0: pivot_df.loc[parent_dpci, col] = f"{parent_dpci}-({int(val):,})"
                                 pivot_df = pivot_df.replace({0: '', 0.0: ''})
 
                                 prod_data_list = []
@@ -706,7 +715,6 @@ if check_password():
 
                                 zip_buffer = io.BytesIO()
                                 
-                                # --- 💡 全域排版與美化樣式設定 ---
                                 calibri_font = Font(name='Calibri', size=11)
                                 calibri_bold = Font(name='Calibri', size=11, bold=True)
                                 thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
@@ -747,7 +755,7 @@ if check_password():
                                             ws = writer.sheets[safe_factory_name]
                                             ws.delete_cols(1) 
                                             
-                                            # --- 💡 自動排版套用 ---
+                                            # --- 💡 全域自動排版套用 ---
                                             for row in ws.iter_rows():
                                                 for cell in row:
                                                     cell.border = thin_border
@@ -757,6 +765,9 @@ if check_password():
                                                     else:
                                                         cell.font = calibri_font
                                                         cell.alignment = Alignment(vertical='center')
+                                                        # 💡 只有第 15 欄以後 (PO 數量區塊) 才套用千分位
+                                                        if cell.column > 14 and isinstance(cell.value, (int, float)):
+                                                            cell.number_format = '#,##0'
                                             
                                             img_col_letter = None
                                             if m_image_zip_files:
@@ -794,7 +805,6 @@ if check_password():
                                                                 ws.row_dimensions[r_idx].height = 70 
                                                             except: pass 
                                                             
-                                            # --- 💡 修正後的安全欄寬調整模組 ---
                                             for col_idx in range(1, ws.max_column + 1):
                                                 col_letter = get_column_letter(col_idx)
                                                 if img_col_letter and col_letter == img_col_letter:
@@ -810,7 +820,7 @@ if check_password():
                                                             if line_len > max_length:
                                                                 max_length = line_len
                                                 
-                                                adjusted_width = max(8, min(max_length + 2, 50))
+                                                adjusted_width = max(8, min(max_length + 2, 50)) 
                                                 ws.column_dimensions[col_letter].width = adjusted_width
                                     
                                     zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
