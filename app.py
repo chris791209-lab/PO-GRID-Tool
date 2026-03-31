@@ -502,7 +502,7 @@ if check_password():
     # ------------------------------------------
     with tab3:
         st.markdown("""
-        此為 **全新 Modern PO** 專屬通道！
+        此為 **全新 Modern PO** 專屬通道！只需上傳 3 份檔案即可自動運算！
         🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
         💡 **混裝救星**：如果該專案有混裝商品(Assortment)，只要上傳【1.5 混裝明細表】，系統就會自動展開子商品並完美還原舊版計算邏輯！
         """)
@@ -640,7 +640,6 @@ if check_password():
                                             child_col = next((c for c in df_asst.columns if str(c).lower() == 'dpci' or 'component dpci' in str(c).lower() or 'child dpci' in str(c).lower() or 'item dpci' in str(c).lower()), None)
                                             qty_col = next((c for c in df_asst.columns if 'units' in str(c).lower() or 'qty' in str(c).lower() or 'ratio' in str(c).lower() or 'pack' in str(c).lower()), None)
                                             
-                                            # 💡 動態捕捉混裝表中的 Sytle / Style 欄位
                                             style_col = next((c for c in df_asst.columns if 'style' in str(c).lower() or 'sytle' in str(c).lower()), None)
                                             
                                             if parent_col and child_col and qty_col:
@@ -664,7 +663,6 @@ if check_password():
                                                     if p_val not in assort_dict: assort_dict[p_val] = []
                                                     assort_dict[p_val].append({'child_dpci': c_val, 'qty': float(q_val)})
                                                     
-                                                    # 💡 將混裝表抓到的 Style 強制賦予母商品
                                                     if style_col:
                                                         p_style = str(row[style_col]).strip()
                                                         if p_style and p_style != 'nan':
@@ -949,7 +947,7 @@ if check_password():
                                     
                                     zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
                                 
-                                st.success("✨ 處理完成！已成功為您展開所有混裝子商品並產出新版 PO GRID！")
+                                st.success("✨ 處理完成！已為您產出新版 PO GRID 表格。")
                                 st.download_button(
                                     label="📦 點擊下載合併版 PO GRID (ZIP)",
                                     data=zip_buffer.getvalue(),
@@ -968,14 +966,15 @@ if check_password():
         此工具繞過了一般程式對「圖片群組化」的盲區，直接潛入 Excel 底層，將 **100% 所有的實體圖片** 硬抓出來。
         """)
         
-        ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx)", type=['xlsx'], key="ps_uploader")
+        ps_file = st.file_uploader("📁 上傳 Program Sheet (包含圖片的 .xlsx / .xlsm)", type=['xlsx', 'xlsm'], key="ps_uploader")
         
         if ps_file and st.button("🪄 開始自動萃取並命名圖片", type="primary"):
             with st.spinner("🕵️‍♂️ 正在深入 Excel 底層架構暴力抓取所有圖片..."):
                 try:
                     ps_file.seek(0)
                     wb_source = openpyxl.load_workbook(ps_file, data_only=True)
-                    dpci_pattern = re.compile(r'\d{3}-\d{2}-\d{4}')
+                    # 💡 寬鬆 DPCI 正規表達式 (允許無連字號或空格)
+                    dpci_pattern = re.compile(r'(?<!\d)(\d{3})[-\s]?(\d{2})[-\s]?(\d{4})(?!\d)')
                     
                     dpci_locations_by_sheet = {}
                     for sheet_name in wb_source.sheetnames:
@@ -984,10 +983,12 @@ if check_password():
                         for r in range(1, ws_source.max_row + 1):
                             for c in range(1, ws_source.max_column + 1):
                                 cell_val = ws_source.cell(row=r, column=c).value
-                                if cell_val and isinstance(cell_val, str):
-                                    match = dpci_pattern.search(cell_val)
+                                if cell_val is not None:
+                                    val_str = str(cell_val).strip()
+                                    match = dpci_pattern.search(val_str)
                                     if match:
-                                        dpci_locations_by_sheet[sheet_name].append({'dpci': match.group(0), 'row': r, 'col': c})
+                                        clean_dpci = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+                                        dpci_locations_by_sheet[sheet_name].append({'dpci': clean_dpci, 'row': r, 'col': c})
                     
                     ps_file.seek(0)
                     images_info = []
@@ -1072,7 +1073,8 @@ if check_password():
                             if anchor_row > 0 and anchor_col > 0 and sheet_name in dpci_locations_by_sheet:
                                 for loc in dpci_locations_by_sheet[sheet_name]:
                                     dist = abs(loc['row'] - anchor_row) + abs(loc['col'] - anchor_col)
-                                    if dist < min_dist and dist < 40: min_dist, closest_dpci = dist, loc['dpci']
+                                    # 💡 放寬圖片搜尋距離 (原本 40 擴大為 100)
+                                    if dist < min_dist and dist < 100: min_dist, closest_dpci = dist, loc['dpci']
                             
                             if closest_dpci:
                                 extracted_dpcis_count[closest_dpci] = extracted_dpcis_count.get(closest_dpci, 0) + 1
