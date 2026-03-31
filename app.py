@@ -640,6 +640,9 @@ if check_password():
                                             child_col = next((c for c in df_asst.columns if str(c).lower() == 'dpci' or 'component dpci' in str(c).lower() or 'child dpci' in str(c).lower() or 'item dpci' in str(c).lower()), None)
                                             qty_col = next((c for c in df_asst.columns if 'units' in str(c).lower() or 'qty' in str(c).lower() or 'ratio' in str(c).lower() or 'pack' in str(c).lower()), None)
                                             
+                                            # 💡 動態捕捉混裝表中的 Sytle / Style 欄位
+                                            style_col = next((c for c in df_asst.columns if 'style' in str(c).lower() or 'sytle' in str(c).lower()), None)
+                                            
                                             if parent_col and child_col and qty_col:
                                                 df_asst[parent_col] = df_asst[parent_col].ffill() 
                                                 for _, row in df_asst.iterrows():
@@ -660,6 +663,18 @@ if check_password():
                                                     
                                                     if p_val not in assort_dict: assort_dict[p_val] = []
                                                     assort_dict[p_val].append({'child_dpci': c_val, 'qty': float(q_val)})
+                                                    
+                                                    # 💡 將混裝表抓到的 Style 強制賦予母商品
+                                                    if style_col:
+                                                        p_style = str(row[style_col]).strip()
+                                                        if p_style and p_style != 'nan':
+                                                            if not p_style.upper().startswith('ASSORT'):
+                                                                p_style = f"ASSORTMENT-{p_style}"
+                                                            if p_val not in item_info_dict:
+                                                                item_info_dict[p_val] = {'style': p_style, 'upc': ''}
+                                                            else:
+                                                                item_info_dict[p_val]['style'] = p_style
+                                                                
                                         except Exception as e:
                                             st.warning(f"讀取混裝明細表失敗: {e}")
 
@@ -759,7 +774,6 @@ if check_password():
                                     new_rows.append(new_row)
                                 if new_rows: prod_data = pd.concat([prod_data, pd.DataFrame(new_rows)], ignore_index=True)
 
-                                # 💡 【關鍵修復】母商品強制繼承子商品的工廠與供應商資訊
                                 for p_dpci, children in parent_to_children.items():
                                     vendor_name, factory_name, factory_id = '', '', ''
                                     for c_dpci in children:
@@ -935,7 +949,7 @@ if check_password():
                                     
                                     zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
                                 
-                                st.success("✨ 處理完成！已為您產出新版 PO GRID 表格。")
+                                st.success("✨ 處理完成！已成功為您展開所有混裝子商品並產出新版 PO GRID！")
                                 st.download_button(
                                     label="📦 點擊下載合併版 PO GRID (ZIP)",
                                     data=zip_buffer.getvalue(),
