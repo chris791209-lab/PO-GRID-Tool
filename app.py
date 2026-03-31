@@ -511,7 +511,6 @@ if check_password():
         with col1:
             modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次上傳 3 份 CSV)", type=['csv'], accept_multiple_files=True, key="m_po")
         with col15:
-            # 💡 全新功能：混裝明細表上傳區
             m_assort_files = st.file_uploader("📁 1.5 混裝明細表\n(選傳，有混裝必傳)", type=['csv', 'xlsx'], accept_multiple_files=True, key="m_asst")
         with col2:
             m_prod_files = st.file_uploader("📁 2. 產品資料(PCN)\n(支援多檔)", type=['xlsx', 'csv'], accept_multiple_files=True, key="m_pcn")
@@ -622,13 +621,11 @@ if check_password():
                     if st.button("🚀 開始自動生成 PO GRID (新版引擎)", type="primary", key="btn_new"):
                         with st.spinner("新版引擎運算與排版美化中，請稍候..."):
                             try:
-                                # 💡 全新動態混裝解析引擎
                                 assort_dict = {}
                                 if m_assort_files:
                                     for asst_file in m_assort_files:
                                         try:
                                             df_asst = pd.read_csv(asst_file) if asst_file.name.lower().endswith('.csv') else pd.read_excel(asst_file)
-                                            # 動態尋找表頭 (避開上方空白列)
                                             header_idx = None
                                             for i in range(min(20, len(df_asst))):
                                                 row_strs = [str(x).lower() for x in df_asst.iloc[i].values]
@@ -644,7 +641,7 @@ if check_password():
                                             qty_col = next((c for c in df_asst.columns if 'units' in str(c).lower() or 'qty' in str(c).lower() or 'ratio' in str(c).lower() or 'pack' in str(c).lower()), None)
                                             
                                             if parent_col and child_col and qty_col:
-                                                df_asst[parent_col] = df_asst[parent_col].ffill() # 母 DPCI 往下填滿
+                                                df_asst[parent_col] = df_asst[parent_col].ffill() 
                                                 for _, row in df_asst.iterrows():
                                                     p_val = str(row[parent_col]).strip().replace('.0', '')
                                                     c_val = str(row[child_col]).strip()
@@ -652,11 +649,9 @@ if check_password():
                                                     
                                                     if pd.isna(q_val) or not p_val or not c_val or p_val == 'nan' or c_val == 'nan': continue
                                                     
-                                                    # 標準化母 DPCI 格式
                                                     p_val = re.sub(r'\D', '', p_val)
                                                     if len(p_val) == 9: p_val = f"{p_val[:3]}-{p_val[3:5]}-{p_val[5:]}"
                                                     
-                                                    # 標準化子 DPCI 格式
                                                     c_val_match = re.search(r'\d{3}-\d{2}-\d{4}', c_val)
                                                     if c_val_match: c_val = c_val_match.group(0)
                                                     else:
@@ -668,7 +663,6 @@ if check_password():
                                         except Exception as e:
                                             st.warning(f"讀取混裝明細表失敗: {e}")
 
-                                # 💡 根據解析出的混裝比例，無中生有展開子商品資料
                                 expanded_records = []
                                 child_assort_qty_dict = {}
                                 parent_to_children = {}
@@ -689,7 +683,7 @@ if check_password():
                                         for child in assort_dict[dpci]:
                                             c_dpci = child['child_dpci']
                                             c_ratio = child['qty']
-                                            c_qty = qty * c_ratio  # 核心：母數量 * 比例 = 子數量
+                                            c_qty = qty * c_ratio  
                                             
                                             parent_to_children[dpci].add(c_dpci)
                                             child_assort_qty_dict[c_dpci] = c_ratio
@@ -746,7 +740,6 @@ if check_password():
                                 for miss_dpci in missing_dpcis:
                                     info = item_info_dict.get(miss_dpci, {'style': '', 'upc': ''})
                                     vendor_name = ""
-                                    # 若是動態展開的子商品，自動繼承母商品的 Vendor Name
                                     for p_dpci, children in parent_to_children.items():
                                         if miss_dpci in children:
                                             match_p = df_item_level[df_item_level['DPCI_MERGE'] == p_dpci]
@@ -765,6 +758,25 @@ if check_password():
                                     new_row['Factory Name'] = vendor_name 
                                     new_rows.append(new_row)
                                 if new_rows: prod_data = pd.concat([prod_data, pd.DataFrame(new_rows)], ignore_index=True)
+
+                                # 💡 【關鍵修復】母商品強制繼承子商品的工廠與供應商資訊
+                                for p_dpci, children in parent_to_children.items():
+                                    vendor_name, factory_name, factory_id = '', '', ''
+                                    for c_dpci in children:
+                                        if c_dpci in prod_data['DPCI_MERGE'].values:
+                                            c_rows = prod_data[prod_data['DPCI_MERGE'] == c_dpci]
+                                            vendor_name = c_rows.iloc[0].get('Import Vendor Name', '')
+                                            factory_name = c_rows.iloc[0].get('Factory Name', '')
+                                            factory_id = c_rows.iloc[0].get('Factory ID', '')
+                                            if vendor_name and factory_name: break
+                                            
+                                    if vendor_name or factory_name:
+                                        if p_dpci in prod_data['DPCI_MERGE'].values:
+                                            idx = prod_data.index[prod_data['DPCI_MERGE'] == p_dpci].tolist()
+                                            for i in idx:
+                                                if vendor_name: prod_data.at[i, 'Import Vendor Name'] = vendor_name
+                                                if factory_name: prod_data.at[i, 'Factory Name'] = factory_name
+                                                if 'Factory ID' in prod_data.columns and pd.notna(factory_id): prod_data.at[i, 'Factory ID'] = factory_id
 
                                 if 'Factory Name' not in prod_data.columns: prod_data['Factory Name'] = '未提供工廠名稱'
                                 if 'Factory ID' not in prod_data.columns: prod_data['Factory ID'] = ''
@@ -923,7 +935,7 @@ if check_password():
                                     
                                     zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
                                 
-                                st.success("✨ 處理完成！已成功為您展開所有混裝子商品並產出新版 PO GRID！")
+                                st.success("✨ 處理完成！已為您產出新版 PO GRID 表格。")
                                 st.download_button(
                                     label="📦 點擊下載合併版 PO GRID (ZIP)",
                                     data=zip_buffer.getvalue(),
