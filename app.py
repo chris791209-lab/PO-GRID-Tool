@@ -424,7 +424,6 @@ if check_password():
                                         ws = writer.sheets[safe_factory_name]
                                         ws.delete_cols(1) 
                                         
-                                        # --- 💡 全域自動排版套用 ---
                                         for row in ws.iter_rows():
                                             for cell in row:
                                                 cell.border = thin_border
@@ -434,7 +433,6 @@ if check_password():
                                                 else:
                                                     cell.font = calibri_font
                                                     cell.alignment = Alignment(vertical='center')
-                                                    # 💡 只有第 15 欄以後 (PO 數量區塊) 才套用千分位
                                                     if cell.column > 14 and isinstance(cell.value, (int, float)):
                                                         cell.number_format = '#,##0'
                                         
@@ -476,9 +474,7 @@ if check_password():
                                                         
                                         for col_idx in range(1, ws.max_column + 1):
                                             col_letter = get_column_letter(col_idx)
-                                            if img_col_letter and col_letter == img_col_letter:
-                                                continue  
-                                                
+                                            if img_col_letter and col_letter == img_col_letter: continue  
                                             max_length = 0
                                             for row_idx in range(1, ws.max_row + 1):
                                                 cell = ws.cell(row=row_idx, column=col_idx)
@@ -486,11 +482,8 @@ if check_password():
                                                     cell_val_str = str(cell.value)
                                                     for line in cell_val_str.split('\n'):
                                                         line_len = sum(2 if unicodedata.east_asian_width(c) in 'FWA' else 1 for c in line)
-                                                        if line_len > max_length:
-                                                            max_length = line_len
-                                            
-                                            adjusted_width = max(8, min(max_length + 2, 50)) 
-                                            ws.column_dimensions[col_letter].width = adjusted_width
+                                                        if line_len > max_length: max_length = line_len
+                                            ws.column_dimensions[col_letter].width = max(8, min(max_length + 2, 50)) 
                                 
                                 zip_file.writestr("PO_GRID_Merged_Old.xlsx", excel_buffer.getvalue())
                             
@@ -509,13 +502,17 @@ if check_password():
     # ------------------------------------------
     with tab3:
         st.markdown("""
-        此為 **全新 Modern PO** 專屬通道！只需上傳 3 份檔案即可自動運算！
-        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `PO_DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
+        此為 **全新 Modern PO** 專屬通道！
+        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
+        💡 **混裝救星**：如果該專案有混裝商品(Assortment)，只要上傳【1.5 混裝明細表】，系統就會自動展開子商品並完美還原舊版計算邏輯！
         """)
 
-        col1, col2, col3 = st.columns(3)
+        col1, col15, col2, col3 = st.columns(4)
         with col1:
-            modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次上傳 3 份 CSV 檔案)", type=['csv'], accept_multiple_files=True, key="m_po")
+            modern_po_files = st.file_uploader("📁 1. Modern PO 報表\n(請一次上傳 3 份 CSV)", type=['csv'], accept_multiple_files=True, key="m_po")
+        with col15:
+            # 💡 全新功能：混裝明細表上傳區
+            m_assort_files = st.file_uploader("📁 1.5 混裝明細表\n(選傳，有混裝必傳)", type=['csv', 'xlsx'], accept_multiple_files=True, key="m_asst")
         with col2:
             m_prod_files = st.file_uploader("📁 2. 產品資料(PCN)\n(支援多檔)", type=['xlsx', 'csv'], accept_multiple_files=True, key="m_pcn")
         with col3:
@@ -539,7 +536,7 @@ if check_password():
                     st.warning(f"檔案讀取失敗 {f.name}: {e}")
 
             if df_po_level is None or df_item_level is None or df_dc_level is None:
-                st.error("❌ 系統未能集齊 3 份必要的 Modern 報表。請確認您同時上傳了含有 PO PURPOSE (PO Level)、MANUFACTURER STYLE (Item Level) 與 DPCI+LOCATION (DC_Item Level) 的 3 份 CSV 檔案！")
+                st.error("❌ 系統未能集齊 3 份必要的 Modern 報表。請確認上傳了 PO Level、Item Level 與 DC_Item Level！")
             else:
                 df_po_level['PO NUMBER'] = df_po_level['PO #'].astype(str).str.split('.').str[0].str.strip()
                 df_item_level['PO NUMBER'] = df_item_level['PO #'].astype(str).str.split('.').str[0].str.strip()
@@ -601,7 +598,6 @@ if check_password():
 
                     df_dc_level['DPCI_MERGE'] = df_dc_level['DPCI'].astype(str).str.strip()
                     df_dc_level['QTY'] = pd.to_numeric(df_dc_level['REVISED QUANTITY'].astype(str).str.replace(',', ''), errors='coerce').fillna(0.0)
-                    
                     df_dc_level['NATIVE_PORT'] = df_dc_level['LOCATION'].astype(str).str.replace(r'\.0$', '', regex=True).replace({'nan': '', 'None': ''}).str.strip()
                     
                     unique_po_ports = df_dc_level[['PO NUMBER', 'NATIVE_PORT']].drop_duplicates(subset=['PO NUMBER']).copy()
@@ -612,7 +608,7 @@ if check_password():
                     st.divider()
                     st.subheader("📍 步驟 5: 最終港口確認")
                     if missing_ports_count_m > 0:
-                        st.warning(f"⚠️ 注意：有 **{missing_ports_count_m}** 筆 PO 的原始檔案中沒有標示港口 (LOCATION 空白)！請在下方手手動補齊。")
+                        st.warning(f"⚠️ 注意：有 **{missing_ports_count_m}** 筆 PO 沒有標示港口 (LOCATION 空白)！請在下方手動補齊。")
                         display_cols = ["PO NUMBER", "輸入港口代碼 (如:581)"]
                         edited_unique = st.data_editor(unique_po_ports[display_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
                         unique_po_ports['輸入港口代碼 (如:581)'] = edited_unique['輸入港口代碼 (如:581)'].values
@@ -622,14 +618,89 @@ if check_password():
                     port_lookup = dict(zip(unique_po_ports['PO NUMBER'], unique_po_ports['輸入港口代碼 (如:581)']))
                     df_dc_level['PORT_NAME'] = df_dc_level['PO NUMBER'].map(port_lookup).fillna('未指定港口').replace({'': '未指定港口'})
 
-                    po_raw_merged = df_dc_level.merge(po_info, on='PO NUMBER', how='left')
-                    po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('')
-                    po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('日期遺失')
-
                     st.divider()
                     if st.button("🚀 開始自動生成 PO GRID (新版引擎)", type="primary", key="btn_new"):
                         with st.spinner("新版引擎運算與排版美化中，請稍候..."):
                             try:
+                                # 💡 全新動態混裝解析引擎
+                                assort_dict = {}
+                                if m_assort_files:
+                                    for asst_file in m_assort_files:
+                                        try:
+                                            df_asst = pd.read_csv(asst_file) if asst_file.name.lower().endswith('.csv') else pd.read_excel(asst_file)
+                                            # 動態尋找表頭 (避開上方空白列)
+                                            header_idx = None
+                                            for i in range(min(20, len(df_asst))):
+                                                row_strs = [str(x).lower() for x in df_asst.iloc[i].values]
+                                                if any('assortment dpci' in x or 'parent' in x for x in row_strs) and any('dpci' in x for x in row_strs):
+                                                    header_idx = i
+                                                    break
+                                            if header_idx is not None:
+                                                df_asst.columns = df_asst.iloc[header_idx]
+                                                df_asst = df_asst.iloc[header_idx+1:].reset_index(drop=True)
+                                                
+                                            parent_col = next((c for c in df_asst.columns if 'assortment dpci' in str(c).lower() or 'parent' in str(c).lower()), None)
+                                            child_col = next((c for c in df_asst.columns if str(c).lower() == 'dpci' or 'component dpci' in str(c).lower() or 'child dpci' in str(c).lower() or 'item dpci' in str(c).lower()), None)
+                                            qty_col = next((c for c in df_asst.columns if 'units' in str(c).lower() or 'qty' in str(c).lower() or 'ratio' in str(c).lower() or 'pack' in str(c).lower()), None)
+                                            
+                                            if parent_col and child_col and qty_col:
+                                                df_asst[parent_col] = df_asst[parent_col].ffill() # 母 DPCI 往下填滿
+                                                for _, row in df_asst.iterrows():
+                                                    p_val = str(row[parent_col]).strip().replace('.0', '')
+                                                    c_val = str(row[child_col]).strip()
+                                                    q_val = pd.to_numeric(str(row[qty_col]), errors='coerce')
+                                                    
+                                                    if pd.isna(q_val) or not p_val or not c_val or p_val == 'nan' or c_val == 'nan': continue
+                                                    
+                                                    # 標準化母 DPCI 格式
+                                                    p_val = re.sub(r'\D', '', p_val)
+                                                    if len(p_val) == 9: p_val = f"{p_val[:3]}-{p_val[3:5]}-{p_val[5:]}"
+                                                    
+                                                    # 標準化子 DPCI 格式
+                                                    c_val_match = re.search(r'\d{3}-\d{2}-\d{4}', c_val)
+                                                    if c_val_match: c_val = c_val_match.group(0)
+                                                    else:
+                                                        c_val_num = re.sub(r'\D', '', c_val)
+                                                        if len(c_val_num) == 9: c_val = f"{c_val_num[:3]}-{c_val_num[3:5]}-{c_val_num[5:]}"
+                                                    
+                                                    if p_val not in assort_dict: assort_dict[p_val] = []
+                                                    assort_dict[p_val].append({'child_dpci': c_val, 'qty': float(q_val)})
+                                        except Exception as e:
+                                            st.warning(f"讀取混裝明細表失敗: {e}")
+
+                                # 💡 根據解析出的混裝比例，無中生有展開子商品資料
+                                expanded_records = []
+                                child_assort_qty_dict = {}
+                                parent_to_children = {}
+                                
+                                for _, row in df_dc_level.iterrows():
+                                    po_num = row['PO NUMBER']
+                                    dpci = row['DPCI_MERGE']
+                                    qty = row['QTY']
+                                    port = row['PORT_NAME']
+                                    
+                                    is_parent = dpci in assort_dict or str(row.get('ITEM DESCRIPTION', '')).upper().startswith('ASSORT')
+                                    if is_parent: parent_dpci_list.add(dpci)
+                                    
+                                    expanded_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': dpci, 'PORT_NAME': port, 'QTY': qty, 'IS_PARENT': is_parent})
+                                    
+                                    if dpci in assort_dict:
+                                        if dpci not in parent_to_children: parent_to_children[dpci] = set()
+                                        for child in assort_dict[dpci]:
+                                            c_dpci = child['child_dpci']
+                                            c_ratio = child['qty']
+                                            c_qty = qty * c_ratio  # 核心：母數量 * 比例 = 子數量
+                                            
+                                            parent_to_children[dpci].add(c_dpci)
+                                            child_assort_qty_dict[c_dpci] = c_ratio
+                                            
+                                            expanded_records.append({'PO NUMBER': po_num, 'DPCI_MERGE': c_dpci, 'PORT_NAME': port, 'QTY': c_qty, 'IS_PARENT': False})
+
+                                df_expanded = pd.DataFrame(expanded_records)
+                                po_raw_merged = df_expanded.merge(po_info, on='PO NUMBER', how='left')
+                                po_raw_merged['PURPOSE'] = po_raw_merged['PURPOSE'].fillna('')
+                                po_raw_merged['SHIP_DATES'] = po_raw_merged['SHIP_DATES'].fillna('日期遺失')
+
                                 pivot_df_temp = po_raw_merged.pivot_table(index='DPCI_MERGE', columns=['PURPOSE', 'PO NUMBER', 'SHIP_DATES', 'PORT_NAME'], values='QTY', aggfunc='sum').fillna(0)
                                 new_pivot_cols = [(col[0], '', col[1], col[2], col[3]) for col in pivot_df_temp.columns]
                                 pivot_df = pd.DataFrame(pivot_df_temp.values, index=pivot_df_temp.index, columns=pd.MultiIndex.from_tuples(new_pivot_cols))
@@ -674,8 +745,17 @@ if check_password():
                                 new_rows = []
                                 for miss_dpci in missing_dpcis:
                                     info = item_info_dict.get(miss_dpci, {'style': '', 'upc': ''})
-                                    match_item = df_item_level[df_item_level['DPCI_MERGE'] == miss_dpci]
-                                    vendor_name = str(match_item.iloc[0].get('VENDOR NAME', '')).strip() if not match_item.empty else ""
+                                    vendor_name = ""
+                                    # 若是動態展開的子商品，自動繼承母商品的 Vendor Name
+                                    for p_dpci, children in parent_to_children.items():
+                                        if miss_dpci in children:
+                                            match_p = df_item_level[df_item_level['DPCI_MERGE'] == p_dpci]
+                                            if not match_p.empty: vendor_name = str(match_p.iloc[0].get('VENDOR NAME', '')).strip()
+                                            break
+                                    if not vendor_name:
+                                        match_item = df_item_level[df_item_level['DPCI_MERGE'] == miss_dpci]
+                                        if not match_item.empty: vendor_name = str(match_item.iloc[0].get('VENDOR NAME', '')).strip()
+                                        
                                     new_row = {c: '' for c in prod_data.columns}
                                     new_row['DPCI'] = miss_dpci
                                     new_row['DPCI_MERGE'] = miss_dpci
@@ -696,6 +776,13 @@ if check_password():
 
                                 prod_data['Packaging'] = prod_data['Retail Packaging Format (1) *'].fillna('') if 'Retail Packaging Format (1) *' in prod_data.columns else ''
                                 prod_data['Assortment'] = '' 
+                                for parent_dpci, children in parent_to_children.items():
+                                    for child_dpci in children:
+                                        assort_qty = child_assort_qty_dict.get(child_dpci, 0)
+                                        if child_dpci in prod_data['DPCI_MERGE'].values:
+                                            idx = prod_data.index[prod_data['DPCI_MERGE'] == child_dpci].tolist()
+                                            for i in idx: prod_data.at[i, 'Assortment'] = int(assort_qty) if float(assort_qty).is_integer() else float(assort_qty)
+                                            
                                 prod_data['IMAGE'] = ''
                                 prod_data['Age'] = ''
 
@@ -739,6 +826,24 @@ if check_password():
                                                 else: cols_to_keep.append(col)
                                                     
                                             export_data = export_data[cols_to_keep]
+                                            available_dpcis = export_data.index.tolist()
+                                            ordered_dfs = []
+                                            added_dpcis = set()
+                                            
+                                            for p_dpci in parent_dpci_list:
+                                                if p_dpci in available_dpcis:
+                                                    ordered_dfs.append(export_data.loc[[p_dpci]])
+                                                    added_dpcis.add(p_dpci)
+                                                    for c_dpci in parent_to_children.get(p_dpci, set()):
+                                                        if c_dpci in available_dpcis:
+                                                            ordered_dfs.append(export_data.loc[[c_dpci]])
+                                                            added_dpcis.add(c_dpci)
+                                                    blank = pd.DataFrame([[''] * len(export_data.columns)], columns=export_data.columns, index=[f'BLANK_{p_dpci}'])
+                                                    ordered_dfs.append(blank)
+                                            
+                                            regular_dpcis = [d for d in available_dpcis if d not in added_dpcis]
+                                            if regular_dpcis: ordered_dfs.append(export_data.loc[regular_dpcis])
+                                            if ordered_dfs: export_data = pd.concat(ordered_dfs)
                                             
                                             unmerged_columns = []
                                             po_idx = 0
@@ -755,7 +860,6 @@ if check_password():
                                             ws = writer.sheets[safe_factory_name]
                                             ws.delete_cols(1) 
                                             
-                                            # --- 💡 全域自動排版套用 ---
                                             for row in ws.iter_rows():
                                                 for cell in row:
                                                     cell.border = thin_border
@@ -765,7 +869,6 @@ if check_password():
                                                     else:
                                                         cell.font = calibri_font
                                                         cell.alignment = Alignment(vertical='center')
-                                                        # 💡 只有第 15 欄以後 (PO 數量區塊) 才套用千分位
                                                         if cell.column > 14 and isinstance(cell.value, (int, float)):
                                                             cell.number_format = '#,##0'
                                             
@@ -807,9 +910,7 @@ if check_password():
                                                             
                                             for col_idx in range(1, ws.max_column + 1):
                                                 col_letter = get_column_letter(col_idx)
-                                                if img_col_letter and col_letter == img_col_letter:
-                                                    continue  
-                                                    
+                                                if img_col_letter and col_letter == img_col_letter: continue  
                                                 max_length = 0
                                                 for row_idx in range(1, ws.max_row + 1):
                                                     cell = ws.cell(row=row_idx, column=col_idx)
@@ -817,15 +918,12 @@ if check_password():
                                                         cell_val_str = str(cell.value)
                                                         for line in cell_val_str.split('\n'):
                                                             line_len = sum(2 if unicodedata.east_asian_width(c) in 'FWA' else 1 for c in line)
-                                                            if line_len > max_length:
-                                                                max_length = line_len
-                                                
-                                                adjusted_width = max(8, min(max_length + 2, 50)) 
-                                                ws.column_dimensions[col_letter].width = adjusted_width
+                                                            if line_len > max_length: max_length = line_len
+                                                ws.column_dimensions[col_letter].width = max(8, min(max_length + 2, 50)) 
                                     
                                     zip_file.writestr("PO_GRID_Merged_Modern.xlsx", excel_buffer.getvalue())
                                 
-                                st.success("✨ 處理完成！已為您產出新版 PO GRID 表格。")
+                                st.success("✨ 處理完成！已成功為您展開所有混裝子商品並產出新版 PO GRID！")
                                 st.download_button(
                                     label="📦 點擊下載合併版 PO GRID (ZIP)",
                                     data=zip_buffer.getvalue(),
