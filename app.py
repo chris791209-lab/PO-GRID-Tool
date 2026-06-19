@@ -205,7 +205,6 @@ if check_password():
 
                             prod_data_list = []
                             for p_file in prod_files:
-                                # 💡 強制讀取為字串，解除 Pandas 的嚴格數字型態鎖定
                                 df_temp = pd.read_csv(p_file, dtype=str) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file, dtype=str)
                                 prod_data_list.append(df_temp)
                             prod_data = pd.concat(prod_data_list, ignore_index=True).astype(object).fillna('')
@@ -443,8 +442,14 @@ if check_password():
                                                 else:
                                                     cell.font = calibri_font
                                                     cell.alignment = Alignment(vertical='center')
-                                                    if cell.column > 14 and isinstance(cell.value, (int, float)):
-                                                        cell.number_format = '#,##0'
+                                                    # 💡 修正：第13欄以後強制轉為數字並套用千分位
+                                                    if cell.column > 12 and cell.value not in ('', None):
+                                                        try:
+                                                            val_float = float(str(cell.value).replace(',', ''))
+                                                            cell.value = int(val_float) if val_float.is_integer() else val_float
+                                                            cell.number_format = '#,##0'
+                                                        except (ValueError, TypeError):
+                                                            pass # 若為母商品字串則略過
                                         
                                         img_col_letter = None
                                         if image_zip_files:
@@ -471,10 +476,18 @@ if check_password():
                                                         try:
                                                             img_bytes = io.BytesIO(image_dict[cell_dpci_val])
                                                             with PILImage.open(img_bytes) as pil_img:
-                                                                if pil_img.mode != 'RGB': pil_img = pil_img.convert('RGB')
+                                                                if pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info):
+                                                                    if pil_img.mode != 'RGBA': pil_img = pil_img.convert('RGBA')
+                                                                    white_bg = PILImage.new('RGB', pil_img.size, (255, 255, 255))
+                                                                    white_bg.paste(pil_img, mask=pil_img.split()[3])
+                                                                    pil_img = white_bg
+                                                                elif pil_img.mode != 'RGB': 
+                                                                    pil_img = pil_img.convert('RGB')
+                                                                    
                                                                 clean_img_io = io.BytesIO()
                                                                 pil_img.save(clean_img_io, format='JPEG')
                                                                 clean_img_io.seek(0)
+                                                                
                                                             img_obj = OpenpyxlImage(clean_img_io)
                                                             img_obj.width = 90
                                                             img_obj.height = 90
@@ -513,7 +526,7 @@ if check_password():
     with tab3:
         st.markdown("""
         此為 **全新 Modern PO** 專屬通道！只需上傳 3 份檔案即可自動運算！
-        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `PO_DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
+        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
         💡 **混裝救星**：如果該專案有混裝商品(Assortment)，只要上傳【1.5 混裝明細表】，系統就會自動展開子商品並完美還原舊版計算邏輯！
         """)
 
@@ -635,7 +648,6 @@ if check_password():
                                 if m_assort_files:
                                     for asst_file in m_assort_files:
                                         try:
-                                            # 💡 同樣強制轉型為 str 防止型別錯誤
                                             df_asst = pd.read_csv(asst_file, dtype=str) if asst_file.name.lower().endswith('.csv') else pd.read_excel(asst_file, dtype=str)
                                             header_idx = None
                                             for i in range(min(20, len(df_asst))):
@@ -650,7 +662,6 @@ if check_password():
                                             parent_col = next((c for c in df_asst.columns if 'assortment dpci' in str(c).lower() or 'parent' in str(c).lower()), None)
                                             child_col = next((c for c in df_asst.columns if str(c).lower() == 'dpci' or 'component dpci' in str(c).lower() or 'child dpci' in str(c).lower() or 'item dpci' in str(c).lower()), None)
                                             qty_col = next((c for c in df_asst.columns if 'units' in str(c).lower() or 'qty' in str(c).lower() or 'ratio' in str(c).lower() or 'pack' in str(c).lower()), None)
-                                            
                                             style_col = next((c for c in df_asst.columns if 'style' in str(c).lower() or 'sytle' in str(c).lower()), None)
                                             
                                             if parent_col and child_col and qty_col:
@@ -738,7 +749,6 @@ if check_password():
 
                                 prod_data_list = []
                                 for p_file in m_prod_files:
-                                    # 💡 強制讀取為字串，解除 Pandas 的嚴格數字型態鎖定
                                     df_temp = pd.read_csv(p_file, dtype=str) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file, dtype=str)
                                     prod_data_list.append(df_temp)
                                 prod_data = pd.concat(prod_data_list, ignore_index=True).astype(object).fillna('')
@@ -915,8 +925,14 @@ if check_password():
                                                     else:
                                                         cell.font = calibri_font
                                                         cell.alignment = Alignment(vertical='center')
-                                                        if cell.column > 14 and isinstance(cell.value, (int, float)):
-                                                            cell.number_format = '#,##0'
+                                                        # 💡 修正：第13欄以後強制轉回數字並掛上千分位
+                                                        if cell.column > 12 and cell.value not in ('', None):
+                                                            try:
+                                                                val_float = float(str(cell.value).replace(',', ''))
+                                                                cell.value = int(val_float) if val_float.is_integer() else val_float
+                                                                cell.number_format = '#,##0'
+                                                            except (ValueError, TypeError):
+                                                                pass
                                             
                                             img_col_letter = None
                                             if m_image_zip_files:
@@ -943,10 +959,18 @@ if check_password():
                                                             try:
                                                                 img_bytes = io.BytesIO(image_dict[cell_dpci_val])
                                                                 with PILImage.open(img_bytes) as pil_img:
-                                                                    if pil_img.mode != 'RGB': pil_img = pil_img.convert('RGB')
+                                                                    if pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info):
+                                                                        if pil_img.mode != 'RGBA': pil_img = pil_img.convert('RGBA')
+                                                                        white_bg = PILImage.new('RGB', pil_img.size, (255, 255, 255))
+                                                                        white_bg.paste(pil_img, mask=pil_img.split()[3])
+                                                                        pil_img = white_bg
+                                                                    elif pil_img.mode != 'RGB': 
+                                                                        pil_img = pil_img.convert('RGB')
+                                                                        
                                                                     clean_img_io = io.BytesIO()
                                                                     pil_img.save(clean_img_io, format='JPEG')
                                                                     clean_img_io.seek(0)
+                                                                    
                                                                 img_obj = OpenpyxlImage(clean_img_io)
                                                                 img_obj.width = 90
                                                                 img_obj.height = 90
