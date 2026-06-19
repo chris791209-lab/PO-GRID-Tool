@@ -205,9 +205,10 @@ if check_password():
 
                             prod_data_list = []
                             for p_file in prod_files:
-                                df_temp = pd.read_csv(p_file) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file)
+                                # 💡 強制讀取為字串，解除 Pandas 的嚴格數字型態鎖定
+                                df_temp = pd.read_csv(p_file, dtype=str) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file, dtype=str)
                                 prod_data_list.append(df_temp)
-                            prod_data = pd.concat(prod_data_list, ignore_index=True)
+                            prod_data = pd.concat(prod_data_list, ignore_index=True).astype(object).fillna('')
 
                             po_processed_records = []
                             parent_dpci_list = set()
@@ -295,41 +296,41 @@ if check_password():
                                     idx_list = prod_data.index[prod_data['DPCI_MERGE'] == dpci_key].tolist()
                                     for i in idx_list:
                                         curr_style = str(prod_data.at[i, 'Manufacturer Style # *']).strip()
-                                        if curr_style in ('', 'nan') and info_dict['style']: prod_data.at[i, 'Manufacturer Style # *'] = info_dict['style']
+                                        if curr_style in ('', 'nan') and info_dict['style']: prod_data.at[i, 'Manufacturer Style # *'] = str(info_dict['style'])
                                         if info_dict['upc']:
                                             curr_upc = str(prod_data.at[i, 'Barcode']).strip()
-                                            if curr_upc in ('', 'nan'): prod_data.at[i, 'Barcode'] = format_upc(info_dict['upc'])
+                                            if curr_upc in ('', 'nan'): prod_data.at[i, 'Barcode'] = str(format_upc(info_dict['upc']))
 
                             for parent_dpci, info in parent_info_dict.items():
                                 vendor_name, factory_name, factory_id = '', '', ''
                                 for c_dpci in parent_to_children.get(parent_dpci, []):
                                     if c_dpci in prod_data['DPCI_MERGE'].values:
                                         child_rows = prod_data[prod_data['DPCI_MERGE'] == c_dpci]
-                                        vendor_name = child_rows.iloc[0].get('Import Vendor Name', '')
-                                        factory_name = child_rows.iloc[0].get('Factory Name', '')
-                                        factory_id = child_rows.iloc[0].get('Factory ID', '')
+                                        vendor_name = str(child_rows.iloc[0].get('Import Vendor Name', '')).strip()
+                                        factory_name = str(child_rows.iloc[0].get('Factory Name', '')).strip()
+                                        factory_id = str(child_rows.iloc[0].get('Factory ID', '')).strip()
                                         if vendor_name and factory_name: break
                                 if parent_dpci in prod_data['DPCI_MERGE'].values:
                                     idx = prod_data.index[prod_data['DPCI_MERGE'] == parent_dpci].tolist()
                                     for i in idx:
                                         prod_data.at[i, 'DPCI'] = parent_dpci 
-                                        prod_data.at[i, 'Manufacturer Style # *'] = info['style']
-                                        prod_data.at[i, 'Barcode'] = format_upc(info['upc'])
+                                        prod_data.at[i, 'Manufacturer Style # *'] = str(info['style'])
+                                        prod_data.at[i, 'Barcode'] = str(format_upc(info['upc']))
                                         prod_data.at[i, 'Product Description'] = '' 
-                                        if vendor_name: prod_data.at[i, 'Import Vendor Name'] = vendor_name
-                                        if factory_name: prod_data.at[i, 'Factory Name'] = factory_name
-                                        if pd.notna(factory_id): prod_data.at[i, 'Factory ID'] = factory_id
+                                        if vendor_name and vendor_name != 'nan': prod_data.at[i, 'Import Vendor Name'] = vendor_name
+                                        if factory_name and factory_name != 'nan': prod_data.at[i, 'Factory Name'] = factory_name
+                                        if 'Factory ID' in prod_data.columns and pd.notna(factory_id) and factory_id != 'nan': prod_data.at[i, 'Factory ID'] = factory_id
                                 else:
                                     new_row = {col: '' for col in prod_data.columns}
                                     new_row['DPCI'] = parent_dpci 
                                     new_row['DPCI_MERGE'] = parent_dpci
-                                    new_row['Manufacturer Style # *'] = info['style']
-                                    new_row['Barcode'] = format_upc(info['upc'])
+                                    new_row['Manufacturer Style # *'] = str(info['style'])
+                                    new_row['Barcode'] = str(format_upc(info['upc']))
                                     new_row['Product Description'] = '' 
-                                    new_row['Import Vendor Name'] = vendor_name
-                                    new_row['Factory Name'] = factory_name
-                                    if pd.notna(factory_id): new_row['Factory ID'] = factory_id
-                                    prod_data = pd.concat([prod_data, pd.DataFrame([new_row])], ignore_index=True)
+                                    new_row['Import Vendor Name'] = vendor_name if vendor_name != 'nan' else ''
+                                    new_row['Factory Name'] = factory_name if factory_name != 'nan' else ''
+                                    if 'Factory ID' in prod_data.columns: new_row['Factory ID'] = factory_id if factory_id != 'nan' else ''
+                                    prod_data = pd.concat([prod_data, pd.DataFrame([new_row])], ignore_index=True).astype(object).fillna('')
                                     
                             if 'Assortment' not in prod_data.columns: prod_data['Assortment'] = ''
                             for parent_dpci, children in parent_to_children.items():
@@ -337,7 +338,9 @@ if check_password():
                                     assort_qty = child_assort_qty_dict.get(child_dpci, 0)
                                     if child_dpci in prod_data['DPCI_MERGE'].values:
                                         idx = prod_data.index[prod_data['DPCI_MERGE'] == child_dpci].tolist()
-                                        for i in idx: prod_data.at[i, 'Assortment'] = int(assort_qty) if float(assort_qty).is_integer() else float(assort_qty)
+                                        for i in idx: 
+                                            val = int(assort_qty) if float(assort_qty).is_integer() else float(assort_qty)
+                                            prod_data.at[i, 'Assortment'] = str(val)
 
                             if 'Factory Name' not in prod_data.columns: prod_data['Factory Name'] = '未提供工廠名稱'
                             if 'Factory ID' not in prod_data.columns: prod_data['Factory ID'] = ''
@@ -369,7 +372,6 @@ if check_password():
                                 else: return (spaces, col, '', '', '')
 
                             left_data.columns = pd.MultiIndex.from_tuples([get_left_tuple(col, i+1) for i, col in enumerate(left_data.columns)])
-                            
                             final_df = left_data.join(pivot_df, how='inner').astype(object).fillna('')
 
                             zip_buffer = io.BytesIO()
@@ -511,7 +513,7 @@ if check_password():
     with tab3:
         st.markdown("""
         此為 **全新 Modern PO** 專屬通道！只需上傳 3 份檔案即可自動運算！
-        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
+        🎯 **智慧偵測**：請將 `PO Level`, `Item Level`, `PO_DC_Item Level` 這 3 份 Modern CSV **同時上傳**至第一個框框，系統會自動在背後為您縫合！
         💡 **混裝救星**：如果該專案有混裝商品(Assortment)，只要上傳【1.5 混裝明細表】，系統就會自動展開子商品並完美還原舊版計算邏輯！
         """)
 
@@ -633,7 +635,8 @@ if check_password():
                                 if m_assort_files:
                                     for asst_file in m_assort_files:
                                         try:
-                                            df_asst = pd.read_csv(asst_file) if asst_file.name.lower().endswith('.csv') else pd.read_excel(asst_file)
+                                            # 💡 同樣強制轉型為 str 防止型別錯誤
+                                            df_asst = pd.read_csv(asst_file, dtype=str) if asst_file.name.lower().endswith('.csv') else pd.read_excel(asst_file, dtype=str)
                                             header_idx = None
                                             for i in range(min(20, len(df_asst))):
                                                 row_strs = [str(x).lower() for x in df_asst.iloc[i].values]
@@ -647,6 +650,7 @@ if check_password():
                                             parent_col = next((c for c in df_asst.columns if 'assortment dpci' in str(c).lower() or 'parent' in str(c).lower()), None)
                                             child_col = next((c for c in df_asst.columns if str(c).lower() == 'dpci' or 'component dpci' in str(c).lower() or 'child dpci' in str(c).lower() or 'item dpci' in str(c).lower()), None)
                                             qty_col = next((c for c in df_asst.columns if 'units' in str(c).lower() or 'qty' in str(c).lower() or 'ratio' in str(c).lower() or 'pack' in str(c).lower()), None)
+                                            
                                             style_col = next((c for c in df_asst.columns if 'style' in str(c).lower() or 'sytle' in str(c).lower()), None)
                                             
                                             if parent_col and child_col and qty_col:
@@ -734,9 +738,10 @@ if check_password():
 
                                 prod_data_list = []
                                 for p_file in m_prod_files:
-                                    df_temp = pd.read_csv(p_file) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file)
+                                    # 💡 強制讀取為字串，解除 Pandas 的嚴格數字型態鎖定
+                                    df_temp = pd.read_csv(p_file, dtype=str) if p_file.name.lower().endswith('.csv') else pd.read_excel(p_file, dtype=str)
                                     prod_data_list.append(df_temp)
-                                prod_data = pd.concat(prod_data_list, ignore_index=True)
+                                prod_data = pd.concat(prod_data_list, ignore_index=True).astype(object).fillna('')
                                 
                                 if 'DPCI' not in prod_data.columns:
                                     st.error("❌ 產品資料(PCN) 缺少 'DPCI' 欄位。")
@@ -752,10 +757,10 @@ if check_password():
                                         idx_list = prod_data.index[prod_data['DPCI_MERGE'] == dpci_key].tolist()
                                         for i in idx_list:
                                             curr_style = str(prod_data.at[i, 'Manufacturer Style # *']).strip()
-                                            if curr_style in ('', 'nan') and info_dict['style']: prod_data.at[i, 'Manufacturer Style # *'] = info_dict['style']
+                                            if curr_style in ('', 'nan') and info_dict['style']: prod_data.at[i, 'Manufacturer Style # *'] = str(info_dict['style'])
                                             if info_dict['upc']:
                                                 curr_upc = str(prod_data.at[i, 'Barcode']).strip()
-                                                if curr_upc in ('', 'nan'): prod_data.at[i, 'Barcode'] = format_upc(info_dict['upc'])
+                                                if curr_upc in ('', 'nan'): prod_data.at[i, 'Barcode'] = str(format_upc(info_dict['upc']))
 
                                 existing_pcn_dpcis = prod_data['DPCI_MERGE'].values
                                 missing_dpcis = [d for d in pivot_df.index if d not in existing_pcn_dpcis]
@@ -775,30 +780,30 @@ if check_password():
                                     new_row = {c: '' for c in prod_data.columns}
                                     new_row['DPCI'] = miss_dpci
                                     new_row['DPCI_MERGE'] = miss_dpci
-                                    new_row['Manufacturer Style # *'] = info['style']
-                                    new_row['Barcode'] = format_upc(info['upc'])
-                                    new_row['Import Vendor Name'] = vendor_name
-                                    new_row['Factory Name'] = vendor_name 
+                                    new_row['Manufacturer Style # *'] = str(info['style'])
+                                    new_row['Barcode'] = str(format_upc(info['upc']))
+                                    new_row['Import Vendor Name'] = vendor_name if vendor_name != 'nan' else ''
+                                    new_row['Factory Name'] = vendor_name if vendor_name != 'nan' else ''
                                     new_rows.append(new_row)
-                                if new_rows: prod_data = pd.concat([prod_data, pd.DataFrame(new_rows)], ignore_index=True)
+                                if new_rows: prod_data = pd.concat([prod_data, pd.DataFrame(new_rows)], ignore_index=True).astype(object).fillna('')
 
                                 for p_dpci, children in parent_to_children.items():
                                     vendor_name, factory_name, factory_id = '', '', ''
                                     for c_dpci in children:
                                         if c_dpci in prod_data['DPCI_MERGE'].values:
                                             c_rows = prod_data[prod_data['DPCI_MERGE'] == c_dpci]
-                                            vendor_name = c_rows.iloc[0].get('Import Vendor Name', '')
-                                            factory_name = c_rows.iloc[0].get('Factory Name', '')
-                                            factory_id = c_rows.iloc[0].get('Factory ID', '')
+                                            vendor_name = str(c_rows.iloc[0].get('Import Vendor Name', '')).strip()
+                                            factory_name = str(c_rows.iloc[0].get('Factory Name', '')).strip()
+                                            factory_id = str(c_rows.iloc[0].get('Factory ID', '')).strip()
                                             if vendor_name and factory_name: break
                                             
                                     if vendor_name or factory_name:
                                         if p_dpci in prod_data['DPCI_MERGE'].values:
                                             idx = prod_data.index[prod_data['DPCI_MERGE'] == p_dpci].tolist()
                                             for i in idx:
-                                                if vendor_name: prod_data.at[i, 'Import Vendor Name'] = vendor_name
-                                                if factory_name: prod_data.at[i, 'Factory Name'] = factory_name
-                                                if 'Factory ID' in prod_data.columns and pd.notna(factory_id): prod_data.at[i, 'Factory ID'] = factory_id
+                                                if vendor_name and vendor_name != 'nan': prod_data.at[i, 'Import Vendor Name'] = vendor_name
+                                                if factory_name and factory_name != 'nan': prod_data.at[i, 'Factory Name'] = factory_name
+                                                if 'Factory ID' in prod_data.columns and pd.notna(factory_id) and factory_id != 'nan': prod_data.at[i, 'Factory ID'] = factory_id
 
                                 if 'Factory Name' not in prod_data.columns: prod_data['Factory Name'] = '未提供工廠名稱'
                                 if 'Factory ID' not in prod_data.columns: prod_data['Factory ID'] = ''
@@ -819,7 +824,9 @@ if check_password():
                                         assort_qty = child_assort_qty_dict.get(child_dpci, 0)
                                         if child_dpci in prod_data['DPCI_MERGE'].values:
                                             idx = prod_data.index[prod_data['DPCI_MERGE'] == child_dpci].tolist()
-                                            for i in idx: prod_data.at[i, 'Assortment'] = int(assort_qty) if float(assort_qty).is_integer() else float(assort_qty)
+                                            for i in idx: 
+                                                val = int(assort_qty) if float(assort_qty).is_integer() else float(assort_qty)
+                                                prod_data.at[i, 'Assortment'] = str(val)
                                             
                                 prod_data['IMAGE'] = ''
                                 prod_data['Age'] = ''
@@ -837,7 +844,7 @@ if check_password():
 
                                 left_data.columns = pd.MultiIndex.from_tuples([get_left_tuple(col, i+1) for i, col in enumerate(left_data.columns)])
                                 
-                                final_df = left_data.join(pivot_df, how='left').astype(object).fillna('')
+                                final_df = left_data.join(pivot_df, how='inner').astype(object).fillna('')
 
                                 zip_buffer = io.BytesIO()
                                 
