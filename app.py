@@ -1097,26 +1097,25 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
 # 8. Streamlit 網頁介面
 # ==========================================
 st.set_page_config(page_title="訂單自動核對系統", layout="wide")
-st.title("📦 跨專案訂單自動核對系統")
+st.title("🗂 TG Team PO 驗證管理平台")
 
 # ---- Sidebar ----
 st.sidebar.header("📂 步驟 1：上傳共通資料庫")
-product_files = st.sidebar.file_uploader("上傳 產品資料表 PCN (可多選)", type=['csv', 'xlsx'], accept_multiple_files=True)
-asst_files = st.sidebar.file_uploader("上傳 混裝箱表單 (可多選/選填)", type=['csv', 'xlsx'], accept_multiple_files=True)
+product_files = st.sidebar.file_uploader("產品資料表 PCN（可多選）", type=['csv', 'xlsx'], accept_multiple_files=True)
+asst_files = st.sidebar.file_uploader("混裝箱表單（可多選／選填）", type=['csv', 'xlsx'], accept_multiple_files=True)
 
 st.sidebar.markdown("---")
-st.sidebar.header("🗂 步驟 2（選填）：上傳工廠&人員隸屬清單")
-dispatch_files = st.sidebar.file_uploader("上傳工廠&人員隸屬清單（Factory / AE / AC 對照）", type=['csv', 'xlsx'], accept_multiple_files=True)
+st.sidebar.header("🏭 步驟 2（選填）：工廠 & 人員")
+dispatch_files = st.sidebar.file_uploader("工廠&人員隸屬清單（Factory / AE / AC）", type=['csv', 'xlsx'], accept_multiple_files=True)
 dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.DataFrame()
 
 # ==========================================
 # 主介面：PDF 上傳解析
 # ==========================================
 if True:
-    st.subheader("📄 直接上傳 SPS Commerce PO PDF")
-    st.info("免匯出 CSV！直接上傳 SPS Commerce 標準版 PO 的 PDF 檔案，系統將自動解析並執行核對。")
+    st.subheader("📄 上傳 SPS Commerce PO PDF")
 
-    pdf_files = st.file_uploader("📥 上傳 SPS Commerce PO PDF（可多選）", type=['pdf'], accept_multiple_files=True, key="pdf_po")
+    pdf_files = st.file_uploader("上傳 PO PDF（可多選）", type=['pdf'], accept_multiple_files=True, key="pdf_po")
 
     if st.button("🚀 解析 PDF 並執行核對", type="primary", key="btn_pdf"):
         if not product_files or not pdf_files:
