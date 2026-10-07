@@ -424,10 +424,13 @@ def process_dispatch(files):
 # ==========================================
 def parse_sps_pdf(pdf_file):
     """
-    G1: 解析 SPS Commerce PO PDF，回傳 (po_df, parse_warnings)
-    支援兩種路線：
+    G1: 解析 SPS Commerce / Target Import PO PDF，回傳 (po_df, parse_warnings)
+    支援三種路線：
       1. pdfplumber extract_tables()：有真實表格結構時使用
-      2. 純文字逐行解析（fallback）：SPS Commerce 常見排版為純文字，無表格框線
+      2. 純文字逐行解析（fallback）：SPS Commerce 文字版
+      3. OCR fallback：Target Import PO（全向量圖形、無文字層）
+         - 使用 pdf2image 光柵化 + pytesseract OCR
+         - 支援 "Buyers Catalog Number: XXXXXXXXX" → DPCI DDD-CC-XXXX 轉換
     """
     try:
         import pdfplumber
@@ -439,20 +442,32 @@ def parse_sps_pdf(pdf_file):
     current_po = None
 
     # PO NUMBER 多種格式：
-    # "Purchase Order: 1234567890" / "PO NUMBER: 1234567890" / "PO #1234567890"
+    # "Purchase Order: 1234567890" / "PO NUMBER: 1234567890" / "Order #: 10002036126-0581"
     PO_PATTERNS = [
+        r'Order\s*#?\s*[:#]?\s*(\d{10,13}(?:-\d{3,5})?)',
         r'Purchase\s+Order\s*[:#]?\s*(\d{7,12})',
         r'PO\s*(?:NUMBER|#|No\.?)[:\s]+(\d{7,12})',
         r'\bP\.?O\.?\s*[:#]?\s*(\d{7,12})\b',
     ]
     DPCI_RE = re.compile(r'\b(\d{3}-\d{2}-\d{4})\b')
+    # Buyers Catalog Number（Target Import format）: 9 digits → DDD-CC-XXXX
+    CATALOG_RE = re.compile(r'Buyers\s+Catalog\s+Number\s*[:\s]+(\d{9})', re.IGNORECASE)
+    # Also match plain 9-digit block that could be catalog number
+    CATALOG_BARE_RE = re.compile(r'\b(\d{9})\b')
 
     def extract_po_number(text):
         for pat in PO_PATTERNS:
             m = re.search(pat, text, re.IGNORECASE)
             if m:
-                return m.group(1)
+                raw = m.group(1)
+                # Strip suffix like "-0581" if present — keep base PO number
+                return raw.split('-')[0] if '-' in raw and len(raw.split('-')[0]) >= 10 else raw
         return None
+
+    def catalog_to_dpci(catalog_num):
+        """Convert 9-digit Buyers Catalog Number to DDD-CC-XXXX DPCI format."""
+        s = str(catalog_num).zfill(9)
+        return f"{s[:3]}-{s[3:5]}-{s[5:]}"
 
     def _build_row(po, dpci_raw, qty_raw, cost_raw=None, retail_raw=None,
                    desc_raw=None, upc_raw=None, asst_raw=None, vcp_raw=None):
@@ -475,12 +490,185 @@ def parse_sps_pdf(pdf_file):
             'Is_Shipper_Display': False,
         }
 
+    def _ocr_parse(pdf_file):
+        """
+        路線 3：OCR 解析 Target Import PO（向量圖形 PDF，無文字層）
+        使用 pdf2image 光柵化後以 pytesseract 辨識。
+        支援 "Buyers Catalog Number" 跨行格式（目錄編號在標題下一行）。
+        """
+        ocr_rows = []
+        ocr_po = None
+        try:
+            from pdf2image import convert_from_bytes
+            import pytesseract
+        except ImportError as e:
+            return [], [f"❌ OCR 套件缺失：{e}"]
+
+        try:
+            pdf_file.seek(0)
+            pdf_bytes = pdf_file.read()
+            images = convert_from_bytes(pdf_bytes, dpi=200, fmt='png')
+        except Exception as e:
+            return [], [f"❌ PDF 光柵化失敗：{e}"]
+
+        ocr_warnings = []
+        full_ocr_text = ''
+
+        for img in images:
+            ocr_text = pytesseract.image_to_string(img, lang='eng', config='--psm 6 --oem 3')
+            full_ocr_text += ocr_text + '\n'
+
+        lines = [l.rstrip() for l in full_ocr_text.splitlines()]
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # ── Extract PO number ──
+            po_found = extract_po_number(line)
+            if po_found:
+                ocr_po = po_found
+                i += 1
+                continue
+
+            # ── Detect "Buyers Catalog Number" header line ──
+            # Target Import format: "Buyers Catalog Number:" on one line,
+            # then the 9-digit catalog number at the start of the NEXT line.
+            if re.search(r'Buyers\s+Catalog\s+Number', line, re.IGNORECASE):
+                # The catalog number is on the next non-empty line
+                catalog_num = None
+                # Check same line first (inline format)
+                same_line_m = re.search(r'Buyers\s+Catalog\s+Number[:\s]+(\d{9})', line, re.IGNORECASE)
+                if same_line_m:
+                    catalog_num = same_line_m.group(1)
+                else:
+                    # Look at next line for a 9-digit number at start
+                    for j in range(i + 1, min(i + 3, len(lines))):
+                        next_m = re.match(r'\s*(\d{9})\b', lines[j])
+                        if next_m:
+                            catalog_num = next_m.group(1)
+                            break
+
+                if not catalog_num:
+                    i += 1
+                    continue
+
+                dpci_raw = catalog_to_dpci(catalog_num)
+
+                # Gather context: current line and surrounding ±6 lines
+                ctx_start = max(0, i - 2)
+                ctx_end = min(len(lines), i + 12)
+                context_lines = lines[ctx_start:ctx_end]
+                context_text = ' '.join(context_lines)
+
+                # ── UPC (12-13 digit number) ──
+                upc_m = re.search(r'\b(\d{12,13})\b', context_text)
+                upc_raw = upc_m.group(1) if upc_m else None
+
+                # ── Unit Price and Resale — use labeled patterns first ──
+                up_m = re.search(r'Unit\s+Price\s*[:\s]+(\d+\.?\d*)', context_text, re.IGNORECASE)
+                res_m = re.search(r'Resale\s*[:\s]+(\d+\.?\d*)', context_text, re.IGNORECASE)
+                cost_raw = up_m.group(1) if up_m else None
+                retail_raw = res_m.group(1) if res_m else None
+
+                # Fallback: extract floats if labeled patterns didn't match
+                if not cost_raw or not retail_raw:
+                    float_nums = re.findall(r'\b(\d+\.\d{2})\b', context_text)
+                    # Filter: remove UPC-digit runs and numbers > 9999 (totals)
+                    price_candidates = []
+                    for f in float_nums:
+                        try:
+                            v = float(f)
+                            if 0 < v < 9999 and (upc_raw is None or f not in upc_raw):
+                                price_candidates.append(f)
+                        except ValueError:
+                            pass
+                    if not cost_raw and price_candidates:
+                        cost_raw = price_candidates[0]
+                    if not retail_raw and len(price_candidates) > 1:
+                        retail_raw = price_candidates[1]
+
+                # ── QTY: prefer "N Each" pattern, then fallback ──
+                qty_m = re.search(r'\b(\d{1,5})\s+Each\b', context_text, re.IGNORECASE)
+                if not qty_m:
+                    qty_m = re.search(r'QTY\s*[:\s]+(\d+)', context_text, re.IGNORECASE)
+                qty_raw = qty_m.group(1) if qty_m else None
+
+                # ── Description: prefer "Product: <NAME>" label (before Resale/Price/Wholesale) ──
+                desc_raw = None
+                # Target Import has two "Product:" occurrences; the real one ends before Resale/Wholesale
+                prod_m = re.search(
+                    r'Product\s*:\s*([A-Z][A-Z0-9&\s\'"]{5,}?)(?=\s+(?:Resale|Unit Price|Wholesale|\Z))',
+                    context_text, re.IGNORECASE
+                )
+                if prod_m:
+                    desc_raw = prod_m.group(1).strip()
+                else:
+                    SKIP_KEYWORDS = {'ORDER', 'TARGET', 'VENDOR', 'BUYER', 'CATALOG',
+                                     'UNIT PRICE', 'RESALE', 'TOTAL', 'SHIP', 'CANCEL',
+                                     'FREIGHT', 'CONTACT', 'CURRENCY', 'INCOTERM',
+                                     'TERMS', 'RELEASE', 'CONTRACT', 'PURCHASING'}
+                    for cl in context_lines:
+                        cl = cl.strip()
+                        if len(cl) < 8:
+                            continue
+                        if not re.search(r'[A-Za-z]{3,}', cl):
+                            continue
+                        cl_up = cl.upper()
+                        if any(kw in cl_up for kw in SKIP_KEYWORDS):
+                            continue
+                        if re.match(r'^[\d\s\.\-\#\$:]+$', cl):
+                            continue
+                        desc_raw = cl
+                        break
+
+                ocr_rows.append(_build_row(
+                    ocr_po, dpci_raw, qty_raw,
+                    cost_raw=cost_raw, retail_raw=retail_raw,
+                    desc_raw=desc_raw, upc_raw=upc_raw,
+                ))
+                i += 1
+                continue
+
+            # ── Also handle plain DPCI format (DDD-CC-XXXX) in OCR text ──
+            dpci_m = DPCI_RE.search(line)
+            if dpci_m:
+                dpci_raw = dpci_m.group(1)
+                nums = re.findall(r'[\$]?([\d,]+\.?\d*)', line)
+                nums_clean = []
+                for n in nums:
+                    n_plain = n.replace(',', '')
+                    try:
+                        val = float(n_plain)
+                        if val > 0 and n_plain not in dpci_raw.replace('-', ''):
+                            nums_clean.append(val)
+                    except ValueError:
+                        pass
+                qty_raw = str(int(nums_clean[0])) if nums_clean and nums_clean[0] == int(nums_clean[0]) else (str(nums_clean[0]) if nums_clean else None)
+                cost_raw = str(nums_clean[1]) if len(nums_clean) > 1 else None
+                retail_raw = str(nums_clean[2]) if len(nums_clean) > 2 else None
+                if qty_raw:
+                    ocr_rows.append(_build_row(ocr_po, dpci_raw, qty_raw,
+                                               cost_raw=cost_raw, retail_raw=retail_raw))
+            i += 1
+
+        if not ocr_rows and ocr_po:
+            ocr_warnings.append("⚠️ OCR 已辨識 PO 編號但未找到商品明細，請確認 PDF 格式或提高掃描品質。")
+        elif not ocr_rows:
+            ocr_warnings.append("⚠️ OCR 無法辨識 PO 內容，PDF 可能掃描品質過低。")
+
+        return ocr_rows, ocr_warnings
+
     try:
         with pdfplumber.open(pdf_file) as pdf:
             full_text_pages = []
+            has_text_layer = False
+
             for page_num, page in enumerate(pdf.pages, 1):
                 text = page.extract_text() or ''
                 full_text_pages.append(text)
+                if len(text.strip()) > 20:
+                    has_text_layer = True
 
                 # ── 更新 PO 編號 ──
                 po_found = extract_po_number(text)
@@ -544,27 +732,19 @@ def parse_sps_pdf(pdf_file):
                             asst_raw=get(asst_idx), vcp_raw=get(vcp_idx),
                         ))
 
-            # ── 路線 2：純文字 fallback（當 extract_tables 完全沒抓到任何行時）──
-            if not all_rows:
+            # ── 路線 2：純文字 fallback（SPS Commerce 文字版）──
+            if not all_rows and has_text_layer:
                 full_text = '\n'.join(full_text_pages)
                 current_po = None
 
-                # 先重新掃一遍全文取得 PO NUMBER
                 for pat in PO_PATTERNS:
                     m = re.search(pat, full_text, re.IGNORECASE)
                     if m:
-                        current_po = m.group(1)
+                        current_po = m.group(1).split('-')[0]
                         break
-
-                # SPS Commerce 文字版常見排版：
-                # 每行包含 DPCI（DDD-CC-XXXX）且附近有數量
-                # 嘗試兩種常見行格式：
-                #   格式 A: "086-04-1234  SOME DESC  100  $1.50  $2.99"
-                #   格式 B: "DPCI: 086-04-1234 ... Qty: 100 ... Cost: 1.50"
 
                 lines = full_text.splitlines()
                 for line in lines:
-                    # 更新 PO 編號
                     po_in_line = extract_po_number(line)
                     if po_in_line:
                         current_po = po_in_line
@@ -575,9 +755,7 @@ def parse_sps_pdf(pdf_file):
                         continue
 
                     dpci_raw = dpci_m.group(1)
-                    # 從同行抓數字：第一個整數作 qty，後面的浮點數作 cost/retail
                     nums = re.findall(r'[\$]?([\d,]+\.?\d*)', line)
-                    # 排除 DPCI 自己的數字
                     nums_clean = []
                     for n in nums:
                         n_plain = n.replace(',', '')
@@ -588,7 +766,7 @@ def parse_sps_pdf(pdf_file):
                         except ValueError:
                             pass
 
-                    qty_raw  = str(int(nums_clean[0])) if len(nums_clean) > 0 and nums_clean[0] == int(nums_clean[0]) else (str(nums_clean[0]) if nums_clean else None)
+                    qty_raw = str(int(nums_clean[0])) if len(nums_clean) > 0 and nums_clean[0] == int(nums_clean[0]) else (str(nums_clean[0]) if nums_clean else None)
                     cost_raw = str(nums_clean[1]) if len(nums_clean) > 1 else None
                     retail_raw = str(nums_clean[2]) if len(nums_clean) > 2 else None
 
@@ -603,10 +781,19 @@ def parse_sps_pdf(pdf_file):
     except Exception as e:
         return None, [f"❌ PDF 解析錯誤：{e}"]
 
+    # ── 路線 3：OCR fallback（Target Import PO，全向量圖形，無文字層）──
+    if not all_rows:
+        pdf_file.seek(0)
+        ocr_rows, ocr_warnings = _ocr_parse(pdf_file)
+        warnings.extend(ocr_warnings)
+        if ocr_rows:
+            all_rows = ocr_rows
+            warnings.append("ℹ️ 此 PDF 為向量圖形格式（Target Import PO），已透過 OCR 辨識解析。")
+
     if not all_rows:
         return None, [
-            "⚠️ 在 PDF 中找不到可解析的 PO 表格。"
-            "請確認為 SPS Commerce 標準版 PO，或將 PDF 原始檔案一併傳給 TG Team 檢視。"
+            "⚠️ 在 PDF 中找不到可解析的 PO 表格，已嘗試 OCR 辨識。"
+            "請確認 PDF 來自 SPS Commerce 或 Target Import，或將原始檔案傳給 TG Team 檢視。"
         ]
 
     po_df = pd.DataFrame(all_rows)
