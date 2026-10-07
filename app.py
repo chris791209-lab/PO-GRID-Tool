@@ -1098,25 +1098,30 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
 # ==========================================
 st.set_page_config(page_title="TG Team PO 驗證管理平台", layout="wide")
 
-# LuckyStar Logo SVG（藍底白色人形堆疊）
+# LuckyStar Logo SVG（藍底白色人形金字塔，圓頭+弧形身體）
 LOGO_SVG = """
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 56 56" width="52" height="52">
-  <rect width="56" height="56" rx="6" fill="#1a5fa8"/>
-  <!-- 底排：3人 -->
-  <circle cx="12" cy="38" r="4.2" fill="white"/>
-  <ellipse cx="12" cy="48" rx="5.5" ry="4" fill="white"/>
-  <circle cx="28" cy="38" r="4.2" fill="white"/>
-  <ellipse cx="28" cy="48" rx="5.5" ry="4" fill="white"/>
-  <circle cx="44" cy="38" r="4.2" fill="white"/>
-  <ellipse cx="44" cy="48" rx="5.5" ry="4" fill="white"/>
-  <!-- 中排：2人 -->
-  <circle cx="20" cy="25" r="4.2" fill="white"/>
-  <ellipse cx="20" cy="35" rx="5.5" ry="4" fill="white"/>
-  <circle cx="36" cy="25" r="4.2" fill="white"/>
-  <ellipse cx="36" cy="35" rx="5.5" ry="4" fill="white"/>
-  <!-- 頂排：1人 -->
-  <circle cx="28" cy="12" r="4.2" fill="white"/>
-  <ellipse cx="28" cy="22" rx="5.5" ry="4" fill="white"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 60 60" width="52" height="52">
+  <rect width="60" height="60" rx="8" fill="#1e6bb8"/>
+  <!-- 底排 3人 -->
+  <!-- 左 -->
+  <circle cx="11" cy="43" r="5" fill="white"/>
+  <path d="M5,54 Q11,49 17,54" fill="white"/>
+  <!-- 中 -->
+  <circle cx="30" cy="43" r="5" fill="white"/>
+  <path d="M24,54 Q30,49 36,54" fill="white"/>
+  <!-- 右 -->
+  <circle cx="49" cy="43" r="5" fill="white"/>
+  <path d="M43,54 Q49,49 55,54" fill="white"/>
+  <!-- 中排 2人 -->
+  <!-- 左中 -->
+  <circle cx="20" cy="28" r="5" fill="white"/>
+  <path d="M14,39 Q20,34 26,39" fill="white"/>
+  <!-- 右中 -->
+  <circle cx="40" cy="28" r="5" fill="white"/>
+  <path d="M34,39 Q40,34 46,39" fill="white"/>
+  <!-- 頂 1人 -->
+  <circle cx="30" cy="13" r="5" fill="white"/>
+  <path d="M24,24 Q30,19 36,24" fill="white"/>
 </svg>
 """
 
@@ -1142,7 +1147,7 @@ dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.
 if True:
     st.subheader("📄 上傳 SPS Commerce PO PDF")
 
-    pdf_files = st.file_uploader("上傳 PO PDF（可多選）", type=['pdf'], accept_multiple_files=True, key="pdf_po")
+    pdf_files = st.file_uploader("", type=['pdf'], accept_multiple_files=True, key="pdf_po", label_visibility="collapsed")
 
     if st.button("🚀 解析 PDF 並執行核對", type="primary", key="btn_pdf"):
         if not product_files or not pdf_files:
