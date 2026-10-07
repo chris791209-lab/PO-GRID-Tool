@@ -821,7 +821,7 @@ def parse_sps_pdf(pdf_file):
         warnings.extend(ocr_warnings)
         if ocr_rows:
             all_rows = ocr_rows
-            warnings.append("ℹ️ 此 PDF 為向量圖形格式（Target Import PO），已透過 OCR 辨識解析。")
+            warnings.append("__OCR_USED__")
 
     if not all_rows:
         return None, [
@@ -990,12 +990,26 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
             asst_mask, merged_df['PO VCP / Assort QTY'], merged_df['Target Case / Assort QTY']
         )
 
-    merged_df['Case QTY Match'] = np.isclose(
-        merged_df['PO VCP / Assort QTY'].fillna(-1),
-        merged_df['Target Case / Assort QTY'].fillna(-1),
-        atol=0.01
-    )
-    merged_df['Case QTY Match'] = np.where(merged_df['Target Case / Assort QTY'].isna(), False, merged_df['Case QTY Match'])
+    # Case QTY 比對：僅當 VCP 資料確實存在時才比對
+    # 若整欄皆為 NaN（SPS 標準 PO 通常無 VCP 欄），略過比對改標 True
+    vcp_col_present = merged_df['PO VCP / Assort QTY'].notna().any()
+    if vcp_col_present:
+        merged_df['Case QTY Match'] = np.where(
+            merged_df['PO VCP / Assort QTY'].isna(),
+            True,  # 此列無 VCP 資料 → 略過
+            np.where(
+                merged_df['Target Case / Assort QTY'].isna(),
+                False,
+                np.isclose(
+                    merged_df['PO VCP / Assort QTY'].fillna(-1),
+                    merged_df['Target Case / Assort QTY'].fillna(-1),
+                    atol=0.01
+                )
+            )
+        )
+    else:
+        # VCP 欄完全缺失（SPS 標準 PO）→ 不執行此項核對
+        merged_df['Case QTY Match'] = True
     if mode == 'modern':
         merged_df['Case QTY Match'] = np.where(asst_mask, True, merged_df['Case QTY Match'])
 
@@ -1505,13 +1519,28 @@ if True:
             all_parsed_dfs = []
             all_parse_warnings = []
 
+            ocr_pdf_names = []
             with st.spinner("PDF 解析中..."):
                 for pdf_file in pdf_files:
                     po_df_parsed, parse_warnings = parse_sps_pdf(pdf_file)
-                    all_parse_warnings.extend(parse_warnings)
+                    for w in parse_warnings:
+                        if w == "__OCR_USED__":
+                            ocr_pdf_names.append(pdf_file.name)
+                        else:
+                            all_parse_warnings.append(w)
                     if po_df_parsed is not None and len(po_df_parsed) > 0:
                         all_parsed_dfs.append(po_df_parsed)
 
+            # 彙整 OCR 警告（合併為一條訊息）
+            if ocr_pdf_names:
+                if len(ocr_pdf_names) == 1:
+                    st.info(f"ℹ️ 以下 PDF 為向量圖形格式（Target Import PO），已透過 OCR 辨識解析：{ocr_pdf_names[0]}")
+                else:
+                    with st.expander(f"ℹ️ {len(ocr_pdf_names)} 份 PDF 透過 OCR 解析（點擊展開檔名）", expanded=False):
+                        for n in ocr_pdf_names:
+                            st.write(f"• {n}")
+
+            # 顯示其他解析警告（非 OCR、非重複 PO）
             for w in all_parse_warnings:
                 st.warning(w)
 
@@ -1523,8 +1552,14 @@ if True:
 
                 clean_po_df, dup_warnings = detect_duplicate_pos(combined_po_df)
                 all_warnings = all_parse_warnings + dup_warnings
-                for w in dup_warnings:
-                    st.warning(w)
+                # 彙整重複 PO 警告（折疊顯示，避免過多警告訊息）
+                if dup_warnings:
+                    if len(dup_warnings) == 1:
+                        st.warning(dup_warnings[0])
+                    else:
+                        with st.expander(f"⚠️ {len(dup_warnings)} 則重複 PO 偵測警告（點擊展開）", expanded=False):
+                            for w in dup_warnings:
+                                st.warning(w)
 
                 prod_df = process_products(product_files)
                 asst_df = process_assortments(asst_files) if asst_files else None
