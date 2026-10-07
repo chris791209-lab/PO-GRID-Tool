@@ -68,7 +68,7 @@ def fuzzy_col(df_cols, *keywords, require_all=False):
     G10 模糊欄位搜尋：正規化空白與大小寫後，尋找包含所有/任一關鍵字的欄位。
     require_all=True → 所有 keywords 都需命中；False → 任一即可。
     """
-    normalized = {c: re.sub(r'\s+', '', c).lower() for c in df_cols}
+    normalized = {c: re.sub(r'\s+', '', str(c)).lower() for c in df_cols if c is not None}
     for col, norm in normalized.items():
         hits = [kw.lower().replace(' ', '') in norm for kw in keywords]
         if (all(hits) if require_all else any(hits)):
@@ -341,7 +341,8 @@ def process_assortments(files):
                 continue
 
             df = raw_df.iloc[header_idx + 1:].reset_index(drop=True)
-            df.columns = raw_df.iloc[header_idx].astype(str).str.replace(r'[\n\r]', ' ', regex=True).str.strip()
+            raw_headers = raw_df.iloc[header_idx].astype(str).str.replace(r'[\n\r]', ' ', regex=True).str.strip()
+            df.columns = raw_headers
 
             master_col = fuzzy_col(df.columns, 'assortment', 'dpci', require_all=True) or \
                          fuzzy_col(df.columns, 'assortmentdpci')
