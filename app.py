@@ -558,7 +558,7 @@ def extract_po_text(pdf_bytes):
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             n_pages = len(pdf.pages)
-            text = '\n'.join((pg.extract_text() or '') for pg in pdf.pages)
+            text = '\f'.join((pg.extract_text() or '') for pg in pdf.pages)
     except Exception as e:
         return '', False, f"PDF 讀取錯誤：{e}"
     if 'Order #' in text and len(text.strip()) > 200:
@@ -580,7 +580,7 @@ def extract_po_text(pdf_bytes):
             del img
     except Exception as e:
         return '', True, f"OCR 失敗：{e}"
-    return normalize_ocr_text('\n'.join(pages)), True, None
+    return '\f'.join(normalize_ocr_text(pg) for pg in pages), True, None
 
 
 def _po_resale(blk):
@@ -729,14 +729,35 @@ def _po_version_key(h):
     return (dkey(h.get('doc_date')), 1 if h.get('is_change') else 0, stamp, fdk)
 
 
-def parse_po_pdfs(pdf_files, progress=None):
+def split_combined_print(text):
+    """
+    SPS「合併列印」：一份 PDF 內含多張訂單。依每頁的 Order # 分組（無 Order # 的頁歸前一張），
+    回傳 [(po_dc, 該訂單文字)]；只有一張訂單時回傳單一元素。
+    """
+    pages = text.split('\f')
+    groups, cur = [], None
+    for pg in pages:
+        m = re.search(r'Order #:\s*(?:\d{4}-)?(\d{5,11})-(\w{3,5})', pg)
+        key = (m.group(1), m.group(2)) if m else None
+        if key and key != cur:
+            groups.append([key, [pg]])
+            cur = key
+        elif groups:
+            groups[-1][1].append(pg)
+        else:
+            groups.append([None, [pg]])
+    return [(k, '\n'.join(pgs)) for k, pgs in groups]
+
+
+def parse_po_pdfs(pdf_files, progress=None, known_dpcis=None):
     """
     解析多份 PO PDF → (po_df, info)
     info: ocr_files / warnings / gate_problems / superseded / cancelled / duplicates / n_files / n_pos
     po_df 每列 Row_Type = line（一般品項）/ box（混裝 Box）/ component（Box 內零件）
     """
     info = {'ocr_files': [], 'warnings': [], 'gate_problems': [], 'superseded': [],
-            'cancelled': [], 'duplicates': [], 'n_files': len(pdf_files), 'n_pos': 0}
+            'cancelled': [], 'duplicates': [], 'n_files': len(pdf_files), 'n_pos': 0,
+            'combined': [], 'skipped_other_program': []}
     parsed = []
     for n, f in enumerate(pdf_files, 1):
         name = getattr(f, 'name', str(f))
@@ -752,15 +773,27 @@ def parse_po_pdfs(pdf_files, progress=None):
         if err:
             info['warnings'].append(f"❌ {name}：{err}")
             continue
-        head, items = parse_po_text(name, text)
-        if not head['po']:
-            info['warnings'].append(f"⚠️ {name}：找不到 Order #，已略過（PDF 版型可能不同）。")
-            continue
-        if head['n_orders'] > 1:
-            info['warnings'].append(
-                f"⚠️ {name}：一份 PDF 內含 {head['n_orders']} 張訂單（SPS 合併列印），請拆成單張後再上傳，已略過。")
-            continue
-        parsed.append((head, items))
+        orders = split_combined_print(text)
+        is_combined = len(orders) > 1
+        kept = 0
+        for key, otext in orders:
+            label = f"{name} ▸ {key[0]}" if is_combined and key else name
+            head, items = parse_po_text(label, otext)
+            if not head['po']:
+                if not is_combined:
+                    info['warnings'].append(f"⚠️ {name}：找不到 Order #，已略過（PDF 版型可能不同）。")
+                continue
+            # 合併列印常混入其他部門／Program 的訂單：沒有任何品項在主檔內的訂單直接略過
+            if is_combined and known_dpcis is not None:
+                skus = {_sku_to_dpci(i['sku']) for i in items}
+                if not (skus & known_dpcis):
+                    info['skipped_other_program'].append(
+                        {'po': head['po'], 'file': name, 'dpcis': sorted(skus)[:3]})
+                    continue
+            parsed.append((head, items))
+            kept += 1
+        if is_combined:
+            info['combined'].append({'file': name, 'orders': len(orders), 'kept': kept})
 
     # ── 版本判定：同 PO#+DC 取最新；CANCEL ORDER 的 PO Change → 整張作廢 ──
     groups = {}
@@ -781,8 +814,10 @@ def parse_po_pdfs(pdf_files, progress=None):
             if not base:
                 continue
             head, items = base
-        for lose, _ in docs:
-            if lose is not head:
+        def _sig(its):
+            return sorted((i['kind'], i['sku'], i['qty'], str(i.get('unit'))) for i in its)
+        for lose, lose_items in docs:
+            if lose is not head and _sig(lose_items) != _sig(items):   # 內容相同的重複檔不提示
                 info['superseded'].append({'po': po, 'kept': head['file'], 'dropped': lose['file'],
                                            'from_qty': lose.get('total_qty'), 'to_qty': head.get('total_qty')})
         probs = _po_gate_check(head, items)
@@ -854,7 +889,8 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
 
     # ---- 合併 PCN ----
     prod_cols = [c for c in ['DPCI', 'Final_Product_Cost', 'Suggested Unit Retail',
-                              'Case Unit Quantity', 'Ent Ttl Rcpt U', 'Target UPC', 'Factory Name']
+                              'Case Unit Quantity', 'Ent Ttl Rcpt U', 'Target UPC', 'Factory Name',
+                              'Product Description']
                  if c in prod_df.columns]
     merged_df = pd.merge(
         po_df,
@@ -1148,7 +1184,185 @@ def build_po_grid(merged_df):
 
     return grid_pivot
 
-def make_excel_bytes(result_df, run_meta, source_label, validation_notes=None, merged_df_full=None):
+def build_validation_summary(merged_df, ctx=None):
+    """
+    第一頁總結（對齊 po-grid Skill 的 Validation Summary）：
+    回傳 (checks, details, headline)
+      checks  = [(檢核項目, 數量, 狀態)]；狀態 'OK' / 'REVIEW' / ''（純資訊）
+      details = [(標題, DataFrame)]，只列有內容的項目
+      headline = [(標籤, 值)]
+    一律以 DPCI 為單位彙總，同一問題出現在多張 PO 只算一項，PO 號列在明細。
+    """
+    ctx = ctx or {}
+    m = merged_df
+    rt = m['Row_Type'] if 'Row_Type' in m.columns else pd.Series('line', index=m.index)
+    not_box = rt != 'box'
+    desc_col = 'Product Description' if 'Product Description' in m.columns else None
+
+    def _pos(s):
+        u = sorted(set(s.astype(str)))
+        return ', '.join(u)
+
+    def _desc(g):
+        return str(g[desc_col].iloc[0])[:60] if desc_col and pd.notna(g[desc_col].iloc[0]) else ''
+
+    details = []
+
+    # 1. PO 品項不在主檔
+    unk = m[not_box & m['Final_Product_Cost'].isna() & m.get('Target Commit QTY', pd.Series(np.nan, index=m.index)).isna()] \
+        if 'Final_Product_Cost' in m.columns else m.iloc[0:0]
+    unk_df = pd.DataFrame([{'DPCI': d, 'PO': _pos(g['PO NUMBER']), 'PO 數量': g['Final_QTY'].sum()}
+                           for d, g in unk.groupby('Final_DPCI')])
+    # 2. 成本不符
+    cm = m[(m['Cost Match'] == False) & ~m.index.isin(unk.index)]
+    cost_df = pd.DataFrame([{
+        'DPCI': d, '品名': _desc(g), '類型': {'line': '一般', 'box': '混裝 Box', 'component': 'Box 零件'}.get(g['Row_Type'].iloc[0], ''),
+        '主檔成本': g['Target_Cost'].iloc[0], 'PO 單價': ', '.join(sorted({f"{v:g}" for v in g['ITEM UNIT COST'].dropna()})) or '讀不到',
+        'PO': _pos(g['PO NUMBER'])} for d, g in cm.groupby('Final_DPCI')])
+    # 3. 零售不符
+    rm = m[(m['Retail Match'] == False) & ~m.index.isin(unk.index)]
+    retail_df = pd.DataFrame([{
+        'DPCI': d, '品名': _desc(g), '主檔零售': g['Suggested Unit Retail'].iloc[0] if 'Suggested Unit Retail' in g else np.nan,
+        'PO 零售': ', '.join(sorted({f"{v:.2f}" for v in g['ITEM UNIT RETAIL'].dropna()})) or '讀不到',
+        'PO': _pos(g['PO NUMBER'])} for d, g in rm.groupby('Final_DPCI')])
+    # 4. 數量 vs 計畫
+    qm = m[not_box & (m['Total QTY Match'] == False) & m['Target Commit QTY'].notna()].drop_duplicates('Final_DPCI')
+    qty_df = pd.DataFrame([{
+        'DPCI': r['Final_DPCI'], '品名': str(r[desc_col])[:60] if desc_col and pd.notna(r[desc_col]) else '',
+        '已下單（含 Box 內含）': r['PO Total QTY'], '計畫 Ent Ttl Rcpt U': r['Target Commit QTY'],
+        '差異': r['QTY Diff'], '差異 %': r['QTY Diff %'], 'Case Pack': r.get('Case Unit Quantity', np.nan)}
+        for _, r in qm.iterrows()])
+    # 5. 混裝不符（零件數量 ≠ 箱數 × 每箱入數，或 Box／零件不在混裝表）
+    am = m[(m.get('Asst_QTY_Check', '') == '❌ 數量不符') | m['Asst_Role'].astype(str).str.startswith('⚠️')]
+    asst_df_ = pd.DataFrame([{
+        'PO': r['PO NUMBER'], 'Box DPCI': r['Original_DPCI'], '零件 DPCI': r['Final_DPCI'] if r['Row_Type'] == 'component' else '',
+        'PO 數量': r['Final_QTY'], '應為（箱數×入數）': r.get('Expected_Component_QTY', np.nan),
+        '說明': re.sub(r'^[^\w]+', '', str(r['Asst_Role']))} for _, r in am.iterrows()])
+    # 6. Box 成本反算
+    bm = m[m.get('Asst_Cost_Status', '') == '❌ 反算不符']
+    box_df = pd.DataFrame([{
+        'Box DPCI': r['Original_DPCI'], 'PO': r['PO NUMBER'], 'PO Box 單價': r['ITEM UNIT COST'],
+        'Σ(零件主檔成本×入數)': round(r['Calc_Box_Cost'], 4), '差額': round(r['ITEM UNIT COST'] - r['Calc_Box_Cost'], 4)}
+        for _, r in bm.iterrows()])
+    # 7. UPC
+    um = m[m.get('UPC Status', '') == '❌ 不符']
+    upc_df = pd.DataFrame([{'DPCI': d, 'PO UPC': g['PO UPC'].iloc[0], '主檔 Barcode': g['Target UPC'].iloc[0],
+                            'PO': _pos(g['PO NUMBER'])} for d, g in um.groupby('Final_DPCI')])
+
+    no_df = pd.DataFrame(ctx.get('not_ordered', []))
+    dup_df = pd.DataFrame([{'PO（品項與數量完全相同）': ' / '.join(g)} for g in ctx.get('duplicates', [])])
+    sup_df = pd.DataFrame([{'PO': x['po'], '採用': x['kept'], '捨棄': x['dropped'],
+                            'Total Qty（舊→新）': f"{x.get('from_qty') or '?'} → {x.get('to_qty') or '?'}"}
+                           for x in ctx.get('superseded', [])])
+    can_df = pd.DataFrame([{'PO': x['po'], '取消通知檔': x['file'], '已排除的原單': ', '.join(x['dropped']) or '—'}
+                           for x in ctx.get('cancelled', [])])
+    gate_df = pd.DataFrame([{'PO': x['po'], '檔案': x['file'], '問題': '；'.join(x['issues'])}
+                            for x in ctx.get('gate_problems', [])])
+    skip_df = pd.DataFrame([{'PO': x['po'], '來源檔': x['file'], '品項（前 3 個）': ', '.join(x['dpcis'])}
+                            for x in ctx.get('skipped_other_program', [])])
+    warn_df = pd.DataFrame([{'訊息': re.sub(r'[*]', '', w)} for w in ctx.get('warnings', [])])
+
+    def st_(n):
+        return 'OK' if n == 0 else 'REVIEW'
+    checks = [
+        ('PO 品項不在主檔 (Unknown DPCI)', len(unk_df), st_(len(unk_df))),
+        ('成本不符：PO 單價 vs 主檔 FCA/FOB (Cost mismatch)', len(cost_df), st_(len(cost_df))),
+        ('零售不符：PO Resale vs 主檔 (Retail mismatch)', len(retail_df), st_(len(retail_df))),
+        ('數量 vs 計畫：超出整箱進位與 ±10% (Qty vs plan)', len(qty_df), st_(len(qty_df))),
+        ('混裝不符：Box 與零件數量／混裝表 (Assortment mismatch)', len(asst_df_), st_(len(asst_df_))),
+        ('Box 成本反算不符 (Box cost reverse-check)', len(box_df), st_(len(box_df))),
+        ('UPC 不符', len(upc_df), st_(len(upc_df))),
+        ('主檔有計畫但尚未下單 (Not yet ordered)', len(no_df), st_(len(no_df))),
+        ('疑似重複 PO：不同 PO# 內容相同 (Duplicate PO groups)', len(dup_df), st_(len(dup_df))),
+        ('PO 內部驗算未通過 (Self-check failed)', len(gate_df), st_(len(gate_df))),
+        ('無法解析的檔案／其他警告', len(warn_df), st_(len(warn_df))),
+        ('已取消的 PO（已排除）', len(can_df), ''),
+        ('多版本 PO（已採用最新版）', len(sup_df), ''),
+        ('其他 Program 的訂單（已略過）', len(skip_df), ''),
+    ]
+    for title, df in [
+        ('PO 品項不在主檔 — 明細', unk_df), ('成本不符 — 明細', cost_df), ('零售不符 — 明細', retail_df),
+        ('數量 vs 計畫 — 明細', qty_df), ('混裝不符 — 明細', asst_df_), ('Box 成本反算不符 — 明細', box_df),
+        ('UPC 不符 — 明細', upc_df), ('尚未下單 — 明細', no_df), ('疑似重複 PO — 明細', dup_df),
+        ('PO 內部驗算未通過 — 明細', gate_df), ('無法解析的檔案／其他警告 — 明細', warn_df),
+        ('已取消的 PO — 明細', can_df), ('多版本 PO — 明細', sup_df), ('其他 Program 的訂單 — 明細', skip_df)]:
+        if len(df) > 0:
+            details.append((title, df))
+
+    ordered = float(m.get('Final_QTY_for_count', pd.Series(dtype=float)).sum())
+    plan = ctx.get('plan_total')
+    n_review = sum(1 for _, n, s_ in checks if s_ == 'REVIEW')
+    headline = [
+        ('有效 PO 張數', int(m['PO NUMBER'].nunique())),
+        ('品項列數', len(m)),
+        ('DPCI 數（不含 Box）', int(m.loc[not_box, 'Final_DPCI'].nunique())),
+        ('已下單總數量', f"{ordered:,.0f}"),
+    ]
+    if plan:
+        headline.append(('計畫總量 / 達成率', f"{plan:,.0f} / {ordered / plan * 100:.1f}%"))
+    headline.append(('結論', '全部檢核通過' if n_review == 0 else f'{n_review} 項需確認（見下方明細）'))
+    return checks, details, headline
+
+
+def write_summary_sheet(wb, title, checks, details, headline, run_meta):
+    """把總結寫成活頁簿的第一個工作表。"""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    ws = wb.create_sheet('Validation Summary', 0)
+    green = PatternFill('solid', start_color='E2EFDA')
+    orange = PatternFill('solid', start_color='F8CBAD')
+    grey = PatternFill('solid', start_color='D9D9D9')
+    ws['A1'] = title
+    ws['A1'].font = Font(bold=True, size=14)
+    ws['A2'] = 'PO Validation Summary'
+    ws['A2'].font = Font(italic=True, bold=True, size=12)
+    ws['A3'] = f"執行時間 {run_meta.get('timestamp', '')}　｜　{run_meta.get('input_files', '')}"
+    ws['A3'].font = Font(color='808080', size=9)
+    r = 5
+    for label, val in headline:
+        ws.cell(r, 1, label).font = Font(bold=True)
+        c = ws.cell(r, 2, val)
+        c.alignment = Alignment(horizontal='left')
+        if label == '結論':
+            c.font = Font(bold=True, color='C00000' if '需確認' in str(val) else '548235')
+        r += 1
+    r += 1
+    for j, h in enumerate(['Check 檢核項目', 'Count', 'Status'], 1):
+        c = ws.cell(r, j, h)
+        c.font = Font(bold=True)
+        c.fill = grey
+    r += 1
+    for label, n, status in checks:
+        fill = orange if status == 'REVIEW' else (green if status == 'OK' else None)
+        for j, v in enumerate([label, n, status], 1):
+            c = ws.cell(r, j, v)
+            if fill:
+                c.fill = fill
+        r += 1
+    for dtitle, df in details:
+        r += 1
+        ws.cell(r, 1, dtitle).font = Font(bold=True, size=11)
+        r += 1
+        for j, h in enumerate(df.columns, 1):
+            c = ws.cell(r, j, h)
+            c.font = Font(bold=True)
+            c.fill = grey
+        r += 1
+        for row in df.itertuples(index=False):
+            for j, v in enumerate(row, 1):
+                if isinstance(v, (np.floating, float)):
+                    v = None if pd.isna(v) else (int(v) if float(v).is_integer() else float(v))
+                elif isinstance(v, np.integer):
+                    v = int(v)
+                ws.cell(r, j, v)
+            r += 1
+    ws.column_dimensions['A'].width = 54
+    for col, w in zip('BCDEFGH', [26, 22, 22, 22, 40, 14, 14]):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = 'A5'
+    wb.active = 0
+
+
+def make_excel_bytes(result_df, run_meta, source_label, validation_notes=None, merged_df_full=None, summary_ctx=None):
     """
     N1 + N5 + G8: 建立含多 sheet 的 Excel
     - Sheet 1: 核對結果
@@ -1290,9 +1504,15 @@ def make_excel_bytes(result_df, run_meta, source_label, validation_notes=None, m
             max_len = max((len(str(cell.value)) for cell in col_cells if cell.value), default=10)
             ws_exec.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 60)
 
+        # ---- 第一頁：Validation Summary（對齊 Skill 版）----
+        if merged_df_full is not None and 'Cost Match' in merged_df_full.columns:
+            ctx = summary_ctx or {}
+            checks, details, headline = build_validation_summary(merged_df_full, ctx)
+            write_summary_sheet(writer.book, ctx.get('title') or 'PO Validation', checks, details, headline, run_meta)
+
     return output.getvalue()
 
-def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
+def show_results(merged_df, source_label, run_meta=None, validation_notes=None, summary_ctx=None):
     """
     統一結果顯示 + 彩色 + 摘要統計 + Excel 下載（含 GRID / 驗核摘要 / 執行摘要）
     """
@@ -1316,6 +1536,20 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
     total = len(result_df)
     pass_count = (result_df['All Match (Pass)'] == True).sum()
     fail_count = (result_df['All Match (Pass)'] == False).sum()
+
+    # ── 總結（與 Excel 第一頁相同）──
+    checks, details, headline = build_validation_summary(merged_df, summary_ctx)
+    st.markdown("### 📌 Validation Summary")
+    st.markdown("　｜　".join(f"**{k}**：{v}" for k, v in headline))
+    chk_df = pd.DataFrame(checks, columns=['檢核項目', 'Count', 'Status'])
+    def _chk_color(row):
+        c = '#F8CBAD' if row['Status'] == 'REVIEW' else ('#E2EFDA' if row['Status'] == 'OK' else '')
+        return [f'background-color: {c}; color: #000' if c else ''] * len(row)
+    st.dataframe(chk_df.style.apply(_chk_color, axis=1), hide_index=True, use_container_width=True)
+    for dtitle, ddf in details:
+        with st.expander(f"{dtitle}（{len(ddf)}）", expanded=len(ddf) <= 10 and '已略過' not in dtitle and '其他 Program' not in dtitle):
+            st.dataframe(ddf, hide_index=True, use_container_width=True)
+    st.markdown("---")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("📋 總筆數", total)
@@ -1373,7 +1607,7 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
 
     # 下載 Excel（N1 GRID + N5 摘要 + G8 執行摘要）
     run_meta = run_meta or {'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'input_files': source_label}
-    excel_bytes = make_excel_bytes(result_df, run_meta, source_label, validation_notes=validation_notes, merged_df_full=merged_df)
+    excel_bytes = make_excel_bytes(result_df, run_meta, source_label, validation_notes=validation_notes, merged_df_full=merged_df, summary_ctx=summary_ctx)
     safe_label = re.sub(r'[^\w\-]', '_', source_label)
     st.download_button(
         "📥 下載完整核對報告 (Excel：核對結果 + PO GRID + 驗核摘要 + 執行摘要)",
@@ -1422,8 +1656,20 @@ if True:
             prog = st.progress(0.0, text="PDF 解析中...")
             def _tick(i, n, name):
                 prog.progress(i / n, text=f"PDF 解析中 {i}/{n}：{name}（無文字層的 PDF 需 OCR，每份約 10–20 秒）")
-            po_df, pinfo = parse_po_pdfs(pdf_files, progress=_tick)
+            prod_df = process_products(product_files)
+            known = set(prod_df['DPCI'].dropna().astype(str)) if 'DPCI' in prod_df.columns else set()
+            asst_df = process_assortments(asst_files) if asst_files else None
+            if asst_df is not None and len(asst_df) > 0:
+                known |= set(asst_df['Assortment_DPCI']) | set(asst_df['Component_DPCI'])
+            po_df, pinfo = parse_po_pdfs(pdf_files, progress=_tick, known_dpcis=known or None)
             prog.empty()
+
+            for cb in pinfo['combined']:
+                st.info(f"📑 {cb['file']} 為合併列印，已自動拆成 {cb['orders']} 張訂單，其中 {cb['kept']} 張屬於本主檔。")
+            if pinfo['skipped_other_program']:
+                with st.expander(f"ℹ️ {len(pinfo['skipped_other_program'])} 張訂單的品項不在主檔內（其他 Program），已略過（點擊展開）", expanded=False):
+                    for sk in pinfo['skipped_other_program']:
+                        st.write(f"• PO {sk['po']}（{sk['file']}）：{', '.join(sk['dpcis'])}")
 
             all_warnings = list(pinfo['warnings'])
 
@@ -1462,25 +1708,34 @@ if True:
                 st.success(f"✅ {pinfo['n_files']} 份 PDF → {pinfo['n_pos']} 張有效 PO、{len(po_df)} 筆品項列；"
                            f"{n_gate_ok}/{pinfo['n_pos']} 張通過 PO 內部驗算。")
 
-                prod_df = process_products(product_files)
-                asst_df = process_assortments(asst_files) if asst_files else None
-
                 dispatch_arg = dispatch_df_global if len(dispatch_df_global) > 0 else None
                 merged_df = run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=dispatch_arg)
 
+                summary_ctx = {k: pinfo[k] for k in ['duplicates', 'superseded', 'cancelled', 'gate_problems',
+                                                      'skipped_other_program', 'warnings']}
+                summary_ctx['title'] = re.sub(r'\.(xlsx|xls|csv)$', '', product_files[0].name, flags=re.I)
+                summary_ctx['not_ordered'] = []
                 # 主檔有計畫量但完全沒有 PO 的品項
                 if 'Ent Ttl Rcpt U' in prod_df.columns and 'DPCI' in prod_df.columns:
                     ordered = set(merged_df.loc[merged_df['Row_Type'] != 'box', 'Final_DPCI'])
                     pm = prod_df.drop_duplicates(subset=['DPCI'])
+                    pm_valid = pm[pm['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')]
+                    summary_ctx['plan_total'] = float(pm_valid['Ent Ttl Rcpt U'].fillna(0).sum())
                     not_ordered = pm[(pm['Ent Ttl Rcpt U'].fillna(0) > 0) & ~pm['DPCI'].isin(ordered)
                                      & pm['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')]
                     if len(not_ordered) > 0:
                         st.warning(f"📭 主檔有計畫量但尚無 PO 的品項 {len(not_ordered)} 個：" + ", ".join(
                             f"{d}（{int(q):,}）" for d, q in zip(not_ordered['DPCI'], not_ordered['Ent Ttl Rcpt U'])))
                         all_warnings.append("尚無 PO 的品項：" + ", ".join(not_ordered['DPCI']))
+                        dcol = 'Product Description' if 'Product Description' in not_ordered.columns else None
+                        summary_ctx['not_ordered'] = [
+                            {'DPCI': d, '品名': (str(n)[:60] if dcol else ''), '計畫 Ent Ttl Rcpt U': int(q)}
+                            for d, n, q in zip(not_ordered['DPCI'],
+                                               not_ordered[dcol] if dcol else [''] * len(not_ordered),
+                                               not_ordered['Ent Ttl Rcpt U'])]
 
                 run_meta = {
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'input_files': f"PDFs: {pinfo['n_files']} files / {pinfo['n_pos']} POs | Products: {', '.join(f.name for f in product_files)}"
                 }
-                show_results(merged_df, 'PDF', run_meta=run_meta, validation_notes=all_warnings)
+                show_results(merged_df, 'PDF', run_meta=run_meta, validation_notes=all_warnings, summary_ctx=summary_ctx)
