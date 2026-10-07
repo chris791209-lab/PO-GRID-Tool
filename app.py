@@ -81,7 +81,7 @@ def fuzzy_col(df_cols, *keywords, require_all=False):
 def detect_duplicate_pos(po_df, po_number_col='PO NUMBER'):
     """
     偵測兩種重複情形：
-    (a) 同 PO# 有多個版本 → 保留最新（依列序），回傳警告訊息
+    (a) 同 PO# 有多個版本 → 依 PO 日期排序後保留最新版本，回傳警告訊息
         N7: 若同 PO# 的數量跨版本有變動，標示 superseded_with_qty_change
     (b) 不同 PO# 但內容完全相同 → 回傳警告訊息
     回傳 (cleaned_df, warnings_list)
@@ -91,6 +91,24 @@ def detect_duplicate_pos(po_df, po_number_col='PO NUMBER'):
 
     dpci_col = 'Final_DPCI' if 'Final_DPCI' in df.columns else 'Original_DPCI'
     qty_col = 'Final_QTY'
+
+    # ── 嘗試偵測 PO 日期欄位（PO DATE / ISSUE DATE / ORDER DATE / CANCEL DATE）──
+    date_col = None
+    for candidate in df.columns:
+        c_norm = re.sub(r'\s+', '', str(candidate)).lower()
+        if any(kw in c_norm for kw in ['podate', 'issuedate', 'orderdate', 'receiveddate', 'poreceiveddate']):
+            date_col = candidate
+            break
+    # 若找到日期欄，嘗試解析；解析失敗則忽略
+    if date_col:
+        try:
+            df['_sort_date'] = pd.to_datetime(df[date_col], errors='coerce')
+            if df['_sort_date'].isna().all():
+                date_col = None
+                df.drop(columns=['_sort_date'], inplace=True)
+        except Exception:
+            date_col = None
+            df.pop('_sort_date', None)
 
     if dpci_col in df.columns:
         # (a) 同 PO# 多版本：偵測重複
@@ -112,8 +130,15 @@ def detect_duplicate_pos(po_df, po_number_col='PO NUMBER'):
                         + ", ".join(qty_changed_pos)
                     )
 
+            # ── 依日期排序（若有），使最新版本落在最後，再用 keep='last' 保留 ──
+            if date_col and '_sort_date' in df.columns:
+                df = df.sort_values('_sort_date', ascending=True, na_position='first')
+                version_note = "（已依 PO 收到日期自動選取最新版本）"
+            else:
+                version_note = "（依上傳順序保留最後出現的版本，建議上傳 PO 日期欄位以自動比對）"
+
             warnings.append(
-                f"⚠️ **版本重複偵測**：以下 PO# 有完全重複的品項列，已自動保留最後出現的版本（請確認是否為最新修訂單）：\n"
+                f"⚠️ **版本重複偵測**：以下 PO# 有完全重複的品項列，已自動保留最新版本{version_note}：\n"
                 + ", ".join(str(p) for p in dup_pos)
             )
             df = df.drop_duplicates(subset=[po_number_col, dpci_col], keep='last')
@@ -130,6 +155,10 @@ def detect_duplicate_pos(po_df, po_number_col='PO NUMBER'):
                     f"⚠️ **內容相同 PO 偵測**：以下 PO# 含有完全相同的品項組合，請確認是否為重複上傳：\n"
                     + " / ".join(str(p) for p in po_list)
                 )
+
+    # 清理排序輔助欄
+    if '_sort_date' in df.columns:
+        df = df.drop(columns=['_sort_date'])
 
     return df, warnings
 
@@ -287,6 +316,7 @@ def process_modern_po(df):
 
     return df
 
+@st.cache_data(show_spinner=False)
 def process_products(files):
     df_list = []
     for f in files:
@@ -320,6 +350,7 @@ def process_products(files):
 
     return master_product_df
 
+@st.cache_data(show_spinner=False)
 def process_assortments(files):
     """G10 改善版：模糊欄位名稱匹配"""
     df_list = []
@@ -373,6 +404,7 @@ def process_assortments(files):
         return pd.concat(df_list, ignore_index=True).drop_duplicates(subset=['Assortment_DPCI', 'Component_DPCI'])
     return pd.DataFrame(columns=['Assortment_DPCI', 'Component_DPCI', 'Asst_Box_Cost', 'Units_in_Assortment'])
 
+@st.cache_data(show_spinner=False)
 def process_dispatch(files):
     """
     G7 + N6: 讀取工廠&人員隸屬清單，輸出 DPCI → Factory / AC / AE 對應。
@@ -835,15 +867,67 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
         left_on='Final_DPCI', right_on='DPCI', how='left'
     )
 
-    # ---- 混裝箱處理 ----
+    # ---- 混裝箱處理（改善版：支援三種比對策略）----
     if asst_df is not None and len(asst_df) > 0:
+        # 建立查找用 set
+        asst_box_dpcis = set(asst_df['Assortment_DPCI'].dropna())      # 混裝 box DPCI
+        asst_comp_dpcis = set(asst_df['Component_DPCI'].dropna())       # 混裝內容品 DPCI
+
         if mode == 'standard':
-            merged_df = pd.merge(
-                merged_df, asst_df,
-                left_on=['Original_DPCI', 'Final_DPCI'],
-                right_on=['Assortment_DPCI', 'Component_DPCI'],
-                how='left'
+            # ── 策略 1：以 Final_DPCI 比對 Component_DPCI（最常見：PO 以零件 DPCI 下單）──
+            merge1 = pd.merge(
+                merged_df,
+                asst_df.rename(columns={'Assortment_DPCI': '_Asst_Box_DPCI'}),
+                left_on='Final_DPCI',
+                right_on='Component_DPCI',
+                how='left',
+                suffixes=('', '_asst')
             )
+            # 若同一 Final_DPCI 在混裝表中對應多個 box，取 Asst_Box_Cost 最小（保守）
+            # dedup: keep first hit per Final_DPCI (sort by cost ascending, NaN last)
+            merge1 = merge1.sort_values('Asst_Box_Cost', ascending=True, na_position='last')
+            # Use original columns as dedup key to avoid duplicates from merge
+            orig_cols = list(po_df.columns) + [c for c in merged_df.columns if c not in po_df.columns and c != 'Asst_Box_Cost' and c != 'Units_in_Assortment']
+            key_cols = [c for c in ['PO NUMBER', 'Final_DPCI', 'Original_DPCI'] if c in merge1.columns]
+            merge1 = merge1.drop_duplicates(subset=key_cols, keep='first')
+            # Clean up extra merge cols
+            merge1.drop(columns=[c for c in ['_Asst_Box_DPCI', 'Component_DPCI'] if c in merge1.columns], inplace=True, errors='ignore')
+            merged_df = merge1
+
+            # 以混裝表資訊標記是否為混裝品：記錄哪些 Final_DPCI 找到了零件對應
+            merged_df['_is_comp_flag'] = merged_df['Asst_Box_Cost'].notna()
+
+            # ── 策略 2：以 Original_DPCI 比對 Assortment_DPCI（PO 中的 box 層級行）──
+            # 若 Original_DPCI 本身是 box DPCI，需拉出 box cost
+            if 'Original_DPCI' in merged_df.columns:
+                box_cost_lookup = asst_df.drop_duplicates(subset=['Assortment_DPCI'])[['Assortment_DPCI', 'Asst_Box_Cost']].rename(
+                    columns={'Assortment_DPCI': '_box_dpci_key', 'Asst_Box_Cost': '_box_cost_direct'}
+                )
+                merged_df = pd.merge(merged_df, box_cost_lookup, left_on='Original_DPCI', right_on='_box_dpci_key', how='left')
+                is_comp = merged_df['_is_comp_flag']
+                is_box = merged_df['_box_cost_direct'].notna() & ~is_comp
+                # 填補 Asst_Box_Cost for box rows
+                merged_df.loc[is_box, 'Asst_Box_Cost'] = merged_df.loc[is_box, '_box_cost_direct']
+                merged_df.drop(columns=['_box_dpci_key', '_box_cost_direct', '_is_comp_flag'], inplace=True, errors='ignore')
+            else:
+                is_comp = merged_df['_is_comp_flag']
+                merged_df.drop(columns=['_is_comp_flag'], inplace=True, errors='ignore')
+                is_box = pd.Series(False, index=merged_df.index)
+
+            # ── 更新 ASSORTMENT ITEM? 欄位 ──
+            merged_df['ASSORTMENT ITEM?'] = np.where(
+                is_comp | is_box, 'Y',
+                merged_df.get('ASSORTMENT ITEM?', pd.Series('N', index=merged_df.index))
+            )
+
+            # ── 新增診斷欄：Asst_Role ──
+            merged_df['Asst_Role'] = np.where(
+                is_comp, '🔹 混裝零件',
+                np.where(is_box, '📦 混裝 Box',
+                np.where(merged_df['Final_DPCI'].isin(asst_comp_dpcis), '⚠️ 零件無對應',
+                np.where(merged_df['Final_DPCI'].isin(asst_box_dpcis), '⚠️ Box無對應', '—')))
+            )
+
             merged_df['Target_Cost'] = np.where(
                 merged_df['ASSORTMENT ITEM?'] == 'Y',
                 merged_df['Asst_Box_Cost'],
@@ -854,12 +938,14 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
             merged_df = pd.merge(merged_df, condensed_asst, left_on='Original_DPCI', right_on='Assortment_DPCI', how='left')
             merged_df['ASSORTMENT ITEM?'] = np.where(merged_df['Asst_Box_Cost'].notna(), 'Y', 'N')
             merged_df['Target_Cost'] = np.where(merged_df['ASSORTMENT ITEM?'] == 'Y', merged_df['Asst_Box_Cost'], merged_df['Final_Product_Cost'])
+            merged_df['Asst_Role'] = '—'
     else:
         merged_df['Target_Cost'] = merged_df['Final_Product_Cost']
         if 'Units_in_Assortment' not in merged_df.columns:
             merged_df['Units_in_Assortment'] = np.nan
         if 'Asst_Box_Cost' not in merged_df.columns:
             merged_df['Asst_Box_Cost'] = np.nan
+        merged_df['Asst_Role'] = '—'
 
     asst_mask = merged_df.get('ASSORTMENT ITEM?', pd.Series('N', index=merged_df.index)) == 'Y'
 
@@ -1294,7 +1380,7 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
     統一結果顯示 + 彩色 + 摘要統計 + Excel 下載（含 GRID / 驗核摘要 / 執行摘要）
     """
     display_cols = [
-        'PO NUMBER', 'ASSORTMENT ITEM?', 'Is_Shipper_Display', 'Original_DPCI', 'Final_DPCI',
+        'PO NUMBER', 'ASSORTMENT ITEM?', 'Asst_Role', 'Is_Shipper_Display', 'Original_DPCI', 'Final_DPCI',
         'ITEM DESCRIPTION', 'Final_QTY', 'Final_QTY_for_count',
         'Cost Match', 'ITEM UNIT COST', 'Target_Cost',
         'Retail Match', 'ITEM UNIT RETAIL', 'Suggested Unit Retail',
