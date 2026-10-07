@@ -1096,8 +1096,35 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
 # ==========================================
 # 8. Streamlit 網頁介面
 # ==========================================
-st.set_page_config(page_title="訂單自動核對系統", layout="wide")
-st.title("🗂 TG Team PO 驗證管理平台")
+st.set_page_config(page_title="TG Team PO 驗證管理平台", layout="wide")
+
+# LuckyStar Logo SVG（藍底白色人形堆疊）
+LOGO_SVG = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 56 56" width="52" height="52">
+  <rect width="56" height="56" rx="6" fill="#1a5fa8"/>
+  <!-- 底排：3人 -->
+  <circle cx="12" cy="38" r="4.2" fill="white"/>
+  <ellipse cx="12" cy="48" rx="5.5" ry="4" fill="white"/>
+  <circle cx="28" cy="38" r="4.2" fill="white"/>
+  <ellipse cx="28" cy="48" rx="5.5" ry="4" fill="white"/>
+  <circle cx="44" cy="38" r="4.2" fill="white"/>
+  <ellipse cx="44" cy="48" rx="5.5" ry="4" fill="white"/>
+  <!-- 中排：2人 -->
+  <circle cx="20" cy="25" r="4.2" fill="white"/>
+  <ellipse cx="20" cy="35" rx="5.5" ry="4" fill="white"/>
+  <circle cx="36" cy="25" r="4.2" fill="white"/>
+  <ellipse cx="36" cy="35" rx="5.5" ry="4" fill="white"/>
+  <!-- 頂排：1人 -->
+  <circle cx="28" cy="12" r="4.2" fill="white"/>
+  <ellipse cx="28" cy="22" rx="5.5" ry="4" fill="white"/>
+</svg>
+"""
+
+col_logo, col_title = st.columns([0.07, 0.93])
+with col_logo:
+    st.markdown(LOGO_SVG, unsafe_allow_html=True)
+with col_title:
+    st.markdown("<h1 style='margin-top:4px; font-size:2rem;'>TG Team PO 驗證管理平台</h1>", unsafe_allow_html=True)
 
 # ---- Sidebar ----
 st.sidebar.header("📂 步驟 1：上傳共通資料庫")
