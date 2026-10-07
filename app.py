@@ -376,13 +376,17 @@ def process_dispatch(files):
     """
     G7 + N6: 讀取工廠&人員隸屬清單，輸出 DPCI → Factory / AC / AE 對應。
     N6: 同時保留 Factory_Name_from_Dispatch 供 PCN Factory Name 比對。
+    files 可以是 file-like 物件的 list，或已是 DataFrame 的 list（圖片辨識後直傳）。
     """
     if not files:
         return pd.DataFrame()
     df_list = []
     for f in files:
-        df = pd.read_csv(f) if f.name.endswith('.csv') else pd.read_excel(f)
-        df_list.append(df)
+        if isinstance(f, pd.DataFrame):
+            df_list.append(f)
+        else:
+            df = pd.read_csv(f) if f.name.endswith('.csv') else pd.read_excel(f)
+            df_list.append(df)
     if not df_list:
         return pd.DataFrame()
     dispatch_df = pd.concat(df_list, ignore_index=True)
@@ -421,7 +425,9 @@ def process_dispatch(files):
 def parse_sps_pdf(pdf_file):
     """
     G1: 解析 SPS Commerce PO PDF，回傳 (po_df, parse_warnings)
-    支援標準版格式（PO NUMBER / ITEM NUMBER / COST）
+    支援兩種路線：
+      1. pdfplumber extract_tables()：有真實表格結構時使用
+      2. 純文字逐行解析（fallback）：SPS Commerce 常見排版為純文字，無表格框線
     """
     try:
         import pdfplumber
@@ -432,23 +438,65 @@ def parse_sps_pdf(pdf_file):
     all_rows = []
     current_po = None
 
+    # PO NUMBER 多種格式：
+    # "Purchase Order: 1234567890" / "PO NUMBER: 1234567890" / "PO #1234567890"
+    PO_PATTERNS = [
+        r'Purchase\s+Order\s*[:#]?\s*(\d{7,12})',
+        r'PO\s*(?:NUMBER|#|No\.?)[:\s]+(\d{7,12})',
+        r'\bP\.?O\.?\s*[:#]?\s*(\d{7,12})\b',
+    ]
+    DPCI_RE = re.compile(r'\b(\d{3}-\d{2}-\d{4})\b')
+
+    def extract_po_number(text):
+        for pat in PO_PATTERNS:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                return m.group(1)
+        return None
+
+    def _build_row(po, dpci_raw, qty_raw, cost_raw=None, retail_raw=None,
+                   desc_raw=None, upc_raw=None, asst_raw=None, vcp_raw=None):
+        def to_num(s):
+            if not s:
+                return np.nan
+            return pd.to_numeric(str(s).replace(',', '').replace('$', ''), errors='coerce')
+        return {
+            'PO NUMBER': po,
+            'Original_DPCI': clean_dpci(pd.Series([dpci_raw])).iloc[0],
+            'Final_DPCI': clean_dpci(pd.Series([dpci_raw])).iloc[0],
+            'Final_QTY': to_num(qty_raw),
+            'ITEM UNIT COST': to_num(cost_raw),
+            'ITEM UNIT RETAIL': to_num(retail_raw),
+            'ITEM DESCRIPTION': desc_raw,
+            'PO UPC': clean_upc(pd.Series([upc_raw if upc_raw else np.nan])).iloc[0],
+            'ASSORTMENT ITEM?': 'Y' if str(asst_raw or '').upper() in ['Y', 'YES'] else 'N',
+            'VCP QUANTITY': to_num(vcp_raw),
+            'COMPONENT ASSORT QTY': np.nan,
+            'Is_Shipper_Display': False,
+        }
+
     try:
         with pdfplumber.open(pdf_file) as pdf:
+            full_text_pages = []
             for page_num, page in enumerate(pdf.pages, 1):
-                tables = page.extract_tables()
                 text = page.extract_text() or ''
+                full_text_pages.append(text)
 
-                po_match = re.search(r'PO\s*(?:NUMBER|#)[:\s]+(\d{8,12})', text, re.IGNORECASE)
-                if po_match:
-                    current_po = po_match.group(1)
+                # ── 更新 PO 編號 ──
+                po_found = extract_po_number(text)
+                if po_found:
+                    current_po = po_found
 
+                # ── 路線 1：extract_tables ──
+                tables = page.extract_tables()
                 for table in tables:
                     if not table:
                         continue
                     header_row_idx = None
                     for i, row in enumerate(table):
                         row_str = ' '.join(str(c) for c in row if c).upper()
-                        if ('DPCI' in row_str or 'ITEM' in row_str) and ('COST' in row_str or 'QTY' in row_str or 'QUANTITY' in row_str):
+                        if ('DPCI' in row_str or 'ITEM' in row_str) and \
+                           ('COST' in row_str or 'QTY' in row_str or 'QUANTITY' in row_str):
                             header_row_idx = i
                             break
 
@@ -457,22 +505,21 @@ def parse_sps_pdf(pdf_file):
 
                     headers = [str(c).strip() if c else '' for c in table[header_row_idx]]
 
-                    def find_col_idx(keywords, require_all=False):
+                    def find_col_idx(keywords):
                         for idx, h in enumerate(headers):
                             h_norm = re.sub(r'\s+', '', h).lower()
-                            hits = [kw.lower().replace(' ', '') in h_norm for kw in keywords]
-                            if (all(hits) if require_all else any(hits)):
+                            if any(kw.lower().replace(' ', '') in h_norm for kw in keywords):
                                 return idx
                         return None
 
                     dpci_idx = find_col_idx(['dpci'])
-                    qty_idx = find_col_idx(['qty', 'quantity'])
+                    qty_idx  = find_col_idx(['qty', 'quantity'])
                     cost_idx = find_col_idx(['cost'])
                     retail_idx = find_col_idx(['retail'])
-                    desc_idx = find_col_idx(['description', 'desc'])
-                    upc_idx = find_col_idx(['upc', 'barcode', 'bar code'])
-                    asst_idx = find_col_idx(['assortment'])
-                    vcp_idx = find_col_idx(['vcp', 'case'])
+                    desc_idx   = find_col_idx(['description', 'desc'])
+                    upc_idx    = find_col_idx(['upc', 'barcode', 'bar code'])
+                    asst_idx   = find_col_idx(['assortment'])
+                    vcp_idx    = find_col_idx(['vcp', 'case'])
 
                     if dpci_idx is None or qty_idx is None:
                         continue
@@ -480,36 +527,87 @@ def parse_sps_pdf(pdf_file):
                     for row in table[header_row_idx + 1:]:
                         if not row or all(c is None or str(c).strip() == '' for c in row):
                             continue
-                        def get(idx):
-                            if idx is None or idx >= len(row):
+
+                        def get(idx, r=row):
+                            if idx is None or idx >= len(r):
                                 return None
-                            return str(row[idx]).strip() if row[idx] is not None else None
+                            return str(r[idx]).strip() if r[idx] is not None else None
 
                         dpci_raw = get(dpci_idx)
-                        qty_raw = get(qty_idx)
-                        if not dpci_raw or not re.search(r'\d{3}-\d{2}-\d{4}', dpci_raw or ''):
+                        qty_raw  = get(qty_idx)
+                        if not dpci_raw or not DPCI_RE.search(dpci_raw):
                             continue
+                        all_rows.append(_build_row(
+                            current_po, dpci_raw, qty_raw,
+                            cost_raw=get(cost_idx), retail_raw=get(retail_idx),
+                            desc_raw=get(desc_idx), upc_raw=get(upc_idx),
+                            asst_raw=get(asst_idx), vcp_raw=get(vcp_idx),
+                        ))
 
-                        all_rows.append({
-                            'PO NUMBER': current_po,
-                            'Original_DPCI': clean_dpci(pd.Series([dpci_raw])).iloc[0],
-                            'Final_DPCI': clean_dpci(pd.Series([dpci_raw])).iloc[0],
-                            'Final_QTY': pd.to_numeric(str(qty_raw).replace(',', ''), errors='coerce') if qty_raw else np.nan,
-                            'ITEM UNIT COST': pd.to_numeric(str(get(cost_idx) or '').replace(',', '').replace('$', ''), errors='coerce'),
-                            'ITEM UNIT RETAIL': pd.to_numeric(str(get(retail_idx) or '').replace(',', '').replace('$', ''), errors='coerce'),
-                            'ITEM DESCRIPTION': get(desc_idx),
-                            'PO UPC': clean_upc(pd.Series([get(upc_idx) or np.nan])).iloc[0],
-                            'ASSORTMENT ITEM?': 'Y' if (get(asst_idx) or '').upper() in ['Y', 'YES'] else 'N',
-                            'VCP QUANTITY': pd.to_numeric(str(get(vcp_idx) or ''), errors='coerce'),
-                            'COMPONENT ASSORT QTY': np.nan,
-                            'Is_Shipper_Display': False,
-                        })
+            # ── 路線 2：純文字 fallback（當 extract_tables 完全沒抓到任何行時）──
+            if not all_rows:
+                full_text = '\n'.join(full_text_pages)
+                current_po = None
+
+                # 先重新掃一遍全文取得 PO NUMBER
+                for pat in PO_PATTERNS:
+                    m = re.search(pat, full_text, re.IGNORECASE)
+                    if m:
+                        current_po = m.group(1)
+                        break
+
+                # SPS Commerce 文字版常見排版：
+                # 每行包含 DPCI（DDD-CC-XXXX）且附近有數量
+                # 嘗試兩種常見行格式：
+                #   格式 A: "086-04-1234  SOME DESC  100  $1.50  $2.99"
+                #   格式 B: "DPCI: 086-04-1234 ... Qty: 100 ... Cost: 1.50"
+
+                lines = full_text.splitlines()
+                for line in lines:
+                    # 更新 PO 編號
+                    po_in_line = extract_po_number(line)
+                    if po_in_line:
+                        current_po = po_in_line
+                        continue
+
+                    dpci_m = DPCI_RE.search(line)
+                    if not dpci_m:
+                        continue
+
+                    dpci_raw = dpci_m.group(1)
+                    # 從同行抓數字：第一個整數作 qty，後面的浮點數作 cost/retail
+                    nums = re.findall(r'[\$]?([\d,]+\.?\d*)', line)
+                    # 排除 DPCI 自己的數字
+                    nums_clean = []
+                    for n in nums:
+                        n_plain = n.replace(',', '')
+                        try:
+                            val = float(n_plain)
+                            if val > 0 and n_plain not in dpci_raw.replace('-', ''):
+                                nums_clean.append(val)
+                        except ValueError:
+                            pass
+
+                    qty_raw  = str(int(nums_clean[0])) if len(nums_clean) > 0 and nums_clean[0] == int(nums_clean[0]) else (str(nums_clean[0]) if nums_clean else None)
+                    cost_raw = str(nums_clean[1]) if len(nums_clean) > 1 else None
+                    retail_raw = str(nums_clean[2]) if len(nums_clean) > 2 else None
+
+                    if qty_raw is None:
+                        continue
+
+                    all_rows.append(_build_row(
+                        current_po, dpci_raw, qty_raw,
+                        cost_raw=cost_raw, retail_raw=retail_raw,
+                    ))
 
     except Exception as e:
         return None, [f"❌ PDF 解析錯誤：{e}"]
 
     if not all_rows:
-        return None, ["⚠️ 在 PDF 中找不到可解析的 PO 表格，請確認格式為 SPS Commerce 標準版 PO。"]
+        return None, [
+            "⚠️ 在 PDF 中找不到可解析的 PO 表格。"
+            "請確認為 SPS Commerce 標準版 PO，或將 PDF 原始檔案一併傳給 TG Team 檢視。"
+        ]
 
     po_df = pd.DataFrame(all_rows)
     po_df = po_df[po_df['PO NUMBER'].notna()].copy()
