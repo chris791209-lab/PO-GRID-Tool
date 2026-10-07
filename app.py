@@ -75,6 +75,33 @@ def fuzzy_col(df_cols, *keywords, require_all=False):
             return col
     return None
 
+def normalize_factory_name(s: str) -> str:
+    """
+    N6 工廠名稱正規化：
+    - 移除常見法律後綴（Co., Ltd., Corp., Inc., LLC 等）
+    - 移除標點、括號內容、多餘空白
+    - 統一小寫
+    讓 PCN 英文名與 Dispatch 表中英混用名仍可比對到最長公共核心。
+    """
+    if not isinstance(s, str):
+        return ''
+    result = s.lower()
+    # 移除括號及其內容（含中文括號）
+    result = re.sub(r'[\(（][^)）]*[\)）]', '', result)
+    # 移除常見法律後綴
+    suffixes = [
+        r'\bco\.?,?\s*ltd\.?', r'\bcorp\.?', r'\binc\.?', r'\bllc\.?',
+        r'\blimited', r'\bcompany', r'\bfactory', r'\bindustrial',
+        r'\bmanufacturing', r'\benterprise', r'\bgroup',
+        r'有限公司', r'工廠', r'工業', r'集團',
+    ]
+    for sfx in suffixes:
+        result = re.sub(sfx, '', result)
+    # 移除標點與多餘空白
+    result = re.sub(r'[^\w\s]', ' ', result)
+    result = re.sub(r'\s+', ' ', result).strip()
+    return result
+
 # ==========================================
 # 2. G3 重複 PO 偵測（含 N7: superseded_with_qty_change）
 # ==========================================
@@ -890,6 +917,8 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
             orig_cols = list(po_df.columns) + [c for c in merged_df.columns if c not in po_df.columns and c != 'Asst_Box_Cost' and c != 'Units_in_Assortment']
             key_cols = [c for c in ['PO NUMBER', 'Final_DPCI', 'Original_DPCI'] if c in merge1.columns]
             merge1 = merge1.drop_duplicates(subset=key_cols, keep='first')
+            # 保留 box DPCI 追溯欄（Gap 3 修正：供 Asst_Role 診斷使用）
+            merge1['Matched_Box_DPCI'] = merge1.get('_Asst_Box_DPCI', pd.Series(np.nan, index=merge1.index))
             # Clean up extra merge cols
             merge1.drop(columns=[c for c in ['_Asst_Box_DPCI', 'Component_DPCI'] if c in merge1.columns], inplace=True, errors='ignore')
             merged_df = merge1
@@ -920,13 +949,31 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
                 merged_df.get('ASSORTMENT ITEM?', pd.Series('N', index=merged_df.index))
             )
 
-            # ── 新增診斷欄：Asst_Role ──
-            merged_df['Asst_Role'] = np.where(
-                is_comp, '🔹 混裝零件',
-                np.where(is_box, '📦 混裝 Box',
-                np.where(merged_df['Final_DPCI'].isin(asst_comp_dpcis), '⚠️ 零件無對應',
-                np.where(merged_df['Final_DPCI'].isin(asst_box_dpcis), '⚠️ Box無對應', '—')))
+            # ── 新增診斷欄：Asst_Role（Gap 3：含 Matched_Box_DPCI 追溯）──
+            # 建立 Final_DPCI → 所屬 Box DPCI 的查找表（供「零件無對應」診斷用）
+            comp_to_box_map = (
+                asst_df[asst_df['Component_DPCI'].notna()]
+                .groupby('Component_DPCI')['Assortment_DPCI']
+                .first()
+                .to_dict()
             )
+            def _asst_role(row):
+                fdpci = row.get('Final_DPCI', '')
+                if is_comp[row.name]:
+                    box_dpci = row.get('Matched_Box_DPCI', '')
+                    box_str = f' ({box_dpci})' if pd.notna(box_dpci) and box_dpci else ''
+                    return f'🔹 混裝零件{box_str}'
+                if is_box[row.name]:
+                    return '📦 混裝 Box'
+                if fdpci in asst_comp_dpcis:
+                    box_ref = comp_to_box_map.get(fdpci, '')
+                    box_str = f' → 應屬 {box_ref}' if box_ref else ''
+                    return f'⚠️ 零件無對應{box_str}'
+                if fdpci in asst_box_dpcis:
+                    return '⚠️ Box無對應'
+                return '—'
+
+            merged_df['Asst_Role'] = merged_df.apply(_asst_role, axis=1)
 
             merged_df['Target_Cost'] = np.where(
                 merged_df['ASSORTMENT ITEM?'] == 'Y',
@@ -1133,12 +1180,30 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
         # N6: If PCN has Factory Name, check if it matches Dispatch_Factory
         if factory_col_in_prod and 'Factory Name' in merged_df.columns and 'Dispatch_Factory' in merged_df.columns:
             both_have_factory = merged_df['Factory Name'].notna() & merged_df['Dispatch_Factory'].notna()
-            # Normalize for comparison (strip whitespace, case-insensitive)
-            pcn_factory_norm = merged_df['Factory Name'].astype(str).str.strip().str.lower()
-            disp_factory_norm = merged_df['Dispatch_Factory'].astype(str).str.strip().str.lower()
+            # Normalize for comparison: strip legal suffixes, punctuation, case
+            # (handles English PCN name vs Chinese/mixed Dispatch name)
+            pcn_factory_norm = merged_df['Factory Name'].astype(str).apply(normalize_factory_name)
+            disp_factory_norm = merged_df['Dispatch_Factory'].astype(str).apply(normalize_factory_name)
+            # Primary: exact match after normalization
+            exact_match = pcn_factory_norm == disp_factory_norm
+            # Fallback: one name is a substring of the other (handles truncated names)
+            subset_match = (
+                pcn_factory_norm.str.len().gt(3) & disp_factory_norm.str.len().gt(3) &
+                (pcn_factory_norm.apply(lambda x: any(x in d or d in x
+                    for d in [disp_factory_norm.iloc[i] if i < len(disp_factory_norm) else '' for i in [pcn_factory_norm.tolist().index(x) if x in pcn_factory_norm.tolist() else 0]])))
+            )
+            # Simpler vectorised substring check
+            factory_match_vec = []
+            for pcn_n, disp_n in zip(pcn_factory_norm, disp_factory_norm):
+                if pcn_n == disp_n:
+                    factory_match_vec.append(True)
+                elif len(pcn_n) > 3 and len(disp_n) > 3 and (pcn_n in disp_n or disp_n in pcn_n):
+                    factory_match_vec.append(True)
+                else:
+                    factory_match_vec.append(False)
             merged_df['Factory_Match'] = np.where(
                 both_have_factory,
-                pcn_factory_norm == disp_factory_norm,
+                factory_match_vec,
                 np.nan
             )
             merged_df['Factory_Match_Status'] = np.where(
@@ -1394,7 +1459,7 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
     統一結果顯示 + 彩色 + 摘要統計 + Excel 下載（含 GRID / 驗核摘要 / 執行摘要）
     """
     display_cols = [
-        'PO NUMBER', 'ASSORTMENT ITEM?', 'Asst_Role', 'Is_Shipper_Display', 'Original_DPCI', 'Final_DPCI',
+        'PO NUMBER', 'ASSORTMENT ITEM?', 'Asst_Role', 'Matched_Box_DPCI', 'Is_Shipper_Display', 'Original_DPCI', 'Final_DPCI',
         'ITEM DESCRIPTION', 'Final_QTY', 'Final_QTY_for_count',
         'Cost Match', 'ITEM UNIT COST', 'Target_Cost',
         'Retail Match', 'ITEM UNIT RETAIL', 'Suggested Unit Retail',
@@ -1563,6 +1628,14 @@ if True:
 
                 prod_df = process_products(product_files)
                 asst_df = process_assortments(asst_files) if asst_files else None
+
+                # ── G5 PO 內部一致性自我驗證 ──
+                self_verify_warnings = po_self_verify(clean_po_df, mode='standard')
+                if self_verify_warnings:
+                    with st.expander(f"⚠️ G5 PO 內部驗算：{len(self_verify_warnings)} 則警告（點擊展開）", expanded=True):
+                        for w in self_verify_warnings:
+                            st.warning(w)
+                all_warnings = all_warnings + self_verify_warnings
 
                 dispatch_arg = dispatch_df_global if len(dispatch_df_global) > 0 else None
                 merged_df = run_validation(clean_po_df, prod_df, asst_df, mode='standard', dispatch_df=dispatch_arg)
