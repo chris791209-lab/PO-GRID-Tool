@@ -811,99 +811,22 @@ st.title("📦 跨專案訂單自動核對系統")
 
 # ---- Sidebar ----
 st.sidebar.header("📂 步驟 1：上傳共通資料庫")
-product_files = st.sidebar.file_uploader("上傳 產品資料表 (可多選)", type=['csv', 'xlsx'], accept_multiple_files=True)
+product_files = st.sidebar.file_uploader("上傳 產品資料表 PCN (可多選)", type=['csv', 'xlsx'], accept_multiple_files=True)
 asst_files = st.sidebar.file_uploader("上傳 混裝箱表單 (可多選/選填)", type=['csv', 'xlsx'], accept_multiple_files=True)
 
-# G7: Dispatch table（選填）
+# G7: 工廠&人員隸屬清單（選填）
 st.sidebar.markdown("---")
-st.sidebar.header("🗂 步驟 2（選填）：上傳 Dispatch 對照表")
-dispatch_files = st.sidebar.file_uploader("上傳 Dispatch 表（Factory / AC / AE 對照）", type=['csv', 'xlsx'], accept_multiple_files=True)
+st.sidebar.header("🗂 步驟 2（選填）：上傳工廠&人員隸屬清單")
+dispatch_files = st.sidebar.file_uploader("上傳工廠&人員隸屬清單（Factory / AE / AC 對照）", type=['csv', 'xlsx'], accept_multiple_files=True)
 dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.DataFrame()
 
 # ---- Tabs ----
-tab1, tab2, tab3 = st.tabs(["📊 標準版 (Standard PO) 核對", "📈 現代版 (Modern PO) 核對", "📄 PDF 上傳解析"])
+tab1, tab2, tab3 = st.tabs(["📄 PDF 上傳解析", "📊 標準版 CSV 核對", "📈 現代版 CSV 核對"])
 
 # ==========================================
-# Tab 1: 標準版 CSV
+# Tab 1: PDF 上傳解析（主要入口）
 # ==========================================
 with tab1:
-    st.subheader("上傳標準版 PO 並執行核對")
-    po_file_std = st.file_uploader("📥 上傳 Purchase Order Item Details (CSV)", type=['csv'], key="std_po")
-
-    if st.button("🚀 開始核對標準版", type="primary", key="btn_std"):
-        if not product_files or not po_file_std:
-            st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表」，並在上方上傳「標準版 PO」！")
-        else:
-            with st.spinner("標準版資料清洗與比對中..."):
-                raw_po_df = process_standard_po(pd.read_csv(po_file_std))
-
-                # G3: 重複 PO 偵測
-                clean_po_df, dup_warnings = detect_duplicate_pos(raw_po_df)
-                for w in dup_warnings:
-                    st.warning(w)
-
-                # G5: PO 自我驗證
-                self_verify_warnings = po_self_verify(clean_po_df, mode='standard')
-                for w in self_verify_warnings:
-                    st.warning(w)
-
-                prod_df = process_products(product_files)
-                asst_df = process_assortments(asst_files) if asst_files else None
-
-                merged_df = run_validation(clean_po_df, prod_df, asst_df, mode='standard')
-
-                # G7: 加入 Dispatch 欄
-                if len(dispatch_df_global) > 0:
-                    merged_df = pd.merge(merged_df, dispatch_df_global, left_on='Final_DPCI', right_on='DPCI', how='left', suffixes=('', '_dispatch'))
-
-                run_meta = {
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'input_files': f"PO: {po_file_std.name} | Products: {', '.join(f.name for f in product_files)}"
-                }
-                show_results(merged_df, 'Standard', run_meta=run_meta)
-
-# ==========================================
-# Tab 2: 現代版 CSV
-# ==========================================
-with tab2:
-    st.subheader("上傳現代版 PO 並執行核對")
-    po_file_mod = st.file_uploader("📥 上傳 Modern PO Visibility (CSV)", type=['csv'], key="mod_po")
-
-    if st.button("🚀 開始核對現代版", type="primary", key="btn_mod"):
-        if not product_files or not po_file_mod:
-            st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表」，並在上方上傳「現代版 PO」！")
-        else:
-            with st.spinner("現代版資料清洗與比對中..."):
-                raw_po_df = process_modern_po(pd.read_csv(po_file_mod))
-
-                # G3
-                clean_po_df, dup_warnings = detect_duplicate_pos(raw_po_df)
-                for w in dup_warnings:
-                    st.warning(w)
-
-                # G5
-                self_verify_warnings = po_self_verify(clean_po_df, mode='modern')
-                for w in self_verify_warnings:
-                    st.warning(w)
-
-                prod_df = process_products(product_files)
-                asst_df = process_assortments(asst_files) if asst_files else None
-
-                merged_df = run_validation(clean_po_df, prod_df, asst_df, mode='modern')
-
-                if len(dispatch_df_global) > 0:
-                    merged_df = pd.merge(merged_df, dispatch_df_global, left_on='Final_DPCI', right_on='DPCI', how='left', suffixes=('', '_dispatch'))
-
-                run_meta = {
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'input_files': f"PO: {po_file_mod.name} | Products: {', '.join(f.name for f in product_files)}"
-                }
-                show_results(merged_df, 'Modern', run_meta=run_meta)
-
-# ==========================================
-# Tab 3: G1 PDF 上傳解析
-# ==========================================
-with tab3:
     st.subheader("📄 直接上傳 SPS Commerce PO PDF")
     st.info("免匯出 CSV！直接上傳 SPS Commerce 標準版 PO 的 PDF 檔案，系統將自動解析並執行核對。")
 
@@ -950,3 +873,65 @@ with tab3:
                     'input_files': f"PDFs: {', '.join(f.name for f in pdf_files)} | Products: {', '.join(f.name for f in product_files)}"
                 }
                 show_results(merged_df, 'PDF', run_meta=run_meta)
+
+# ==========================================
+# Tab 2: 標準版 CSV（備用）
+# ==========================================
+with tab2:
+    st.subheader("上傳標準版 PO CSV 並執行核對")
+    st.caption("若 SPS Commerce 無法直接提供 PDF，可在此上傳匯出的 CSV 檔案。")
+    po_file_std = st.file_uploader("📥 上傳 Purchase Order Item Details (CSV)", type=['csv'], key="std_po")
+
+    if st.button("🚀 開始核對標準版", type="primary", key="btn_std"):
+        if not product_files or not po_file_std:
+            st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表 PCN」，並在上方上傳「標準版 PO」！")
+        else:
+            with st.spinner("標準版資料清洗與比對中..."):
+                raw_po_df = process_standard_po(pd.read_csv(po_file_std))
+                clean_po_df, dup_warnings = detect_duplicate_pos(raw_po_df)
+                for w in dup_warnings:
+                    st.warning(w)
+                self_verify_warnings = po_self_verify(clean_po_df, mode='standard')
+                for w in self_verify_warnings:
+                    st.warning(w)
+                prod_df = process_products(product_files)
+                asst_df = process_assortments(asst_files) if asst_files else None
+                merged_df = run_validation(clean_po_df, prod_df, asst_df, mode='standard')
+                if len(dispatch_df_global) > 0:
+                    merged_df = pd.merge(merged_df, dispatch_df_global, left_on='Final_DPCI', right_on='DPCI', how='left', suffixes=('', '_dispatch'))
+                run_meta = {
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'input_files': f"PO: {po_file_std.name} | Products: {', '.join(f.name for f in product_files)}"
+                }
+                show_results(merged_df, 'Standard', run_meta=run_meta)
+
+# ==========================================
+# Tab 3: 現代版 CSV（備用）
+# ==========================================
+with tab3:
+    st.subheader("上傳現代版 PO CSV 並執行核對")
+    st.caption("若使用 Modern PO Visibility 格式，請在此上傳 CSV 檔案。")
+    po_file_mod = st.file_uploader("📥 上傳 Modern PO Visibility (CSV)", type=['csv'], key="mod_po")
+
+    if st.button("🚀 開始核對現代版", type="primary", key="btn_mod"):
+        if not product_files or not po_file_mod:
+            st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表 PCN」，並在上方上傳「現代版 PO」！")
+        else:
+            with st.spinner("現代版資料清洗與比對中..."):
+                raw_po_df = process_modern_po(pd.read_csv(po_file_mod))
+                clean_po_df, dup_warnings = detect_duplicate_pos(raw_po_df)
+                for w in dup_warnings:
+                    st.warning(w)
+                self_verify_warnings = po_self_verify(clean_po_df, mode='modern')
+                for w in self_verify_warnings:
+                    st.warning(w)
+                prod_df = process_products(product_files)
+                asst_df = process_assortments(asst_files) if asst_files else None
+                merged_df = run_validation(clean_po_df, prod_df, asst_df, mode='modern')
+                if len(dispatch_df_global) > 0:
+                    merged_df = pd.merge(merged_df, dispatch_df_global, left_on='Final_DPCI', right_on='DPCI', how='left', suffixes=('', '_dispatch'))
+                run_meta = {
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'input_files': f"PO: {po_file_mod.name} | Products: {', '.join(f.name for f in product_files)}"
+                }
+                show_results(merged_df, 'Modern', run_meta=run_meta)
