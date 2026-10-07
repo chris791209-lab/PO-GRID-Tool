@@ -48,7 +48,7 @@ def clean_dpci(series):
     if series is None:
         return series
     cleaned = series.astype(str)
-    cleaned = cleaned.str.replace(r'\s+', '', regex=True)
+    cleaned = cleaned.str.replace(r'[\s\u00a0\u200b\u3000\ufeff]+', '', regex=True)
     cleaned = cleaned.str.replace(r'[/\\]', '-', regex=True)
     cleaned = cleaned.str.replace(r'\.0$', '', regex=True)
     return cleaned
@@ -406,9 +406,10 @@ def process_assortments(files):
                          fuzzy_col(df.columns, 'assortmentdpci')
             sub_col = fuzzy_col(df.columns, 'component', 'dpci', require_all=True) or \
                       fuzzy_col(df.columns, 'itemdpci')
-            cost_col = fuzzy_col(df.columns, 'asst', 'cost') or \
-                       fuzzy_col(df.columns, 'fa', 'box', 'cost', require_all=False) or \
-                       fuzzy_col(df.columns, 'boxcost')
+            # 成本欄必須同時含 box/asst 與 cost；舊寫法會誤選到「Vendor Asst Style #」
+            cost_col = fuzzy_col(df.columns, 'box', 'cost', require_all=True) or \
+                       fuzzy_col(df.columns, 'asst', 'cost', require_all=True) or \
+                       fuzzy_col(df.columns, 'assortment', 'cost', require_all=True)
             units_col = fuzzy_col(df.columns, 'units', 'assortment', require_all=True) or \
                         fuzzy_col(df.columns, 'unitsinassortment')
 
@@ -417,12 +418,19 @@ def process_assortments(files):
 
             temp_df = df[[master_col, sub_col, cost_col, units_col]].copy()
             temp_df.columns = ['Assortment_DPCI', 'Component_DPCI', 'Asst_Box_Cost', 'Units_in_Assortment']
-            temp_df['Assortment_DPCI'] = temp_df['Assortment_DPCI'].replace(r'^\s*$', np.nan, regex=True).ffill()
-            temp_df['Asst_Box_Cost'] = temp_df['Asst_Box_Cost'].replace(r'^\s*$', np.nan, regex=True).ffill()
+            blank = r'^[\s\u00a0]*$'
+            temp_df['Assortment_DPCI'] = temp_df['Assortment_DPCI'].replace(blank, np.nan, regex=True)
+            temp_df['Asst_Box_Cost'] = temp_df['Asst_Box_Cost'].replace(blank, np.nan, regex=True)
+            # 每個 Box 以「該列有 Box 成本或 Box DPCI」為起點；只在同一個 Box 內往下填，
+            # 避免尚未配發 DPCI 的 Box 繼承上一個 Box 的 DPCI
+            grp = (temp_df['Asst_Box_Cost'].notna() | temp_df['Assortment_DPCI'].notna()).cumsum()
+            temp_df['Assortment_DPCI'] = temp_df.groupby(grp)['Assortment_DPCI'].ffill()
+            temp_df['Asst_Box_Cost'] = temp_df.groupby(grp)['Asst_Box_Cost'].ffill()
             temp_df = temp_df.dropna(subset=['Assortment_DPCI', 'Component_DPCI'])
             temp_df['Assortment_DPCI'] = clean_dpci(temp_df['Assortment_DPCI'])
             temp_df['Component_DPCI'] = clean_dpci(temp_df['Component_DPCI'])
-            temp_df = temp_df[~temp_df['Assortment_DPCI'].str.lower().str.contains('iafillsout|nan|none', na=False)]
+            temp_df = temp_df[temp_df['Assortment_DPCI'].str.match(r'^\d{3}-\d{2}-\d{4}$', na=False)
+                              & temp_df['Component_DPCI'].str.match(r'^\d{3}-\d{2}-\d{4}$', na=False)]
             temp_df['Asst_Box_Cost'] = pd.to_numeric(temp_df['Asst_Box_Cost'], errors='coerce')
             temp_df['Units_in_Assortment'] = pd.to_numeric(temp_df['Units_in_Assortment'], errors='coerce')
             df_list.append(temp_df)
@@ -480,389 +488,349 @@ def process_dispatch(files):
     return result
 
 # ==========================================
-# 5. G1: PDF 解析函數
+# 5. G1: PDF 解析（與 po-grid Skill 的 parse_po_pdfs.py 同一套規則）
 # ==========================================
-def parse_sps_pdf(pdf_file):
-    """
-    G1: 解析 SPS Commerce / Target Import PO PDF，回傳 (po_df, parse_warnings)
-    支援三種路線：
-      1. pdfplumber extract_tables()：有真實表格結構時使用
-      2. 純文字逐行解析（fallback）：SPS Commerce 文字版
-      3. OCR fallback：Target Import PO（全向量圖形、無文字層）
-         - 使用 pdf2image 光柵化 + pytesseract OCR
-         - 支援 "Buyers Catalog Number: XXXXXXXXX" → DPCI DDD-CC-XXXX 轉換
-    """
+# 文字層：有 → pdfplumber；無（Microsoft Print To PDF）→ 300dpi 灰階 OCR
+# 版型：V1（DPCI 在行首）、V2（27C1：數量緊接 Unit Price）、V3（27C2：單價在數量前）
+# 自我驗證三道 gate：Σ行小計 = PO Total、數量×單價 = 行小計、Σ數量 = Total Qty
+
+_PO_LINE_START = re.compile(r'^(\d{1,3}) (\d{9}) Vendors Style (\d{11,13})', re.M)
+_PO_PREPACK = re.compile(
+    r'^(\d{1,3}) (\d{9}) (\S+) (\d{11,13})[^\d\n]*?(\d+\.\d+) ([\d,]+)\s*Each\s*$', re.M)
+_PO_LINE_START_V2 = re.compile(
+    r'^(\d{1,2}) Buyers Catalog Number:\s*(?:Vendors Style\s*)?'
+    r'(\d{11,13})Product:\s*(\w+)\s*Unit\s*Price:\s*([\d,]+)\s*Each\s*([\d,]+\.\d{2})', re.M)
+_PO_DPCI_V2 = re.compile(r'^(\d{9})\s*(?:Number:\s*)?Product:\s*(.*?)\s*([\d,]+\.\d{2,4})\s*$', re.M)
+_PO_STYLE_V2 = re.compile(r'Buyers Item Number:\s*(.*?)\s*Resale:\s*([\d.]+)', re.S)
+_PO_PREPACK_V2 = re.compile(r'^(\d{1,3}) (\d{9}) (\d{11,13}) ([\d.]+) ([\d,]+)\s*Each\s*$', re.M)
+_PO_LINE_START_V3 = re.compile(
+    r'^(\d{1,3}) Buyers Catalog Number:\s*(?:Vendors Style\s*)?'
+    r'(\d{11,13})Product:\s*(\w+)\s*Unit\s*Price:\s*([\d.]+)\s+([\d,]+)\s*Each\s*'
+    r'([\d,]+\.\d{2})', re.M)
+_PO_DPCI_V3 = re.compile(r'^(\d{9})\b', re.M)
+_PO_STYLE_V3 = re.compile(r'Buyers Item Number:\s*(\S+)')
+_PO_PREPACK_V3 = re.compile(
+    r'^(\d{1,3}) (\d{9}) (\d{11,13})\s*(.*?)\s*(\d+\.\d+) ([\d,]+)\s*Each\s*$', re.M)
+_PO_SHIP_WIN = r'Shipping Window:(.{0,400}?)(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})'
+
+
+def _po_num(s):
+    try:
+        return float(str(s).replace(',', '').replace(' ', '')) if s not in (None, '') else None
+    except ValueError:
+        return None
+
+
+def _po_g(pat, text, grp=1, flags=0):
+    m = re.search(pat, text, flags)
+    return m.group(grp).strip() if m else ''
+
+
+def _sku_to_dpci(sku):
+    s = str(sku).zfill(9)
+    return f"{s[:3]}-{s[3:5]}-{s[5:]}"
+
+
+def normalize_ocr_text(t):
+    """把 OCR 文字整理成與原生文字層相同的形狀，讓同一組 regex 可用。"""
+    out = []
+    for ln in t.splitlines():
+        ln = ln.replace(' ', ' ').rstrip()
+        ln = re.sub(r'[ \t]{2,}', ' ', ln).strip()
+        out.append(ln)
+    t = '\n'.join(out)
+    t = re.sub(r'(\d{11,13})\s+Product:', r'\1Product:', t)
+    t = re.sub(r'(Order #:\s*\d{10,11})\s+-\s*(\d{4})', r'\1-\2', t)
+    t = re.sub(r'Unit Price:\s*', 'Unit Price: ', t)
+    t = re.sub(r'Resale:\s*', 'Resale: ', t)
+    t = re.sub(r'(\d+\.\d+)\.(?=\s)', r'\1', t)      # 表格線被讀成小數點
+    t = re.sub(r'(\d) ,(\d{3})', r'\1,\2', t)         # "468 ,002.66"
+    return t
+
+
+@st.cache_data(show_spinner=False)
+def extract_po_text(pdf_bytes):
+    """回傳 (text, used_ocr, error)。以檔案內容快取，重跑不需再 OCR。"""
     try:
         import pdfplumber
     except ImportError:
-        return None, ["❌ 缺少 pdfplumber 套件，請在 requirements.txt 加入 pdfplumber 並重新部署。"]
-
-    warnings = []
-    all_rows = []
-    current_po = None
-
-    # PO NUMBER 多種格式：
-    # "Purchase Order: 1234567890" / "PO NUMBER: 1234567890" / "Order #: 10002036126-0581"
-    PO_PATTERNS = [
-        r'Order\s*#?\s*[:#]?\s*(\d{10,13}(?:-\d{3,5})?)',
-        r'Purchase\s+Order\s*[:#]?\s*(\d{7,12})',
-        r'PO\s*(?:NUMBER|#|No\.?)[:\s]+(\d{7,12})',
-        r'\bP\.?O\.?\s*[:#]?\s*(\d{7,12})\b',
-    ]
-    DPCI_RE = re.compile(r'\b(\d{3}-\d{2}-\d{4})\b')
-    # Buyers Catalog Number（Target Import format）: 9 digits → DDD-CC-XXXX
-    CATALOG_RE = re.compile(r'Buyers\s+Catalog\s+Number\s*[:\s]+(\d{9})', re.IGNORECASE)
-    # Also match plain 9-digit block that could be catalog number
-    CATALOG_BARE_RE = re.compile(r'\b(\d{9})\b')
-
-    def extract_po_number(text):
-        for pat in PO_PATTERNS:
-            m = re.search(pat, text, re.IGNORECASE)
-            if m:
-                raw = m.group(1)
-                # Strip suffix like "-0581" if present — keep base PO number
-                return raw.split('-')[0] if '-' in raw and len(raw.split('-')[0]) >= 10 else raw
-        return None
-
-    def catalog_to_dpci(catalog_num):
-        """Convert 9-digit Buyers Catalog Number to DDD-CC-XXXX DPCI format."""
-        s = str(catalog_num).zfill(9)
-        return f"{s[:3]}-{s[3:5]}-{s[5:]}"
-
-    def _build_row(po, dpci_raw, qty_raw, cost_raw=None, retail_raw=None,
-                   desc_raw=None, upc_raw=None, asst_raw=None, vcp_raw=None):
-        def to_num(s):
-            if not s:
-                return np.nan
-            return pd.to_numeric(str(s).replace(',', '').replace('$', ''), errors='coerce')
-        return {
-            'PO NUMBER': po,
-            'Original_DPCI': clean_dpci(pd.Series([dpci_raw])).iloc[0],
-            'Final_DPCI': clean_dpci(pd.Series([dpci_raw])).iloc[0],
-            'Final_QTY': to_num(qty_raw),
-            'ITEM UNIT COST': to_num(cost_raw),
-            'ITEM UNIT RETAIL': to_num(retail_raw),
-            'ITEM DESCRIPTION': desc_raw,
-            'PO UPC': clean_upc(pd.Series([upc_raw if upc_raw else np.nan])).iloc[0],
-            'ASSORTMENT ITEM?': 'Y' if str(asst_raw or '').upper() in ['Y', 'YES'] else 'N',
-            'VCP QUANTITY': to_num(vcp_raw),
-            'COMPONENT ASSORT QTY': np.nan,
-            'Is_Shipper_Display': False,
-        }
-
-    def _ocr_parse(pdf_file):
-        """
-        路線 3：OCR 解析 Target Import PO（向量圖形 PDF，無文字層）
-        使用 pdf2image 光柵化後以 pytesseract 辨識。
-        支援 "Buyers Catalog Number" 跨行格式（目錄編號在標題下一行）。
-        """
-        ocr_rows = []
-        ocr_po = None
-        try:
-            from pdf2image import convert_from_bytes
-            import pytesseract
-        except ImportError as e:
-            return [], [f"❌ OCR 套件缺失：{e}"]
-
-        try:
-            pdf_file.seek(0)
-            pdf_bytes = pdf_file.read()
-            images = convert_from_bytes(pdf_bytes, dpi=200, fmt='png')
-        except Exception as e:
-            return [], [f"❌ PDF 光柵化失敗：{e}"]
-
-        ocr_warnings = []
-        full_ocr_text = ''
-
-        for img in images:
-            ocr_text = pytesseract.image_to_string(img, lang='eng', config='--psm 6 --oem 3')
-            full_ocr_text += ocr_text + '\n'
-
-        lines = [l.rstrip() for l in full_ocr_text.splitlines()]
-
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            # ── Extract PO number ──
-            po_found = extract_po_number(line)
-            if po_found:
-                ocr_po = po_found
-                i += 1
-                continue
-
-            # ── Detect "Buyers Catalog Number" header line ──
-            # Target Import format: "Buyers Catalog Number:" on one line,
-            # then the 9-digit catalog number at the start of the NEXT line.
-            if re.search(r'Buyers\s+Catalog\s+Number', line, re.IGNORECASE):
-                # The catalog number is on the next non-empty line
-                catalog_num = None
-                # Check same line first (inline format)
-                same_line_m = re.search(r'Buyers\s+Catalog\s+Number[:\s]+(\d{9})', line, re.IGNORECASE)
-                if same_line_m:
-                    catalog_num = same_line_m.group(1)
-                else:
-                    # Look at next line for a 9-digit number at start
-                    for j in range(i + 1, min(i + 3, len(lines))):
-                        next_m = re.match(r'\s*(\d{9})\b', lines[j])
-                        if next_m:
-                            catalog_num = next_m.group(1)
-                            break
-
-                if not catalog_num:
-                    i += 1
-                    continue
-
-                dpci_raw = catalog_to_dpci(catalog_num)
-
-                # Gather context: current line and surrounding ±6 lines
-                ctx_start = max(0, i - 2)
-                ctx_end = min(len(lines), i + 12)
-                context_lines = lines[ctx_start:ctx_end]
-                context_text = ' '.join(context_lines)
-
-                # ── UPC (12-13 digit number) ──
-                upc_m = re.search(r'\b(\d{12,13})\b', context_text)
-                upc_raw = upc_m.group(1) if upc_m else None
-
-                # ── Unit Price and Resale — use labeled patterns first ──
-                up_m = re.search(r'Unit\s+Price\s*[:\s]+(\d+\.?\d*)', context_text, re.IGNORECASE)
-                res_m = re.search(r'Resale\s*[:\s]+(\d+\.?\d*)', context_text, re.IGNORECASE)
-                cost_raw = up_m.group(1) if up_m else None
-                retail_raw = res_m.group(1) if res_m else None
-
-                # Fallback: extract floats if labeled patterns didn't match
-                if not cost_raw or not retail_raw:
-                    float_nums = re.findall(r'\b(\d+\.\d{2})\b', context_text)
-                    # Filter: remove UPC-digit runs and numbers > 9999 (totals)
-                    price_candidates = []
-                    for f in float_nums:
-                        try:
-                            v = float(f)
-                            if 0 < v < 9999 and (upc_raw is None or f not in upc_raw):
-                                price_candidates.append(f)
-                        except ValueError:
-                            pass
-                    if not cost_raw and price_candidates:
-                        cost_raw = price_candidates[0]
-                    if not retail_raw and len(price_candidates) > 1:
-                        retail_raw = price_candidates[1]
-
-                # ── QTY: prefer "N Each" pattern, then fallback ──
-                qty_m = re.search(r'\b(\d{1,5})\s+Each\b', context_text, re.IGNORECASE)
-                if not qty_m:
-                    qty_m = re.search(r'QTY\s*[:\s]+(\d+)', context_text, re.IGNORECASE)
-                qty_raw = qty_m.group(1) if qty_m else None
-
-                # ── Description: prefer "Product: <NAME>" label (before Resale/Price/Wholesale) ──
-                desc_raw = None
-                # Target Import has two "Product:" occurrences; the real one ends before Resale/Wholesale
-                prod_m = re.search(
-                    r'Product\s*:\s*([A-Z][A-Z0-9&\s\'"]{5,}?)(?=\s+(?:Resale|Unit Price|Wholesale|\Z))',
-                    context_text, re.IGNORECASE
-                )
-                if prod_m:
-                    desc_raw = prod_m.group(1).strip()
-                else:
-                    SKIP_KEYWORDS = {'ORDER', 'TARGET', 'VENDOR', 'BUYER', 'CATALOG',
-                                     'UNIT PRICE', 'RESALE', 'TOTAL', 'SHIP', 'CANCEL',
-                                     'FREIGHT', 'CONTACT', 'CURRENCY', 'INCOTERM',
-                                     'TERMS', 'RELEASE', 'CONTRACT', 'PURCHASING'}
-                    for cl in context_lines:
-                        cl = cl.strip()
-                        if len(cl) < 8:
-                            continue
-                        if not re.search(r'[A-Za-z]{3,}', cl):
-                            continue
-                        cl_up = cl.upper()
-                        if any(kw in cl_up for kw in SKIP_KEYWORDS):
-                            continue
-                        if re.match(r'^[\d\s\.\-\#\$:]+$', cl):
-                            continue
-                        desc_raw = cl
-                        break
-
-                ocr_rows.append(_build_row(
-                    ocr_po, dpci_raw, qty_raw,
-                    cost_raw=cost_raw, retail_raw=retail_raw,
-                    desc_raw=desc_raw, upc_raw=upc_raw,
-                ))
-                i += 1
-                continue
-
-            # ── Also handle plain DPCI format (DDD-CC-XXXX) in OCR text ──
-            dpci_m = DPCI_RE.search(line)
-            if dpci_m:
-                dpci_raw = dpci_m.group(1)
-                nums = re.findall(r'[\$]?([\d,]+\.?\d*)', line)
-                nums_clean = []
-                for n in nums:
-                    n_plain = n.replace(',', '')
-                    try:
-                        val = float(n_plain)
-                        if val > 0 and n_plain not in dpci_raw.replace('-', ''):
-                            nums_clean.append(val)
-                    except ValueError:
-                        pass
-                qty_raw = str(int(nums_clean[0])) if nums_clean and nums_clean[0] == int(nums_clean[0]) else (str(nums_clean[0]) if nums_clean else None)
-                cost_raw = str(nums_clean[1]) if len(nums_clean) > 1 else None
-                retail_raw = str(nums_clean[2]) if len(nums_clean) > 2 else None
-                if qty_raw:
-                    ocr_rows.append(_build_row(ocr_po, dpci_raw, qty_raw,
-                                               cost_raw=cost_raw, retail_raw=retail_raw))
-            i += 1
-
-        if not ocr_rows and ocr_po:
-            ocr_warnings.append("⚠️ OCR 已辨識 PO 編號但未找到商品明細，請確認 PDF 格式或提高掃描品質。")
-        elif not ocr_rows:
-            ocr_warnings.append("⚠️ OCR 無法辨識 PO 內容，PDF 可能掃描品質過低。")
-
-        return ocr_rows, ocr_warnings
-
+        return '', False, "缺少 pdfplumber 套件，請在 requirements.txt 加入 pdfplumber。"
     try:
-        with pdfplumber.open(pdf_file) as pdf:
-            full_text_pages = []
-            has_text_layer = False
-
-            for page_num, page in enumerate(pdf.pages, 1):
-                text = page.extract_text() or ''
-                full_text_pages.append(text)
-                if len(text.strip()) > 20:
-                    has_text_layer = True
-
-                # ── 更新 PO 編號 ──
-                po_found = extract_po_number(text)
-                if po_found:
-                    current_po = po_found
-
-                # ── 路線 1：extract_tables ──
-                tables = page.extract_tables()
-                for table in tables:
-                    if not table:
-                        continue
-                    header_row_idx = None
-                    for i, row in enumerate(table):
-                        row_str = ' '.join(str(c) for c in row if c).upper()
-                        if ('DPCI' in row_str or 'ITEM' in row_str) and \
-                           ('COST' in row_str or 'QTY' in row_str or 'QUANTITY' in row_str):
-                            header_row_idx = i
-                            break
-
-                    if header_row_idx is None:
-                        continue
-
-                    headers = [str(c).strip() if c else '' for c in table[header_row_idx]]
-
-                    def find_col_idx(keywords):
-                        for idx, h in enumerate(headers):
-                            h_norm = re.sub(r'\s+', '', h).lower()
-                            if any(kw.lower().replace(' ', '') in h_norm for kw in keywords):
-                                return idx
-                        return None
-
-                    dpci_idx = find_col_idx(['dpci'])
-                    qty_idx  = find_col_idx(['qty', 'quantity'])
-                    cost_idx = find_col_idx(['cost'])
-                    retail_idx = find_col_idx(['retail'])
-                    desc_idx   = find_col_idx(['description', 'desc'])
-                    upc_idx    = find_col_idx(['upc', 'barcode', 'bar code'])
-                    asst_idx   = find_col_idx(['assortment'])
-                    vcp_idx    = find_col_idx(['vcp', 'case'])
-
-                    if dpci_idx is None or qty_idx is None:
-                        continue
-
-                    for row in table[header_row_idx + 1:]:
-                        if not row or all(c is None or str(c).strip() == '' for c in row):
-                            continue
-
-                        def get(idx, r=row):
-                            if idx is None or idx >= len(r):
-                                return None
-                            return str(r[idx]).strip() if r[idx] is not None else None
-
-                        dpci_raw = get(dpci_idx)
-                        qty_raw  = get(qty_idx)
-                        if not dpci_raw or not DPCI_RE.search(dpci_raw):
-                            continue
-                        all_rows.append(_build_row(
-                            current_po, dpci_raw, qty_raw,
-                            cost_raw=get(cost_idx), retail_raw=get(retail_idx),
-                            desc_raw=get(desc_idx), upc_raw=get(upc_idx),
-                            asst_raw=get(asst_idx), vcp_raw=get(vcp_idx),
-                        ))
-
-            # ── 路線 2：純文字 fallback（SPS Commerce 文字版）──
-            if not all_rows and has_text_layer:
-                full_text = '\n'.join(full_text_pages)
-                current_po = None
-
-                for pat in PO_PATTERNS:
-                    m = re.search(pat, full_text, re.IGNORECASE)
-                    if m:
-                        current_po = m.group(1).split('-')[0]
-                        break
-
-                lines = full_text.splitlines()
-                for line in lines:
-                    po_in_line = extract_po_number(line)
-                    if po_in_line:
-                        current_po = po_in_line
-                        continue
-
-                    dpci_m = DPCI_RE.search(line)
-                    if not dpci_m:
-                        continue
-
-                    dpci_raw = dpci_m.group(1)
-                    nums = re.findall(r'[\$]?([\d,]+\.?\d*)', line)
-                    nums_clean = []
-                    for n in nums:
-                        n_plain = n.replace(',', '')
-                        try:
-                            val = float(n_plain)
-                            if val > 0 and n_plain not in dpci_raw.replace('-', ''):
-                                nums_clean.append(val)
-                        except ValueError:
-                            pass
-
-                    qty_raw = str(int(nums_clean[0])) if len(nums_clean) > 0 and nums_clean[0] == int(nums_clean[0]) else (str(nums_clean[0]) if nums_clean else None)
-                    cost_raw = str(nums_clean[1]) if len(nums_clean) > 1 else None
-                    retail_raw = str(nums_clean[2]) if len(nums_clean) > 2 else None
-
-                    if qty_raw is None:
-                        continue
-
-                    all_rows.append(_build_row(
-                        current_po, dpci_raw, qty_raw,
-                        cost_raw=cost_raw, retail_raw=retail_raw,
-                    ))
-
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            n_pages = len(pdf.pages)
+            text = '\n'.join((pg.extract_text() or '') for pg in pdf.pages)
     except Exception as e:
-        return None, [f"❌ PDF 解析錯誤：{e}"]
+        return '', False, f"PDF 讀取錯誤：{e}"
+    if 'Order #' in text and len(text.strip()) > 200:
+        return text, False, None
 
-    # ── 路線 3：OCR fallback（Target Import PO，全向量圖形，無文字層）──
-    if not all_rows:
-        pdf_file.seek(0)
-        ocr_rows, ocr_warnings = _ocr_parse(pdf_file)
-        warnings.extend(ocr_warnings)
-        if ocr_rows:
-            all_rows = ocr_rows
-            warnings.append("__OCR_USED__")
+    # 無文字層 → OCR。300dpi：150dpi 曾把 1.675 讀成 1.875。
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract
+    except ImportError as e:
+        return '', True, f"OCR 套件缺失：{e}"
+    pages = []
+    try:
+        for p in range(1, n_pages + 1):
+            img = convert_from_bytes(pdf_bytes, dpi=300, grayscale=True,
+                                     first_page=p, last_page=p, fmt='png')[0]
+            pages.append(pytesseract.image_to_string(
+                img, lang='eng', config='--psm 6 -c preserve_interword_spaces=1'))
+            del img
+    except Exception as e:
+        return '', True, f"OCR 失敗：{e}"
+    return normalize_ocr_text('\n'.join(pages)), True, None
 
-    if not all_rows:
-        return None, [
-            "⚠️ 在 PDF 中找不到可解析的 PO 表格，已嘗試 OCR 辨識。"
-            "請確認 PDF 來自 SPS Commerce 或 Target Import，或將原始檔案傳給 TG Team 檢視。"
-        ]
 
-    po_df = pd.DataFrame(all_rows)
-    po_df = po_df[po_df['PO NUMBER'].notna()].copy()
+def _po_resale(blk):
+    """Resale 後第一個金額形狀的數字（欄位換行時 10 位 Item Number 會插在中間）。"""
+    m = re.search(r'Resale:', blk)
+    if not m:
+        return ''
+    mm = re.search(r'(\d{1,4}\.\d{2})\b', blk[m.end():m.end() + 200])
+    return mm.group(1) if mm else ''
 
-    if po_df['PO NUMBER'].isna().any():
-        warnings.append("⚠️ 部分列無法對應 PO NUMBER，已略過。")
 
-    return po_df, warnings
+def parse_po_text(fname, txt):
+    """解析單一 PO 文字 → (head, items)。items.kind = line / ast / prepack。"""
+    stamp = _po_g(r'(\d{4}/\d{1,2}/\d{1,2} \d{1,2}:\d{2}) Fulfillment', txt)
+    txt = re.sub(r'^\d{4}/\d{1,2}/\d{1,2} \d{1,2}:\d{2} Fulfillment\s*$', '', txt, flags=re.M)
+    txt = re.sub(r'^https://\S+\s+\d+/\d+\s*$', '', txt, flags=re.M)
+
+    m = re.search(r'Order #:\s*(\d{4})-(\d{5,8})-(\w{4})', txt)
+    if m:
+        po, dc = m.group(2), m.group(3)
+    else:
+        m2 = re.search(r'Order #:\s*(\d{6,11})-(\w{3,5})', txt)
+        po, dc = (m2.group(1), m2.group(2)) if m2 else ('', '')
+
+    head = {
+        'po': po, 'dc': dc, 'file': fname, 'retrieved': stamp,
+        'fname_date': _po_g(r'_(\d{4})(?:\D[^_]*)?\.pdf$', fname),
+        'is_change': bool(re.search(r'Import PO Change|PO Change Date', txt)),
+        'is_cancel': bool(re.search(r'CANCEL ORDER', txt, re.I)),
+        'doc_date': _po_g(r'(?:PO Change Date|PO Date):.*?\n\s*(\d{2}/\d{2}/\d{4})', txt, 1, re.S),
+        'po_total': _po_g(r'Purchase Order Total:\s*([\d, ]+\.\d{2})', txt),
+        'total_qty': _po_g(r'Total Qty:\s*([\d,]+)', txt),
+        'n_orders': len(set(re.findall(r'Order #:\s*(\d{6,11})', txt))),
+    }
+
+    items = []
+
+    def add_prepacks(blk, sku, lineno, patterns):
+        seen = set()
+        for kind, pat in patterns:
+            for pm in pat.finditer(blk):
+                gr = pm.groups()
+                if kind == 'v3':
+                    _, csku, cupc, _d, cunit, cqty = gr
+                elif kind == 'v1':
+                    _, csku, _s, cupc, cunit, cqty = gr
+                else:
+                    _, csku, cupc, cunit, cqty = gr
+                if csku in seen:
+                    continue
+                seen.add(csku)
+                items.append({'kind': 'prepack', 'parent_sku': sku, 'parent_line': int(lineno),
+                              'sku': csku, 'upc': cupc, 'unit': cunit,
+                              'qty': int(cqty.replace(',', ''))})
+
+    starts = [(mm.start(), mm) for mm in _PO_LINE_START.finditer(txt)]
+    v3_hits = [(mm.start(), 'v3', mm) for mm in _PO_LINE_START_V3.finditer(txt)]
+    v2_hits = [(mm.start(), 'v2', mm) for mm in _PO_LINE_START_V2.finditer(txt)]
+
+    if not starts and (v3_hits or v2_hits):
+        # 27C2：同一張 PO 可同時出現 V2 與 V3 形狀 → 取聯集
+        hits = sorted(v3_hits + v2_hits, key=lambda x: x[0])
+        for idx, (pos_, variant, mm) in enumerate(hits):
+            end = hits[idx + 1][0] if idx + 1 < len(hits) else len(txt)
+            blk = txt[pos_:end]
+            if variant == 'v3':
+                lineno, upc, ptype, unit, qty_s, total = mm.groups()
+            else:
+                lineno, upc, ptype, qty_s, total = mm.groups()
+                dm2 = _PO_DPCI_V2.search(blk)
+                unit = dm2.group(3) if dm2 else ''
+            dm = _PO_DPCI_V3.search(blk)
+            if not dm:
+                continue
+            sku = dm.group(1)
+            sm = _PO_STYLE_V3.search(blk)
+            style_tok = sm.group(1).strip() if sm else ''
+            items.append({'kind': 'ast' if ptype.upper() == 'AST' else 'line',
+                          'line': int(lineno), 'sku': sku, 'upc': upc,
+                          'style': style_tok if re.match(r'^\d{0,2}[A-Za-z]', style_tok) else '',
+                          'qty': int(qty_s.replace(',', '')), 'unit': unit,
+                          'total': total, 'resale': _po_resale(blk)})
+            add_prepacks(blk, sku, lineno,
+                         [('v3', _PO_PREPACK_V3), ('v1', _PO_PREPACK), ('v2', _PO_PREPACK_V2)])
+    elif starts:
+        for idx, (pos_, mm) in enumerate(starts):
+            end = starts[idx + 1][0] if idx + 1 < len(starts) else len(txt)
+            blk = txt[pos_:end]
+            lineno, sku, upc = mm.groups()
+            qm = re.search(r'Unit Price:\s*([\d,]+)\s*Each\s*([\d,]+\.\d{2})', blk)
+            if not qm:
+                continue
+            ptype = 'AST' if re.search(r'Product:\s*AST\b|ASSORTMENT', blk) else 'REG'
+            unit = _po_g(r'^Number:[^\n]*?([\d]+\.[\d]+)\s*$', blk, 1, re.M) or \
+                   _po_g(r'^[^\n]*?([\d]+\.[\d]{2,4})\s*$', blk, 1, re.M)
+            resale = _po_g(r'Resale:\s*([\d.]+)', blk) or \
+                     _po_g(r'Resale:\s*\n[^\n]*?([\d]+\.[\d]{2})\s*$', blk, 1, re.M)
+            items.append({'kind': 'ast' if ptype == 'AST' else 'line',
+                          'line': int(lineno), 'sku': sku, 'upc': upc,
+                          'style': _po_g(r'^(\d{2}[A-Z]{2,4}\d{0,3})\b', blk, 1, re.M),
+                          'qty': int(qm.group(1).replace(',', '')), 'unit': unit,
+                          'total': qm.group(2), 'resale': resale})
+            add_prepacks(blk, sku, lineno, [('v1', _PO_PREPACK)])
+
+    for it in items:
+        it.update({'po': po, 'dc': dc, 'file': fname})
+    return head, items
+
+
+def _po_gate_check(head, items):
+    """三道自我驗證 gate，回傳問題字串 list（空 = 通過）。"""
+    probs = []
+    lines = [i for i in items if i['kind'] in ('line', 'ast')]
+    if not lines:
+        return ["找不到任何品項列（PDF 版型可能已變更）"]
+    lt = sum(_po_num(i['total']) or 0 for i in lines)
+    pt = _po_num(head['po_total'])
+    if pt is None:
+        probs.append("讀不到 Purchase Order Total，無法驗算總金額")
+    elif abs(lt - pt) > 0.05:
+        probs.append(f"行小計合計 {lt:,.2f} ≠ PO Total {pt:,.2f}")
+    for i in lines:
+        u, t = _po_num(i.get('unit')), _po_num(i.get('total'))
+        if u is None:
+            probs.append(f"{_sku_to_dpci(i['sku'])} 讀不到單價")
+        elif abs(u * i['qty'] - t) > 0.05:
+            probs.append(f"{_sku_to_dpci(i['sku'])}：{u} × {i['qty']:,} ≠ {t:,.2f}")
+    tq = _po_num(head['total_qty'])
+    sq = sum(i['qty'] for i in lines)
+    if tq is None:
+        probs.append("讀不到 Total Qty，無法驗算總數量")
+    elif abs(sq - tq) > 0.5:
+        probs.append(f"行數量合計 {sq:,} ≠ Total Qty {tq:,.0f}")
+    return probs
+
+
+def _po_version_key(h):
+    """同一 PO# 多份文件時決定何者為現行版：PO Change 優先於原單，其次文件日期、擷取時間、檔名日期。"""
+    def dkey(s):
+        m = re.match(r'(\d{2})/(\d{2})/(\d{4})', s or '')
+        return (int(m.group(3)), int(m.group(1)), int(m.group(2))) if m else (0, 0, 0)
+    m = re.match(r'(\d{4})/(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})', h.get('retrieved') or '')
+    stamp = tuple(int(x) for x in m.groups()) if m else (0, 0, 0, 0, 0)
+    fd = h.get('fname_date') or ''
+    fdk = (int(fd[:2]), int(fd[2:])) if len(fd) == 4 and fd.isdigit() else (0, 0)
+    return (dkey(h.get('doc_date')), 1 if h.get('is_change') else 0, stamp, fdk)
+
+
+def parse_po_pdfs(pdf_files, progress=None):
+    """
+    解析多份 PO PDF → (po_df, info)
+    info: ocr_files / warnings / gate_problems / superseded / cancelled / duplicates / n_files / n_pos
+    po_df 每列 Row_Type = line（一般品項）/ box（混裝 Box）/ component（Box 內零件）
+    """
+    info = {'ocr_files': [], 'warnings': [], 'gate_problems': [], 'superseded': [],
+            'cancelled': [], 'duplicates': [], 'n_files': len(pdf_files), 'n_pos': 0}
+    parsed = []
+    for n, f in enumerate(pdf_files, 1):
+        name = getattr(f, 'name', str(f))
+        if progress:
+            progress(n, len(pdf_files), name)
+        try:
+            f.seek(0)
+        except Exception:
+            pass
+        text, used_ocr, err = extract_po_text(f.read())
+        if used_ocr:
+            info['ocr_files'].append(name)
+        if err:
+            info['warnings'].append(f"❌ {name}：{err}")
+            continue
+        head, items = parse_po_text(name, text)
+        if not head['po']:
+            info['warnings'].append(f"⚠️ {name}：找不到 Order #，已略過（PDF 版型可能不同）。")
+            continue
+        if head['n_orders'] > 1:
+            info['warnings'].append(
+                f"⚠️ {name}：一份 PDF 內含 {head['n_orders']} 張訂單（SPS 合併列印），請拆成單張後再上傳，已略過。")
+            continue
+        parsed.append((head, items))
+
+    # ── 版本判定：同 PO#+DC 取最新；CANCEL ORDER 的 PO Change → 整張作廢 ──
+    groups = {}
+    for head, items in parsed:
+        groups.setdefault((head['po'], head['dc']), []).append((head, items))
+    live = []
+    for (po, dc), docs in groups.items():
+        docs.sort(key=lambda d: _po_version_key(d[0]), reverse=True)
+        cancel = next((h for h, _ in docs if h['is_cancel']), None)
+        if cancel:
+            info['cancelled'].append({'po': po, 'dc': dc, 'file': cancel['file'],
+                                      'dropped': [h['file'] for h, _ in docs if h is not cancel]})
+            continue
+        head, items = docs[0]
+        if head['is_change'] and not items:
+            info['warnings'].append(f"⚠️ {head['file']}：為 PO Change 文件但讀不到變更後的品項，請人工確認 PO {po}。")
+            base = next(((h, it) for h, it in docs[1:] if it), None)
+            if not base:
+                continue
+            head, items = base
+        for lose, _ in docs:
+            if lose is not head:
+                info['superseded'].append({'po': po, 'kept': head['file'], 'dropped': lose['file'],
+                                           'from_qty': lose.get('total_qty'), 'to_qty': head.get('total_qty')})
+        probs = _po_gate_check(head, items)
+        if probs:
+            info['gate_problems'].append({'po': po, 'file': head['file'], 'issues': probs})
+        live.append((head, items))
+
+    # ── 不同 PO# 但 (DPCI, 數量) 完全相同 → 疑似重複下單 ──
+    fp = {}
+    for head, items in live:
+        key = tuple(sorted((i['sku'], i['qty']) for i in items if i['kind'] in ('line', 'prepack')))
+        if key:
+            fp.setdefault(key, set()).add(head['po'])
+    info['duplicates'] = [sorted(v) for v in fp.values() if len(v) > 1]
+
+    rows = []
+    for head, items in live:
+        box_qty = {(i['sku'], i['line']): i['qty'] for i in items if i['kind'] == 'ast'}
+        for i in items:
+            dpci = _sku_to_dpci(i['sku'])
+            base = {'PO NUMBER': head['po'], 'DC': head['dc'], 'PO_FILE': head['file'],
+                    'PO UPC': i.get('upc') or np.nan, 'VCP QUANTITY': np.nan,
+                    'Is_Shipper_Display': False, 'ITEM DESCRIPTION': i.get('style', '')}
+            if i['kind'] == 'prepack':
+                parent = _sku_to_dpci(i['parent_sku'])
+                bq = box_qty.get((i['parent_sku'], i['parent_line']))
+                base.update({'Row_Type': 'component', 'ASSORTMENT ITEM?': 'Y',
+                             'Original_DPCI': parent, 'Final_DPCI': dpci,
+                             'Final_QTY': float(i['qty']), 'Box_QTY': bq,
+                             'ITEM UNIT COST': _po_num(i.get('unit')), 'ITEM UNIT RETAIL': np.nan,
+                             'LINE TOTAL': np.nan,
+                             'COMPONENT ASSORT QTY': (i['qty'] / bq) if bq else np.nan})
+            else:
+                is_box = i['kind'] == 'ast'
+                base.update({'Row_Type': 'box' if is_box else 'line',
+                             'ASSORTMENT ITEM?': 'Y' if is_box else 'N',
+                             'Original_DPCI': dpci, 'Final_DPCI': dpci,
+                             'Final_QTY': float(i['qty']), 'Box_QTY': float(i['qty']) if is_box else np.nan,
+                             'ITEM UNIT COST': _po_num(i.get('unit')),
+                             'ITEM UNIT RETAIL': _po_num(i.get('resale')),
+                             'LINE TOTAL': _po_num(i.get('total')),
+                             'COMPONENT ASSORT QTY': np.nan})
+            rows.append(base)
+    info['n_pos'] = len(live)
+    cols = ['PO NUMBER', 'DC', 'PO_FILE', 'Row_Type', 'ASSORTMENT ITEM?', 'Original_DPCI', 'Final_DPCI',
+            'ITEM DESCRIPTION', 'Final_QTY', 'Box_QTY', 'ITEM UNIT COST', 'ITEM UNIT RETAIL', 'LINE TOTAL',
+            'PO UPC', 'VCP QUANTITY', 'COMPONENT ASSORT QTY', 'Is_Shipper_Display']
+    return pd.DataFrame(rows, columns=cols), info
 
 # ==========================================
 # 6. 共通驗證引擎（G2 / G4 / G6 / N2 / N3 / N4 / N6 整合）
@@ -894,268 +862,138 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
         left_on='Final_DPCI', right_on='DPCI', how='left'
     )
 
-    # ---- 混裝箱處理（改善版：支援三種比對策略）----
-    if asst_df is not None and len(asst_df) > 0:
-        # 建立查找用 set
-        asst_box_dpcis = set(asst_df['Assortment_DPCI'].dropna())      # 混裝 box DPCI
-        asst_comp_dpcis = set(asst_df['Component_DPCI'].dropna())       # 混裝內容品 DPCI
+    # ---- 列類型：line（一般品項）/ box（混裝 Box）/ component（Box 內零件）----
+    has_asst = asst_df is not None and len(asst_df) > 0
+    if 'Row_Type' not in merged_df.columns:
+        # CSV 來源沒有列類型：標準版以 ASSORTMENT ITEM? 判斷零件；現代版以混裝表判斷 Box
+        is_y = merged_df.get('ASSORTMENT ITEM?', pd.Series('N', index=merged_df.index)).astype(str) == 'Y'
+        merged_df['Row_Type'] = np.where(is_y, 'component', 'line')
+        if has_asst:
+            box_set = set(asst_df['Assortment_DPCI'].dropna())
+            merged_df.loc[(~is_y) & merged_df['Original_DPCI'].isin(box_set), 'Row_Type'] = 'box'
+    is_line = merged_df['Row_Type'] == 'line'
+    is_box = merged_df['Row_Type'] == 'box'
+    is_comp = merged_df['Row_Type'] == 'component'
+    merged_df['ASSORTMENT ITEM?'] = np.where(is_line, 'N', 'Y')
+    for c in ['COMPONENT ASSORT QTY', 'VCP QUANTITY', 'Box_QTY']:
+        if c not in merged_df.columns:
+            merged_df[c] = np.nan
 
-        if mode == 'standard':
-            # ── 策略 1：以 Final_DPCI 比對 Component_DPCI（最常見：PO 以零件 DPCI 下單）──
-            merge1 = pd.merge(
-                merged_df,
-                asst_df.rename(columns={'Assortment_DPCI': '_Asst_Box_DPCI'}),
-                left_on='Final_DPCI',
-                right_on='Component_DPCI',
-                how='left',
-                suffixes=('', '_asst')
-            )
-            # 若同一 Final_DPCI 在混裝表中對應多個 box，取 Asst_Box_Cost 最小（保守）
-            # dedup: keep first hit per Final_DPCI (sort by cost ascending, NaN last)
-            merge1 = merge1.sort_values('Asst_Box_Cost', ascending=True, na_position='last')
-            # Use original columns as dedup key to avoid duplicates from merge
-            orig_cols = list(po_df.columns) + [c for c in merged_df.columns if c not in po_df.columns and c != 'Asst_Box_Cost' and c != 'Units_in_Assortment']
-            key_cols = [c for c in ['PO NUMBER', 'Final_DPCI', 'Original_DPCI'] if c in merge1.columns]
-            merge1 = merge1.drop_duplicates(subset=key_cols, keep='first')
-            # 保留 box DPCI 追溯欄（Gap 3 修正：供 Asst_Role 診斷使用）
-            merge1['Matched_Box_DPCI'] = merge1.get('_Asst_Box_DPCI', pd.Series(np.nan, index=merge1.index))
-            # Clean up extra merge cols
-            merge1.drop(columns=[c for c in ['_Asst_Box_DPCI', 'Component_DPCI'] if c in merge1.columns], inplace=True, errors='ignore')
-            merged_df = merge1
+    # ---- 混裝表查找：(Box, 零件) → 每箱入數；Box → proposal 成本 ----
+    pair_units, box_cost_prop, box_comps = {}, {}, {}
+    if has_asst:
+        for _, a in asst_df.iterrows():
+            pair_units[(a['Assortment_DPCI'], a['Component_DPCI'])] = a['Units_in_Assortment']
+            box_comps.setdefault(a['Assortment_DPCI'], set()).add(a['Component_DPCI'])
+            if pd.notna(a['Asst_Box_Cost']):
+                box_cost_prop.setdefault(a['Assortment_DPCI'], a['Asst_Box_Cost'])
+    fca = prod_df.drop_duplicates(subset=['DPCI']).set_index('DPCI')['Final_Product_Cost'].to_dict() \
+        if 'Final_Product_Cost' in prod_df.columns else {}
 
-            # 以混裝表資訊標記是否為混裝品：記錄哪些 Final_DPCI 找到了零件對應
-            merged_df['_is_comp_flag'] = merged_df['Asst_Box_Cost'].notna()
+    merged_df['Units_in_Assortment'] = [
+        pair_units.get((o, f), np.nan) if t == 'component' else np.nan
+        for o, f, t in zip(merged_df['Original_DPCI'], merged_df['Final_DPCI'], merged_df['Row_Type'])]
+    merged_df['Matched_Box_DPCI'] = np.where(is_comp, merged_df['Original_DPCI'], np.nan)
+    merged_df['Asst_Box_Cost'] = np.where(is_box, merged_df['Original_DPCI'].map(box_cost_prop), np.nan)
 
-            # ── 策略 2：以 Original_DPCI 比對 Assortment_DPCI（PO 中的 box 層級行）──
-            # 若 Original_DPCI 本身是 box DPCI，需拉出 box cost
-            if 'Original_DPCI' in merged_df.columns:
-                box_cost_lookup = asst_df.drop_duplicates(subset=['Assortment_DPCI'])[['Assortment_DPCI', 'Asst_Box_Cost']].rename(
-                    columns={'Assortment_DPCI': '_box_dpci_key', 'Asst_Box_Cost': '_box_cost_direct'}
-                )
-                merged_df = pd.merge(merged_df, box_cost_lookup, left_on='Original_DPCI', right_on='_box_dpci_key', how='left')
-                is_comp = merged_df['_is_comp_flag']
-                is_box = merged_df['_box_cost_direct'].notna() & ~is_comp
-                # 填補 Asst_Box_Cost for box rows
-                merged_df.loc[is_box, 'Asst_Box_Cost'] = merged_df.loc[is_box, '_box_cost_direct']
-                merged_df.drop(columns=['_box_dpci_key', '_box_cost_direct', '_is_comp_flag'], inplace=True, errors='ignore')
-            else:
-                is_comp = merged_df['_is_comp_flag']
-                merged_df.drop(columns=['_is_comp_flag'], inplace=True, errors='ignore')
-                is_box = pd.Series(False, index=merged_df.index)
+    # 反算 Box 成本 = Σ(零件 FCA × 每箱入數)；優先用混裝表的入數，沒有混裝表時用 PO 自身的零件列
+    calc_prop = {}
+    for b, comps in box_comps.items():
+        vals = [fca.get(c, np.nan) * pair_units[(b, c)] for c in comps]
+        calc_prop[b] = np.nan if any(pd.isna(v) for v in vals) else float(np.sum(vals))
+    comp_rows = merged_df[is_comp].copy()
+    comp_rows['_contrib'] = comp_rows['Final_Product_Cost'] * comp_rows['COMPONENT ASSORT QTY']
+    calc_po = comp_rows.groupby(['PO NUMBER', 'Original_DPCI'])['_contrib'].agg(
+        lambda s: np.nan if s.isna().any() else s.sum()).to_dict()
+    merged_df['Calc_Box_Cost'] = [
+        (calc_prop.get(o) if pd.notna(calc_prop.get(o, np.nan)) else calc_po.get((p, o), np.nan)) if t == 'box' else np.nan
+        for p, o, t in zip(merged_df['PO NUMBER'], merged_df['Original_DPCI'], merged_df['Row_Type'])]
 
-            # ── 更新 ASSORTMENT ITEM? 欄位 ──
-            merged_df['ASSORTMENT ITEM?'] = np.where(
-                is_comp | is_box, 'Y',
-                merged_df.get('ASSORTMENT ITEM?', pd.Series('N', index=merged_df.index))
-            )
-
-            # ── 新增診斷欄：Asst_Role（Gap 3：含 Matched_Box_DPCI 追溯）──
-            # 建立 Final_DPCI → 所屬 Box DPCI 的查找表（供「零件無對應」診斷用）
-            comp_to_box_map = (
-                asst_df[asst_df['Component_DPCI'].notna()]
-                .groupby('Component_DPCI')['Assortment_DPCI']
-                .first()
-                .to_dict()
-            )
-            def _asst_role(row):
-                fdpci = row.get('Final_DPCI', '')
-                if is_comp[row.name]:
-                    box_dpci = row.get('Matched_Box_DPCI', '')
-                    box_str = f' ({box_dpci})' if pd.notna(box_dpci) and box_dpci else ''
-                    return f'🔹 混裝零件{box_str}'
-                if is_box[row.name]:
-                    return '📦 混裝 Box'
-                if fdpci in asst_comp_dpcis:
-                    box_ref = comp_to_box_map.get(fdpci, '')
-                    box_str = f' → 應屬 {box_ref}' if box_ref else ''
-                    return f'⚠️ 零件無對應{box_str}'
-                if fdpci in asst_box_dpcis:
-                    return '⚠️ Box無對應'
-                return '—'
-
-            merged_df['Asst_Role'] = merged_df.apply(_asst_role, axis=1)
-
-            merged_df['Target_Cost'] = np.where(
-                merged_df['ASSORTMENT ITEM?'] == 'Y',
-                merged_df['Asst_Box_Cost'],
-                merged_df['Final_Product_Cost']
-            )
-        else:
-            condensed_asst = asst_df.groupby('Assortment_DPCI', as_index=False).agg({'Asst_Box_Cost': 'first'})
-            merged_df = pd.merge(merged_df, condensed_asst, left_on='Original_DPCI', right_on='Assortment_DPCI', how='left')
-            merged_df['ASSORTMENT ITEM?'] = np.where(merged_df['Asst_Box_Cost'].notna(), 'Y', 'N')
-            merged_df['Target_Cost'] = np.where(merged_df['ASSORTMENT ITEM?'] == 'Y', merged_df['Asst_Box_Cost'], merged_df['Final_Product_Cost'])
-            merged_df['Asst_Role'] = '—'
-    else:
-        merged_df['Target_Cost'] = merged_df['Final_Product_Cost']
-        if 'Units_in_Assortment' not in merged_df.columns:
-            merged_df['Units_in_Assortment'] = np.nan
-        if 'Asst_Box_Cost' not in merged_df.columns:
-            merged_df['Asst_Box_Cost'] = np.nan
-        merged_df['Asst_Role'] = '—'
-
-    asst_mask = merged_df.get('ASSORTMENT ITEM?', pd.Series('N', index=merged_df.index)) == 'Y'
+    def _role(row):
+        if row['Row_Type'] == 'box':
+            if has_asst and row['Original_DPCI'] not in box_comps:
+                return '⚠️ Box 不在混裝表'
+            return '📦 混裝 Box'
+        if row['Row_Type'] == 'component':
+            if has_asst and pd.isna(row['Units_in_Assortment']):
+                return f"⚠️ 零件不在混裝表的 {row['Original_DPCI']}"
+            return f"🔹 混裝零件 ({row['Original_DPCI']})"
+        return '—'
+    merged_df['Asst_Role'] = merged_df.apply(_role, axis=1)
 
     # ---- G4: 成本比對（tolerance = 0.005）----
-    merged_df['Cost Match'] = np.isclose(
-        merged_df['ITEM UNIT COST'].fillna(-1),
-        merged_df['Target_Cost'].fillna(-1),
-        atol=0.005
-    )
-    merged_df['Cost Match'] = np.where(merged_df['Target_Cost'].isna(), False, merged_df['Cost Match'])
+    # 一般品項、零件 → FCA/FOB；Box → 混裝表 Box 成本（無混裝表時用反算成本）
+    merged_df['Target_Cost'] = np.where(
+        is_box, merged_df['Asst_Box_Cost'].fillna(merged_df['Calc_Box_Cost']), merged_df['Final_Product_Cost'])
+    merged_df['Cost Match'] = np.where(
+        merged_df['Target_Cost'].isna() | merged_df['ITEM UNIT COST'].isna(), False,
+        (merged_df['ITEM UNIT COST'] - merged_df['Target_Cost']).abs() <= 0.005 + 1e-9)
 
-    # ---- N2: 零售價比對（tolerance = 0.005）----
+    # ---- N2: 零售價比對（tolerance = 0.005）；Box 與零件無單一零售價 → n/a ----
     if 'Suggested Unit Retail' in merged_df.columns:
         merged_df['Retail Match'] = np.where(
-            asst_mask,
-            True,  # 混裝箱 master row 零售標 n/a
-            np.isclose(
-                merged_df['ITEM UNIT RETAIL'].fillna(0),
-                merged_df['Suggested Unit Retail'].fillna(0),
-                atol=0.005  # N2: 修正自 0.01 → 0.005
-            )
-        )
+            ~is_line, True,
+            np.where(merged_df['ITEM UNIT RETAIL'].isna() | merged_df['Suggested Unit Retail'].isna(), False,
+                     (merged_df['ITEM UNIT RETAIL'] - merged_df['Suggested Unit Retail']).abs() <= 0.005 + 1e-9))
     else:
         merged_df['Retail Match'] = True
 
-    # ---- 裝箱數比對 ----
-    if mode == 'standard':
-        merged_df['Target Case / Assort QTY'] = np.where(
-            asst_mask,
-            merged_df.get('Units_in_Assortment', pd.Series(np.nan, index=merged_df.index)),
-            merged_df.get('Case Unit Quantity', pd.Series(np.nan, index=merged_df.index))
-        )
-        merged_df['PO VCP / Assort QTY'] = np.where(
-            asst_mask,
-            merged_df.get('COMPONENT ASSORT QTY', pd.Series(np.nan, index=merged_df.index)),
-            merged_df.get('VCP QUANTITY', pd.Series(np.nan, index=merged_df.index))
-        )
-    else:
-        merged_df['Target Case / Assort QTY'] = merged_df.get('Case Unit Quantity', pd.Series(np.nan, index=merged_df.index))
-        merged_df['PO VCP / Assort QTY'] = merged_df.get('VCP QUANTITY', pd.Series(np.nan, index=merged_df.index))
-        merged_df['Target Case / Assort QTY'] = np.where(
-            asst_mask, merged_df['PO VCP / Assort QTY'], merged_df['Target Case / Assort QTY']
-        )
+    # ---- 裝箱數比對：一般品項 VCP vs Case；零件 每箱入數 vs 混裝表（PO 無資料則略過）----
+    merged_df['Target Case / Assort QTY'] = np.where(
+        is_comp, merged_df['Units_in_Assortment'],
+        np.where(is_line, merged_df.get('Case Unit Quantity', pd.Series(np.nan, index=merged_df.index)), np.nan))
+    merged_df['PO VCP / Assort QTY'] = np.where(
+        is_comp, merged_df['COMPONENT ASSORT QTY'], np.where(is_line, merged_df['VCP QUANTITY'], np.nan))
+    po_pack = pd.to_numeric(merged_df['PO VCP / Assort QTY'], errors='coerce')
+    tg_pack = pd.to_numeric(merged_df['Target Case / Assort QTY'], errors='coerce')
+    merged_df['Case QTY Match'] = np.where(
+        po_pack.isna(), True,                                   # PO 無此資料 → 不檢核
+        np.where(tg_pack.isna(), ~(is_comp & has_asst) if has_asst else True,
+                 (po_pack - tg_pack).abs() <= 0.01))
+    merged_df['Case QTY Match'] = merged_df['Case QTY Match'].astype(bool)
 
-    # Case QTY 比對：僅當 VCP 資料確實存在時才比對
-    # 若整欄皆為 NaN（SPS 標準 PO 通常無 VCP 欄），略過比對改標 True
-    vcp_col_present = merged_df['PO VCP / Assort QTY'].notna().any()
-    if vcp_col_present:
-        merged_df['Case QTY Match'] = np.where(
-            merged_df['PO VCP / Assort QTY'].isna(),
-            True,  # 此列無 VCP 資料 → 略過
-            np.where(
-                merged_df['Target Case / Assort QTY'].isna(),
-                False,
-                np.isclose(
-                    merged_df['PO VCP / Assort QTY'].fillna(-1),
-                    merged_df['Target Case / Assort QTY'].fillna(-1),
-                    atol=0.01
-                )
-            )
-        )
-    else:
-        # VCP 欄完全缺失（SPS 標準 PO）→ 不執行此項核對
-        merged_df['Case QTY Match'] = True
-    if mode == 'modern':
-        merged_df['Case QTY Match'] = np.where(asst_mask, True, merged_df['Case QTY Match'])
-
-    # ---- G2: 總數量比對（case_pack rounding + 10% 容忍）----
-    merged_df['Target Commit QTY'] = merged_df.get('Ent Ttl Rcpt U', pd.Series(np.nan, index=merged_df.index))
-    case_pack = merged_df.get('Case Unit Quantity', pd.Series(1, index=merged_df.index)).fillna(1)
-
-    shipper_mask = merged_df.get('Is_Shipper_Display', pd.Series(False, index=merged_df.index)).astype(bool)
-    merged_df['Final_QTY_for_count'] = np.where(shipper_mask, 0, merged_df['Final_QTY'])
+    # ---- G2: 總數量 = 單品 PO 數量 + Box 內含數量；Box 列本身不計（避免重複）----
+    merged_df['Target Commit QTY'] = np.where(
+        is_box, np.nan, merged_df.get('Ent Ttl Rcpt U', pd.Series(np.nan, index=merged_df.index)))
+    case_pack = pd.to_numeric(
+        merged_df.get('Case Unit Quantity', pd.Series(1, index=merged_df.index)), errors='coerce').fillna(1)
+    shipper_mask = merged_df.get('Is_Shipper_Display', pd.Series(False, index=merged_df.index)).fillna(False).astype(bool)
+    merged_df['Final_QTY_for_count'] = np.where(shipper_mask | is_box, 0, merged_df['Final_QTY'])
     merged_df['PO Total QTY'] = merged_df.groupby('Final_DPCI')['Final_QTY_for_count'].transform('sum')
-
+    merged_df['PO Total QTY'] = np.where(is_box, merged_df['Final_QTY'], merged_df['PO Total QTY'])
     qty_diff = (merged_df['PO Total QTY'] - merged_df['Target Commit QTY']).abs()
     merged_df['Total QTY Match'] = np.where(
-        merged_df['Target Commit QTY'].isna(),
-        False,
-        (qty_diff < case_pack) | (qty_diff <= 0.10 * merged_df['Target Commit QTY'])
-    )
+        is_box, True,                                           # Box 無計畫量 → n/a
+        np.where(merged_df['Target Commit QTY'].isna(), False,
+                 (qty_diff < case_pack) | (qty_diff <= 0.10 * merged_df['Target Commit QTY'])))
+    merged_df['Total QTY Match'] = merged_df['Total QTY Match'].astype(bool)
     merged_df['QTY Diff'] = merged_df['PO Total QTY'] - merged_df['Target Commit QTY']
     merged_df['QTY Diff %'] = np.where(
-        merged_df['Target Commit QTY'].replace(0, np.nan).isna(),
-        np.nan,
-        (merged_df['QTY Diff'] / merged_df['Target Commit QTY'] * 100).round(1)
-    )
+        merged_df['Target Commit QTY'].replace(0, np.nan).isna(), np.nan,
+        (merged_df['QTY Diff'] / merged_df['Target Commit QTY'] * 100).round(1))
 
-    # ---- UPC 比對 ----
-    upc_both_exist = merged_df['PO UPC'].notna() & merged_df['Target UPC'].notna()
+    # ---- UPC 比對（去除前導 0 後比較；Excel 常把 Barcode 存成數字）----
+    def _upc_key(s):
+        return s.astype(str).str.replace(r'\.0$', '', regex=True).str.strip().str.lstrip('0')
+    upc_both_exist = merged_df['PO UPC'].notna() & merged_df['Target UPC'].notna() & ~is_box
     merged_df['UPC Match'] = np.where(
-        upc_both_exist,
-        merged_df['PO UPC'] == merged_df['Target UPC'],
-        True
-    )
+        upc_both_exist, _upc_key(merged_df['PO UPC']) == _upc_key(merged_df['Target UPC']), True)
     merged_df['UPC Status'] = np.where(
-        ~upc_both_exist, '⚪ 無資料',
-        np.where(merged_df['UPC Match'], '✅ 相符', '❌ 不符')
-    )
+        ~upc_both_exist, '⚪ 無資料', np.where(merged_df['UPC Match'], '✅ 相符', '❌ 不符'))
 
-    # ---- G6: Assortment 成本反算驗證 ----
-    if asst_df is not None and len(asst_df) > 0 and 'Units_in_Assortment' in merged_df.columns:
-        asst_cost_check = merged_df[asst_mask & merged_df['Final_Product_Cost'].notna() & merged_df['Units_in_Assortment'].notna()].copy()
-        if len(asst_cost_check) > 0:
-            asst_cost_check['_component_contribution'] = asst_cost_check['Final_Product_Cost'] * asst_cost_check['Units_in_Assortment']
-            calc_box_cost = asst_cost_check.groupby('Original_DPCI')['_component_contribution'].sum().reset_index()
-            calc_box_cost.columns = ['Original_DPCI', 'Calc_Box_Cost']
-            merged_df = pd.merge(merged_df, calc_box_cost, on='Original_DPCI', how='left')
-            merged_df['Asst_Cost_Check'] = np.where(
-                asst_mask & merged_df['Asst_Box_Cost'].notna() & merged_df['Calc_Box_Cost'].notna(),
-                np.isclose(merged_df['Asst_Box_Cost'], merged_df['Calc_Box_Cost'], atol=0.005),
-                np.nan
-            )
-            merged_df['Asst_Cost_Status'] = np.where(
-                merged_df['Asst_Cost_Check'].isna(), '⚪ N/A',
-                np.where(merged_df['Asst_Cost_Check'] == 1.0, '✅ 反算相符', '❌ 反算不符')
-            )
-        else:
-            merged_df['Calc_Box_Cost'] = np.nan
-            merged_df['Asst_Cost_Status'] = '⚪ N/A'
-    else:
-        merged_df['Calc_Box_Cost'] = np.nan
-        merged_df['Asst_Cost_Status'] = '⚪ N/A'
+    # ---- G6: Box 成本反算：Σ(零件 FCA × 每箱入數) vs PO 上的 Box 單價 ----
+    merged_df['Asst_Cost_Status'] = np.where(
+        ~is_box | merged_df['Calc_Box_Cost'].isna() | merged_df['ITEM UNIT COST'].isna(), '⚪ N/A',
+        np.where((merged_df['Calc_Box_Cost'] - merged_df['ITEM UNIT COST']).abs() <= 0.005 + 1e-9,
+                 '✅ 反算相符', '❌ 反算不符'))
 
-    # ---- N3: Assortment QTY 展開驗證 ----
-    # 對每個 assortment box DPCI：boxes in PO × units_per_box = expected component qty
-    # 比較 PO 中記錄的 component qty（Final_QTY for asst rows）
-    merged_df['Asst_QTY_Check'] = '⚪ N/A'
-    if asst_df is not None and len(asst_df) > 0 and 'Units_in_Assortment' in merged_df.columns:
-        # 找出 assortment 行（box level）的訂購數量
-        # Standard PO: assortment rows have Original_DPCI = box DPCI, ASSORTMENT ITEM? = Y
-        asst_rows = merged_df[asst_mask].copy()
-        if len(asst_rows) > 0 and 'COMPONENT ASSORT QTY' in asst_rows.columns:
-            # boxes = Original_DPCI 的 Total qty (sum of Final_QTY for original asst rows)
-            # For each component: expected = boxes × units_in_assortment
-            # Actual = COMPONENT ASSORT QTY (the prepack quantity in the PO for that component)
-            box_qtys = po_df[po_df.get('ASSORTMENT ITEM?', pd.Series('N')) == 'Y'].groupby(
-                po_df.get('Original_DPCI', po_df.index)
-            )['Final_QTY'].sum().reset_index() if 'Original_DPCI' in po_df.columns else pd.DataFrame()
-
-            if len(box_qtys) > 0:
-                box_qtys.columns = ['Original_DPCI', 'Total_Box_QTY']
-                asst_check = asst_rows.merge(box_qtys, on='Original_DPCI', how='left')
-                asst_check['Expected_Component_QTY'] = asst_check['Total_Box_QTY'] * asst_check['Units_in_Assortment']
-                asst_check['Asst_QTY_OK'] = np.where(
-                    asst_check['Expected_Component_QTY'].notna() & asst_check['COMPONENT ASSORT QTY'].notna(),
-                    np.isclose(asst_check['Expected_Component_QTY'], asst_check['COMPONENT ASSORT QTY'], atol=0.5),
-                    True
-                )
-                # Map results back to merged_df
-                asst_check['Asst_QTY_Check'] = np.where(
-                    asst_check['Expected_Component_QTY'].isna() | asst_check['COMPONENT ASSORT QTY'].isna(),
-                    '⚪ N/A',
-                    np.where(asst_check['Asst_QTY_OK'], '✅ 數量相符', '❌ 數量不符')
-                )
-                # Store expected component qty
-                for idx_val, row_val in asst_check.iterrows():
-                    if idx_val in merged_df.index:
-                        merged_df.loc[idx_val, 'Asst_QTY_Check'] = row_val['Asst_QTY_Check']
-                        merged_df.loc[idx_val, 'Expected_Component_QTY'] = row_val.get('Expected_Component_QTY', np.nan)
-
-    if 'Expected_Component_QTY' not in merged_df.columns:
-        merged_df['Expected_Component_QTY'] = np.nan
+    # ---- N3: 零件數量展開：Box 箱數 × 每箱入數（混裝表）vs PO 零件數量 ----
+    merged_df['Expected_Component_QTY'] = np.where(
+        is_comp, pd.to_numeric(merged_df['Box_QTY'], errors='coerce') * merged_df['Units_in_Assortment'], np.nan)
+    merged_df['Asst_QTY_Check'] = np.where(
+        ~is_comp | merged_df['Expected_Component_QTY'].isna(), '⚪ N/A',
+        np.where((merged_df['Expected_Component_QTY'] - merged_df['Final_QTY']).abs() <= 0.5,
+                 '✅ 數量相符', '❌ 數量不符'))
 
     # ---- N4: Dispatch AC/AE 規則驗證 ----
     # 規則：AC follows factory（用 Factory Name 從 PCN 找 factory → dispatch AC 應與工廠一致）
@@ -1459,8 +1297,8 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None):
     統一結果顯示 + 彩色 + 摘要統計 + Excel 下載（含 GRID / 驗核摘要 / 執行摘要）
     """
     display_cols = [
-        'PO NUMBER', 'ASSORTMENT ITEM?', 'Asst_Role', 'Matched_Box_DPCI', 'Is_Shipper_Display', 'Original_DPCI', 'Final_DPCI',
-        'ITEM DESCRIPTION', 'Final_QTY', 'Final_QTY_for_count',
+        'PO NUMBER', 'DC', 'ASSORTMENT ITEM?', 'Asst_Role', 'Matched_Box_DPCI', 'Is_Shipper_Display', 'Original_DPCI', 'Final_DPCI',
+        'ITEM DESCRIPTION', 'Final_QTY', 'Box_QTY', 'Final_QTY_for_count',
         'Cost Match', 'ITEM UNIT COST', 'Target_Cost',
         'Retail Match', 'ITEM UNIT RETAIL', 'Suggested Unit Retail',
         'Case QTY Match', 'PO VCP / Assort QTY', 'Target Case / Assort QTY',
@@ -1581,68 +1419,68 @@ if True:
         if not product_files or not pdf_files:
             st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表」，並在上方上傳 PDF！")
         else:
-            all_parsed_dfs = []
-            all_parse_warnings = []
+            prog = st.progress(0.0, text="PDF 解析中...")
+            def _tick(i, n, name):
+                prog.progress(i / n, text=f"PDF 解析中 {i}/{n}：{name}（無文字層的 PDF 需 OCR，每份約 10–20 秒）")
+            po_df, pinfo = parse_po_pdfs(pdf_files, progress=_tick)
+            prog.empty()
 
-            ocr_pdf_names = []
-            with st.spinner("PDF 解析中..."):
-                for pdf_file in pdf_files:
-                    po_df_parsed, parse_warnings = parse_sps_pdf(pdf_file)
-                    for w in parse_warnings:
-                        if w == "__OCR_USED__":
-                            ocr_pdf_names.append(pdf_file.name)
-                        else:
-                            all_parse_warnings.append(w)
-                    if po_df_parsed is not None and len(po_df_parsed) > 0:
-                        all_parsed_dfs.append(po_df_parsed)
+            all_warnings = list(pinfo['warnings'])
 
-            # 彙整 OCR 警告（合併為一條訊息）
-            if ocr_pdf_names:
-                if len(ocr_pdf_names) == 1:
-                    st.info(f"ℹ️ 以下 PDF 為向量圖形格式（Target Import PO），已透過 OCR 辨識解析：{ocr_pdf_names[0]}")
-                else:
-                    with st.expander(f"ℹ️ {len(ocr_pdf_names)} 份 PDF 透過 OCR 解析（點擊展開檔名）", expanded=False):
-                        for n in ocr_pdf_names:
-                            st.write(f"• {n}")
-
-            # 顯示其他解析警告（非 OCR、非重複 PO）
-            for w in all_parse_warnings:
+            if pinfo['ocr_files']:
+                with st.expander(f"ℹ️ {len(pinfo['ocr_files'])} 份 PDF 無文字層，已透過 OCR 解析（點擊展開檔名）", expanded=False):
+                    for n in pinfo['ocr_files']:
+                        st.write(f"• {n}")
+            for w in pinfo['warnings']:
                 st.warning(w)
 
-            if not all_parsed_dfs:
+            if pinfo['cancelled']:
+                msg = [f"PO {c['po']}（取消通知：{c['file']}；已排除：{', '.join(c['dropped']) or '—'}）" for c in pinfo['cancelled']]
+                st.warning("🚫 **以下 PO 已被客人取消（CANCEL ORDER），不計入核對**：\n\n" + "\n\n".join("• " + m for m in msg))
+                all_warnings.append("已取消 PO（不計入）：" + ", ".join(c['po'] for c in pinfo['cancelled']))
+            if pinfo['superseded']:
+                with st.expander(f"⚠️ {len(pinfo['superseded'])} 張 PO 有多個版本，已採用最新版（點擊展開）", expanded=False):
+                    for s in pinfo['superseded']:
+                        st.write(f"• PO {s['po']}：採用 {s['kept']}，捨棄 {s['dropped']}（Total Qty {s['from_qty'] or '?'} → {s['to_qty'] or '?'}）")
+                all_warnings.append("多版本 PO（已取最新）：" + ", ".join(s['po'] for s in pinfo['superseded']))
+            if pinfo['duplicates']:
+                with st.expander(f"⚠️ {len(pinfo['duplicates'])} 組 PO 的品項與數量完全相同，請確認是否重複下單（點擊展開）", expanded=False):
+                    for g_ in pinfo['duplicates']:
+                        st.write("• " + " / ".join(g_))
+                all_warnings.append("品項與數量完全相同的 PO：" + "；".join(" / ".join(g_) for g_ in pinfo['duplicates']))
+            # ── G5 PO 內部一致性自我驗證（Σ行小計=PO Total、數量×單價=行小計、Σ數量=Total Qty）──
+            if pinfo['gate_problems']:
+                with st.expander(f"⚠️ G5 PO 內部驗算：{len(pinfo['gate_problems'])} 張 PO 未通過，該 PO 的解析結果請人工複核（點擊展開）", expanded=True):
+                    for gp in pinfo['gate_problems']:
+                        st.warning(f"PO {gp['po']}（{gp['file']}）：" + "；".join(gp['issues']))
+                all_warnings += [f"G5 驗算未過 PO {gp['po']}：" + "；".join(gp['issues']) for gp in pinfo['gate_problems']]
+
+            if len(po_df) == 0:
                 st.error("❌ 所有 PDF 均無法解析出訂單資料，請確認格式後再試。")
             else:
-                combined_po_df = pd.concat(all_parsed_dfs, ignore_index=True)
-                st.success(f"✅ 成功從 {len(pdf_files)} 份 PDF 解析出 {len(combined_po_df)} 筆訂單列。")
-
-                clean_po_df, dup_warnings = detect_duplicate_pos(combined_po_df)
-                all_warnings = all_parse_warnings + dup_warnings
-                # 彙整重複 PO 警告（折疊顯示，避免過多警告訊息）
-                if dup_warnings:
-                    if len(dup_warnings) == 1:
-                        st.warning(dup_warnings[0])
-                    else:
-                        with st.expander(f"⚠️ {len(dup_warnings)} 則重複 PO 偵測警告（點擊展開）", expanded=False):
-                            for w in dup_warnings:
-                                st.warning(w)
+                n_gate_ok = pinfo['n_pos'] - len(pinfo['gate_problems'])
+                st.success(f"✅ {pinfo['n_files']} 份 PDF → {pinfo['n_pos']} 張有效 PO、{len(po_df)} 筆品項列；"
+                           f"{n_gate_ok}/{pinfo['n_pos']} 張通過 PO 內部驗算。")
 
                 prod_df = process_products(product_files)
                 asst_df = process_assortments(asst_files) if asst_files else None
 
-                # ── G5 PO 內部一致性自我驗證 ──
-                self_verify_warnings = po_self_verify(clean_po_df, mode='standard')
-                if self_verify_warnings:
-                    with st.expander(f"⚠️ G5 PO 內部驗算：{len(self_verify_warnings)} 則警告（點擊展開）", expanded=True):
-                        for w in self_verify_warnings:
-                            st.warning(w)
-                all_warnings = all_warnings + self_verify_warnings
-
                 dispatch_arg = dispatch_df_global if len(dispatch_df_global) > 0 else None
-                merged_df = run_validation(clean_po_df, prod_df, asst_df, mode='standard', dispatch_df=dispatch_arg)
+                merged_df = run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=dispatch_arg)
+
+                # 主檔有計畫量但完全沒有 PO 的品項
+                if 'Ent Ttl Rcpt U' in prod_df.columns and 'DPCI' in prod_df.columns:
+                    ordered = set(merged_df.loc[merged_df['Row_Type'] != 'box', 'Final_DPCI'])
+                    pm = prod_df.drop_duplicates(subset=['DPCI'])
+                    not_ordered = pm[(pm['Ent Ttl Rcpt U'].fillna(0) > 0) & ~pm['DPCI'].isin(ordered)
+                                     & pm['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')]
+                    if len(not_ordered) > 0:
+                        st.warning(f"📭 主檔有計畫量但尚無 PO 的品項 {len(not_ordered)} 個：" + ", ".join(
+                            f"{d}（{int(q):,}）" for d, q in zip(not_ordered['DPCI'], not_ordered['Ent Ttl Rcpt U'])))
+                        all_warnings.append("尚無 PO 的品項：" + ", ".join(not_ordered['DPCI']))
 
                 run_meta = {
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'input_files': f"PDFs: {', '.join(f.name for f in pdf_files)} | Products: {', '.join(f.name for f in product_files)}"
+                    'input_files': f"PDFs: {pinfo['n_files']} files / {pinfo['n_pos']} POs | Products: {', '.join(f.name for f in product_files)}"
                 }
                 show_results(merged_df, 'PDF', run_meta=run_meta, validation_notes=all_warnings)
-
