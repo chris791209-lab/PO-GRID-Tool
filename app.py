@@ -887,53 +887,78 @@ def _grid_engine_dir():
 def extract_spk_images(xlsx_bytes, out_dir):
     """
     從 SPK Workspace 活頁簿抽出產品圖，依 DPCI 存成 <DPCI>.png。
-    多個工作表都有圖時只取 Products（Claims 是瑕疵照，不是產品照）。
-    回傳 (已存張數, 訊息 list)
+    - SPK 匯出通常沒有獨立的 DPCI 欄：DPCI 是「Product Description」開頭的 DDD-CC-XXXX，
+      所以在圖片所在列（及下方幾列）的所有儲存格裡找 DPCI 樣式，有 DPCI 欄時優先用它
+    - 同一品項每個打樣回合各一列，圖只錨在該組第一列；同一 DPCI 只取第一張
+    - 多個工作表都有圖時只取 Products（Claims 是瑕疵照，不是產品照）
+    回傳 (已存張數, 問題訊息 list)；成功時不回傳訊息
     """
     import openpyxl
     from PIL import Image as _PILImage
-    notes, saved = [], 0
+    dpci_re = re.compile(r'(?<!\d)(\d{3})-(\d{2})-(\d{4})(?!\d)')
     try:
         wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
     except Exception as e:
         return 0, [f"SPK 檔讀取失敗：{e}"]
     with_imgs = [ws for ws in wb.worksheets if getattr(ws, '_images', None)]
     if not with_imgs:
-        return 0, ["SPK 檔內找不到浮動圖片（若圖片是「儲存格內圖片」格式，請改上傳圖片 zip）。"]
-    if len(with_imgs) > 1:
-        prod = [ws for ws in with_imgs if ws.title.strip().lower() == 'products']
-        if prod:
-            notes.append(f"SPK 有 {len(with_imgs)} 個工作表含圖片，只取 Products。")
-            with_imgs = prod
+        return 0, ["檔案內找不到產品圖（若圖片是「儲存格內圖片」格式，請改上傳圖片 zip）。"]
+    prod = [ws for ws in with_imgs if ws.title.strip().lower() == 'products']
+    if len(with_imgs) > 1 and prod:
+        with_imgs = prod
+
+    saved, done = 0, set()
     for ws in with_imgs:
-        dpci_col = None
-        for row in ws.iter_rows(min_row=1, max_row=15):
+        # 表頭裡有 DPCI 欄就優先看那一欄，其次 Product Description
+        pref_cols = []
+        for row in ws.iter_rows(min_row=1, max_row=20):
             for c in row:
-                if isinstance(c.value, str) and c.value.strip().upper() == 'DPCI':
-                    dpci_col, hdr_row = c.column, c.row
-                    break
-            if dpci_col:
+                if isinstance(c.value, str):
+                    h = c.value.strip().lower()
+                    if h == 'dpci' or h.startswith('dpci'):
+                        pref_cols.insert(0, c.column)
+                    elif 'product description' in h:
+                        pref_cols.append(c.column)
+            if pref_cols:
                 break
-        if not dpci_col:
-            notes.append(f"工作表 {ws.title}：找不到 DPCI 欄，已略過。")
-            continue
-        missing = 0
+
+        def dpci_in_row(r):
+            cells = [ws.cell(r, col).value for col in pref_cols]
+            cells += [c.value for c in ws[r]]
+            for v in cells:
+                if v is None:
+                    continue
+                m = dpci_re.search(str(v).replace('/', '-'))
+                if m:
+                    return '%s-%s-%s' % m.groups()
+            return None
+
+        anchored = []
         for img in ws._images:
             try:
-                r = img.anchor._from.row + 1
-                v = ws.cell(r, dpci_col).value
-                d = re.sub(r'[\s ]', '', str(v or '')).replace('/', '-')
-                if not re.match(r'^\d{3}-\d{2}-\d{4}$', d):
-                    missing += 1
-                    continue
+                anchored.append((img.anchor._from.row + 1, img))
+            except Exception:
+                continue
+        for r, img in sorted(anchored, key=lambda x: x[0]):
+            d = None
+            for rr in range(r, r + 4):           # 圖可能錨在 DPCI 那列的上緣
+                d = dpci_in_row(rr)
+                if d:
+                    break
+            if not d or d in done:
+                continue
+            try:
                 im = _PILImage.open(io.BytesIO(img._data()))
+                if im.mode not in ('RGB', 'RGBA'):
+                    im = im.convert('RGBA')
                 im.save(os.path.join(out_dir, d + '.png'))
+                done.add(d)
                 saved += 1
             except Exception:
-                missing += 1
-        if missing:
-            notes.append(f"工作表 {ws.title}：{missing} 張圖片所在列沒有有效 DPCI，已略過。")
-    return saved, notes
+                continue
+    if saved == 0:
+        return 0, ["檔案內有圖片，但找不到對應的 DPCI（Product Description 開頭或 DPCI 欄），未能放入 GRID。"]
+    return saved, []
 
 
 def collect_grid_images(image_files, out_dir):
@@ -1838,7 +1863,7 @@ dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.
 
 st.sidebar.markdown("---")
 st.sidebar.header("📊 步驟 3（選填）：PO GRID")
-st.sidebar.caption("核對完成後會一併產生 PO GRID（每間工廠一個工作表）。以下三項都可以不填。")
+st.sidebar.caption("核對完成後會一併產生一份新的 PO GRID（每間工廠一個工作表）。以下三項都可以不填。")
 grid_title_input = st.sidebar.text_input(
     "GRID 標題", value="", placeholder="例：D240 27C2 EASTER",
     help="顯示在每個工作表左上角，也會用在下載的檔名。空白時用產品資料表的檔名。")
@@ -1850,12 +1875,11 @@ st.sidebar.caption("放進 GRID 的 PICTURE 欄，二選一或混用：\n\n"
 grid_image_files = st.sidebar.file_uploader(
     "產品圖片", type=['zip', 'xlsx', 'xlsm', 'png', 'jpg', 'jpeg'],
     accept_multiple_files=True, key="grid_imgs", label_visibility="collapsed")
-st.sidebar.markdown("**上一版 PO GRID**")
-st.sidebar.caption("• **不上傳** → 用本次上傳的全部 PO 產生一份全新的 GRID（第一次做、或想重整版面時用）\n\n"
-                   "• **上傳** → 在這份 GRID 上補數量、為新 PO 加欄，原檔的圖片與手填內容（AGE、工廠料號等）都保留。"
-                   "若有新品項需要加列，會另外附一份全新版本。")
+st.sidebar.markdown("**更新 PO GRID**")
+st.sidebar.caption("要在現有的 PO GRID 上加入新 PO 時，把那份 GRID 上傳到這裡。"
+                   "會在原檔上補入數量、為新 PO 加欄，原檔的圖片與手填內容（AGE、工廠料號等）都保留。")
 grid_existing_file = st.sidebar.file_uploader(
-    "上一版 PO GRID", type=['xlsx'], key="grid_existing", label_visibility="collapsed")
+    "更新 PO GRID", type=['xlsx'], key="grid_existing", label_visibility="collapsed")
 
 # ==========================================
 # 主介面：PDF 上傳解析
@@ -1960,69 +1984,80 @@ if True:
                 # ── PO GRID：有上傳既有 GRID → 更新；否則重建 ──
                 grid_title = grid_title_input.strip() or summary_ctx['title']
                 with st.spinner("PO GRID 產生中..."):
-                    gres = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
-                                           grid_image_files or [], grid_existing_file, grid_title)
-                    grebuild = None
-                    if gres['ok'] and gres['mode'] == 'update':
-                        no_row = [x for x in gres['report'].get('needs_attention', []) if x.get('dpci')]
-                        if no_row:      # 既有 GRID 缺列 → 另外提供一份完整重建版
-                            grebuild = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
-                                                       grid_image_files or [], None, grid_title)
-                st.session_state['grid_out'] = {'main': gres, 'rebuild': grebuild}
+                    gnew = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
+                                           grid_image_files or [], None, grid_title)
+                    gupd = None
+                    if grid_existing_file is not None:
+                        gupd = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
+                                               [], grid_existing_file, grid_title)
+                st.session_state['grid_out'] = {'new': gnew, 'update': gupd}
 
 
 def render_grid_section(go):
     """PO GRID 結果與下載（存在 session_state，按下載後不會消失）。"""
-    gres, grebuild = go['main'], go.get('rebuild')
+    xlsx_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     st.markdown("---")
     st.markdown("### 📊 PO GRID")
-    for n in gres['notes']:
-        st.warning(n)
-    if not gres['ok']:
-        st.error("PO GRID 未能產生。")
-        with st.expander("技術訊息"):
-            st.code(gres['log'][-3000:])
-        return
-    rep_ = gres['report']
-    xlsx_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    if gres['mode'] == 'create':
-        n_items = rep_.get('item_count', 0) or 0
-        st.success(f"✅ 已依本次全部 PO 產生新的 PO GRID：{rep_.get('sheet_count', '?')} 間工廠（每間一個工作表）、"
-                   f"{n_items:,} 個品項，產品圖片 {rep_.get('image_count', 0):,} / {n_items:,} 張。")
-        if rep_.get('no_image') and rep_.get('images_supplied'):
-            with st.expander(f"🖼️ {len(rep_['no_image'])} 個品項找不到對應圖片，PICTURE 欄留空（點擊展開）"):
-                st.write(", ".join(rep_['no_image']))
-        elif not rep_.get('images_supplied'):
-            st.caption("PICTURE 欄目前是空的。要放產品圖，請在左側「步驟 3 › 產品圖片」上傳圖片 zip 或 SPK 檔，"
-                       "再按一次「解析 PDF 並執行核對」。")
-        if rep_.get('unmapped_dc'):
-            st.warning("以下 DC 代碼尚無確認過的目的地，DES PORT 列直接顯示代碼，請人工確認：" +
-                       "；".join(f"{dc}（PO {', '.join(pos)}）" for dc, pos in rep_['unmapped_dc'].items()))
-        st.download_button("📥 下載 PO GRID", data=gres['data'], file_name=gres['filename'],
-                           mime=xlsx_mime, key="dl_grid_main")
-    else:
+
+    gnew = go.get('new')
+    if gnew is not None:
+        for n in gnew['notes']:
+            st.warning(n)
+        if not gnew['ok']:
+            st.error("PO GRID 未能產生。")
+            with st.expander("技術訊息"):
+                st.code(gnew['log'][-3000:])
+        else:
+            rep_ = gnew['report']
+            n_items = rep_.get('item_count', 0) or 0
+            st.success(f"✅ 已依本次全部 PO 產生新的 PO GRID：{rep_.get('sheet_count', '?')} 間工廠（每間一個工作表）、"
+                       f"{n_items:,} 個品項，產品圖片 {rep_.get('image_count', 0):,} / {n_items:,} 張。")
+            if rep_.get('no_image') and rep_.get('images_supplied'):
+                with st.expander(f"🖼️ {len(rep_['no_image'])} 個品項找不到對應圖片，PICTURE 欄留空（點擊展開）"):
+                    st.write(", ".join(rep_['no_image']))
+            elif not rep_.get('images_supplied'):
+                st.caption("PICTURE 欄目前是空的。要放產品圖，請在左側「步驟 3 › 產品圖片」上傳圖片 zip 或 SPK 檔，"
+                           "再按一次「解析 PDF 並執行核對」。")
+            if rep_.get('unmapped_dc'):
+                st.warning("以下 DC 代碼尚無確認過的目的地，DES PORT 列直接顯示代碼，請人工確認：" +
+                           "；".join(f"{dc}（PO {', '.join(pos)}）" for dc, pos in rep_['unmapped_dc'].items()))
+            st.download_button("📥 下載 PO GRID", data=gnew['data'], file_name=gnew['filename'],
+                               mime=xlsx_mime, key="dl_grid_new")
+
+    gupd = go.get('update')
+    if gupd is not None:
+        st.markdown("#### 🔄 更新後的 PO GRID")
+        for n in gupd['notes']:
+            st.warning(n)
+        if not gupd['ok']:
+            st.error("上傳的 PO GRID 未能更新（版面可能與標準 GRID 不同），請改用上方新產生的 PO GRID。")
+            with st.expander("技術訊息"):
+                st.code(gupd['log'][-3000:])
+            return
+        rep_ = gupd['report']
         ins = rep_.get('inserted', [])
-        st.success(f"已更新既有 PO GRID：寫入 {len(rep_.get('written', []))} 格數量、新增 {len(ins)} 個 PO 欄；"
-                   f"原有圖片 {rep_.get('media_before', 0)} 張{'完整保留' if rep_.get('image_integrity') else '請檢查'}。")
+        st.success(f"✅ 已更新上傳的 PO GRID：寫入 {len(rep_.get('written', [])):,} 格數量、新增 {len(ins)} 個 PO 欄；"
+                   f"原檔圖片 {rep_.get('media_before', 0):,} 張"
+                   f"{'與手填內容完整保留' if rep_.get('image_integrity') else '，請開檔確認'}。")
         if ins:
-            with st.expander(f"➕ 新增的 PO 欄（{len(ins)}）", expanded=True):
+            with st.expander(f"➕ 新增的 PO 欄（{len(ins)}）", expanded=False):
                 st.dataframe(pd.DataFrame([{'工作表': i.get('sheet'), 'PO': i.get('po'), '欄': i.get('column'),
                                             '類型': i.get('label'), 'Ship Window': i.get('window'),
                                             '目的地': i.get('dest'), '備註': i.get('note', '')} for i in ins]),
                              hide_index=True, use_container_width=True)
         att = rep_.get('needs_attention', [])
+        no_row = [x for x in att if x.get('dpci')]
         if att:
             with st.expander(f"⚠️ {len(att)} 項需要人工處理（點擊展開）", expanded=True):
+                if no_row:
+                    st.caption(f"其中 {len(no_row)} 個品項在上傳的 GRID 裡沒有列，更新無法自動加列；"
+                               "可手動加列，或直接改用上方新產生的 PO GRID。")
                 st.dataframe(pd.DataFrame([{'工作表': x.get('sheet', ''), 'DPCI': x.get('dpci', ''),
                                             'PO': x.get('po') or ', '.join(x.get('pos', [])),
                                             '問題': x.get('issue', ''), '建議': x.get('next_step', '')} for x in att]),
                              hide_index=True, use_container_width=True)
-        st.download_button("📥 下載 PO GRID（更新版，保留原檔圖片與手填內容）", data=gres['data'],
-                           file_name=gres['filename'], mime=xlsx_mime, key="dl_grid_main")
-        if grebuild and grebuild['ok']:
-            st.info("既有 GRID 缺少部分品項的列，更新模式無法新增列。另外提供一份完整重建版（不含原檔的手填內容）。")
-            st.download_button("📥 下載 PO GRID（完整重建版）", data=grebuild['data'],
-                               file_name=grebuild['filename'], mime=xlsx_mime, key="dl_grid_rebuild")
+        st.download_button("📥 下載更新後的 PO GRID", data=gupd['data'], file_name=gupd['filename'],
+                           mime=xlsx_mime, key="dl_grid_update")
 
 
 # ── 結果區：放在按鈕區塊外、存在 session_state，按下載或展開明細後畫面不會消失 ──
