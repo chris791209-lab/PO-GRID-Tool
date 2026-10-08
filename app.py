@@ -1492,7 +1492,7 @@ def build_validation_summary(merged_df, ctx=None):
     qm = m[not_box & (m['Total QTY Match'] == False) & m['Target Commit QTY'].notna()].drop_duplicates('Final_DPCI')
     qty_df = pd.DataFrame([{
         'DPCI': r['Final_DPCI'], '品名': str(r[desc_col])[:60] if desc_col and pd.notna(r[desc_col]) else '',
-        '已下單（含 Box 內含）': r['PO Total QTY'], '計畫 Ent Ttl Rcpt U': r['Target Commit QTY'],
+        'PO 數量（含 Assortment 內含）': r['PO Total QTY'], 'PCN Commit Qty': r['Target Commit QTY'],
         '差異': r['QTY Diff'], '差異 %': r['QTY Diff %'], 'Case Pack': r.get('Case Unit Quantity', np.nan)}
         for _, r in qm.iterrows()])
     # 5. 混裝不符（零件數量 ≠ 箱數 × 每箱入數，或 Box／零件不在混裝表）
@@ -1555,7 +1555,7 @@ def build_validation_summary(merged_df, ctx=None):
         ('已下單總數量', f"{ordered:,.0f}"),
     ]
     if plan:
-        headline.append(('計畫總量 / 達成率', f"{plan:,.0f} / {ordered / plan * 100:.1f}%"))
+        headline.append(('PCN Commit Qty / 達成率', f"{plan:,.0f} / {ordered / plan * 100:.1f}%"))
     headline.append(('結論', '全部檢核通過' if n_review == 0 else f'{n_review} 項需確認（見下方明細）'))
     return checks, details, headline
 
@@ -1650,91 +1650,6 @@ def make_excel_bytes(result_df, run_meta, source_label, validation_notes=None, m
             max_len = max((len(str(cell.value)) for cell in col_cells if cell.value), default=8)
             ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 30)
 
-        # ---- Sheet 2: PO GRID（N1）----
-        if merged_df_full is not None:
-            grid_df = build_po_grid(merged_df_full)
-        else:
-            grid_df = build_po_grid(result_df)
-
-        if len(grid_df) > 0:
-            # 清理 emoji
-            grid_clean = grid_df.copy()
-            for col in grid_clean.columns:
-                if grid_clean[col].dtype == object:
-                    grid_clean[col] = grid_clean[col].astype(str).apply(strip_emoji)
-            grid_clean.to_excel(writer, sheet_name='PO GRID', index=False)
-
-            ws_grid = writer.sheets['PO GRID']
-            ws_grid.freeze_panes = 'B2'
-
-            # 嘗試套用顏色：QTY vs PLAN 欄 — 紅色代表超出 ±10%
-            try:
-                from openpyxl.styles import PatternFill, Font
-                header_row = [cell.value for cell in ws_grid[1]]
-                if 'QTY vs PLAN' in header_row:
-                    diff_col_idx = header_row.index('QTY vs PLAN') + 1
-                    plan_col_idx = header_row.index('PLAN QTY') + 1 if 'PLAN QTY' in header_row else None
-                    red_fill = PatternFill(start_color='FFCCCC', end_color='FFCCCC', fill_type='solid')
-                    green_fill = PatternFill(start_color='CCFFCC', end_color='CCFFCC', fill_type='solid')
-                    for row_idx in range(2, ws_grid.max_row + 1):
-                        diff_cell = ws_grid.cell(row=row_idx, column=diff_col_idx)
-                        plan_cell = ws_grid.cell(row=row_idx, column=plan_col_idx) if plan_col_idx else None
-                        try:
-                            diff_val = float(diff_cell.value or 0)
-                            plan_val = float(plan_cell.value or 0) if plan_cell else 0
-                            if plan_val > 0:
-                                pct = abs(diff_val) / plan_val
-                                if pct > 0.10:
-                                    diff_cell.fill = red_fill
-                                else:
-                                    diff_cell.fill = green_fill
-                        except (ValueError, TypeError):
-                            pass
-            except Exception:
-                pass  # 顏色套用失敗不影響主功能
-
-            for col_cells in ws_grid.columns:
-                max_len = max((len(str(cell.value)) for cell in col_cells if cell.value), default=8)
-                ws_grid.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 20)
-
-        # ---- Sheet 3: 驗核摘要（N5）----
-        check_cols = ['Cost Match', 'Retail Match', 'Case QTY Match', 'Total QTY Match']
-        summary_rows = []
-        for c in check_cols:
-            if c in result_df.columns:
-                n_fail = int((result_df[c] == False).sum())
-                n_pass = int((result_df[c] == True).sum())
-                summary_rows.append({'檢核項目': c, '相符筆數': n_pass, '異常筆數': n_fail, '建議動作': '請確認 PO 內容' if n_fail > 0 else '無需處理'})
-
-        # UPC
-        upc_fail = int((result_df.get('UPC Status', pd.Series()) == '❌ 不符').sum())
-        upc_na = int((result_df.get('UPC Status', pd.Series()) == '⚪ 無資料').sum())
-        summary_rows.append({'檢核項目': 'UPC', '相符筆數': total - upc_fail - upc_na, '異常筆數': upc_fail, '建議動作': '請確認條碼' if upc_fail > 0 else '無需處理'})
-
-        # Assortment cost
-        # Factory match
-        factory_fail = int((result_df.get('Factory_Match_Status', pd.Series()) == '⚠️ 工廠不符').sum())
-        if factory_fail > 0:
-            summary_rows.append({'檢核項目': 'Factory 工廠比對 (N6)', '相符筆數': 0, '異常筆數': factory_fail, '建議動作': '請確認 PCN 工廠與 Dispatch 清單是否一致'})
-
-        # Skipped DPCIs (no PCN match)
-        no_prod_match = int(result_df['Target_Cost'].isna().sum()) if 'Target_Cost' in result_df.columns else 0
-        if no_prod_match > 0:
-            summary_rows.append({'檢核項目': '無 PCN 對應 (略過)', '相符筆數': 0, '異常筆數': no_prod_match, '建議動作': '請確認 PCN 是否包含所有 DPCI'})
-
-        # Add validation notes
-        if validation_notes:
-            for note in validation_notes:
-                summary_rows.append({'檢核項目': '系統警告', '相符筆數': 0, '異常筆數': 1, '建議動作': strip_emoji(note)[:200]})
-
-        val_summary_df = pd.DataFrame(summary_rows)
-        val_summary_df.to_excel(writer, sheet_name='驗核摘要', index=False)
-        ws_val = writer.sheets['驗核摘要']
-        ws_val.freeze_panes = 'A2'
-        for col_cells in ws_val.columns:
-            max_len = max((len(str(cell.value)) for cell in col_cells if cell.value), default=10)
-            ws_val.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 50)
-
         # ---- Sheet 4: 執行摘要（G8）----
         summary_data = {
             '項目': ['執行時間', '資料來源', '總筆數', '全部相符', '發現異常', '相符率 (%)',
@@ -1784,11 +1699,7 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
         'All Match (Pass)'
     ]
     result_df = merged_df[[c for c in display_cols if c in merged_df.columns]].copy()
-    errors_df = result_df[result_df['All Match (Pass)'] == False]
-
-    total = len(result_df)
-    pass_count = (result_df['All Match (Pass)'] == True).sum()
-    fail_count = (result_df['All Match (Pass)'] == False).sum()
+    result_df = result_df.rename(columns={'Target Commit QTY': 'PCN Commit Qty'})
 
     # ── 總結（與 Excel 第一頁相同）──
     checks, details, headline = build_validation_summary(merged_df, summary_ctx)
@@ -1802,71 +1713,39 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
     for dtitle, ddf in details:
         with st.expander(f"{dtitle}（{len(ddf)}）", expanded=len(ddf) <= 10 and '已略過' not in dtitle and '其他 Program' not in dtitle):
             st.dataframe(ddf, hide_index=True, use_container_width=True)
-    st.markdown("---")
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("📋 總筆數", total)
-    col2.metric("✅ 全部相符", pass_count)
-    col3.metric("❌ 發現異常", fail_count)
-
-    if fail_count > 0:
-        check_cols = ['Cost Match', 'Retail Match', 'Case QTY Match', 'Total QTY Match']
-        col_errors = {c: int((result_df[c] == False).sum()) for c in check_cols if c in result_df.columns}
-        upc_mismatch = int((result_df.get('UPC Status', pd.Series()) == '❌ 不符').sum())
-        if upc_mismatch > 0:
-            col_errors['UPC 不符'] = upc_mismatch
-        factory_mismatch = int((result_df.get('Factory_Match_Status', pd.Series()) == '⚠️ 工廠不符').sum())
-        if factory_mismatch > 0:
-            col_errors['Factory 工廠不符 (N6)'] = factory_mismatch
-
-        st.markdown("**各欄位異常數**")
-        err_summary = pd.DataFrame({'欄位': list(col_errors.keys()), '異常筆數': list(col_errors.values())})
-        st.dataframe(err_summary, hide_index=True)
-
-        st.markdown("**❌ 異常明細**")
-        st.dataframe(style_result(errors_df), use_container_width=True)
+    # ── 逐筆異常（只列有問題的 PO 品項列；完整逐筆結果在 Excel「核對結果」）──
+    errors_df = result_df[result_df['All Match (Pass)'] == False]
+    if len(errors_df) == 0:
+        st.success("🎉 所有品項列皆一致！")
     else:
-        st.balloons()
-        st.success("🎉 所有資料皆一致！")
+        screen_cols = {
+            'PO NUMBER': 'PO', 'DC': 'DC', 'Asst_Role': '類型', 'Final_DPCI': 'DPCI',
+            'Final_QTY': 'PO 數量', 'ITEM UNIT COST': 'PO 單價', 'Target_Cost': '主檔成本',
+            'ITEM UNIT RETAIL': 'PO 零售', 'Suggested Unit Retail': '主檔零售',
+            'PO Total QTY': 'DPCI 合計', 'PCN Commit Qty': 'PCN Commit Qty', 'QTY Diff %': '差異 %',
+            'UPC Status': 'UPC', 'Cost Match': '成本', 'Retail Match': '零售', 'Total QTY Match': '數量'}
+        view = errors_df[[c for c in screen_cols if c in errors_df.columns]].rename(columns=screen_cols)
+        if '類型' in view.columns:
+            view['類型'] = view['類型'].astype(str).str.replace(r'^[^\w(]+', '', regex=True)
+        fmt = {c: '{:,.0f}' for c in ['PO 數量', 'DPCI 合計', 'PCN Commit Qty'] if c in view.columns}
+        fmt.update({c: '{:g}' for c in ['PO 單價', '主檔成本', 'PO 零售', '主檔零售', '差異 %'] if c in view.columns})
+        bool_cols = [c for c in ['成本', '零售', '數量'] if c in view.columns]
+        def _bad(v):
+            return 'background-color: #F8CBAD; color: #000' if v is False or v == False else ''
+        styler = view.style.format(fmt, na_rep='')
+        styler = styler.map(_bad, subset=bool_cols) if hasattr(styler, 'map') else styler.applymap(_bad, subset=bool_cols)
+        with st.expander(f"❌ 逐筆異常明細（{len(errors_df)} 筆 PO 品項列）", expanded=False):
+            st.dataframe(styler, hide_index=True, use_container_width=True)
+            st.caption("完整逐筆核對結果（含相符的列與所有欄位）請見下載的 Excel「核對結果」工作表。")
 
-    st.markdown("**📄 完整核對結果**")
-    st.dataframe(style_result(result_df), use_container_width=True)
-
-    # N1: 預覽 PO GRID
-    st.markdown("---")
-    st.markdown("**📊 PO GRID 訂購矩陣**")
-    grid_df = build_po_grid(merged_df)
-    if len(grid_df) > 0:
-        # 顏色標示 QTY vs PLAN
-        if 'QTY vs PLAN' in grid_df.columns and 'PLAN QTY' in grid_df.columns:
-            def color_grid_row(row):
-                styles = [''] * len(row)
-                try:
-                    diff = float(row.get('QTY vs PLAN', 0) or 0)
-                    plan = float(row.get('PLAN QTY', 0) or 0)
-                    if plan > 0 and abs(diff) / plan > 0.10:
-                        return ['background-color: #FFCCCC'] * len(row)
-                except (ValueError, TypeError):
-                    pass
-                return styles
-            st.dataframe(grid_df.style.apply(color_grid_row, axis=1), use_container_width=True)
-        else:
-            st.dataframe(grid_df, use_container_width=True)
-    else:
-        st.info("GRID 矩陣暫無資料（需有 PO NUMBER 與 Final_DPCI）。")
-
-    # 下載 Excel（N1 GRID + N5 摘要 + G8 執行摘要）
-    run_meta = run_meta or {'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'input_files': source_label}
-    excel_bytes = make_excel_bytes(result_df, run_meta, source_label, validation_notes=validation_notes, merged_df_full=merged_df, summary_ctx=summary_ctx)
-    safe_label = re.sub(r'[^\w\-]', '_', source_label)
-    st.session_state['last_report'] = {
-        'data': excel_bytes, 'name': f'PO_Validation_{safe_label}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'}
-    st.download_button(
-        "📥 下載完整核對報告 (Excel：核對結果 + PO GRID + 驗核摘要 + 執行摘要)",
-        data=excel_bytes,
-        file_name=f'PO_Validation_{safe_label}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx',
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
+    # 報表只產生一次，存起來供下載（按下載不會重算、結果不會消失）
+    res = st.session_state.get('results')
+    if res is not None and res.get('excel') is None:
+        run_meta = run_meta or {'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'input_files': source_label}
+        res['excel'] = make_excel_bytes(result_df, run_meta, source_label, validation_notes=validation_notes,
+                                        merged_df_full=merged_df, summary_ctx=summary_ctx)
+        res['excel_name'] = f'PO_Validation_{re.sub(r"[^\w\-]", "_", source_label)}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'
 
 # ==========================================
 # 8. Streamlit 網頁介面
@@ -1912,7 +1791,7 @@ if True:
 
     if st.button("🚀 解析 PDF 並執行核對", type="primary", key="btn_pdf"):
         st.session_state.pop('grid_out', None)
-        st.session_state.pop('last_report', None)
+        st.session_state.pop('results', None)
         if not product_files or not pdf_files:
             st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表」，並在上方上傳 PDF！")
         else:
@@ -1987,12 +1866,10 @@ if True:
                     not_ordered = pm[(pm['Ent Ttl Rcpt U'].fillna(0) > 0) & ~pm['DPCI'].isin(ordered)
                                      & pm['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')]
                     if len(not_ordered) > 0:
-                        st.warning(f"📭 主檔有計畫量但尚無 PO 的品項 {len(not_ordered)} 個：" + ", ".join(
-                            f"{d}（{int(q):,}）" for d, q in zip(not_ordered['DPCI'], not_ordered['Ent Ttl Rcpt U'])))
                         all_warnings.append("尚無 PO 的品項：" + ", ".join(not_ordered['DPCI']))
                         dcol = 'Product Description' if 'Product Description' in not_ordered.columns else None
                         summary_ctx['not_ordered'] = [
-                            {'DPCI': d, '品名': (str(n)[:60] if dcol else ''), '計畫 Ent Ttl Rcpt U': int(q)}
+                            {'DPCI': d, '品名': (str(n)[:60] if dcol else ''), 'PCN Commit Qty': int(q)}
                             for d, n, q in zip(not_ordered['DPCI'],
                                                not_ordered[dcol] if dcol else [''] * len(not_ordered),
                                                not_ordered['Ent Ttl Rcpt U'])]
@@ -2001,7 +1878,8 @@ if True:
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'input_files': f"PDFs: {pinfo['n_files']} files / {pinfo['n_pos']} POs | Products: {', '.join(f.name for f in product_files)}"
                 }
-                show_results(merged_df, 'PDF', run_meta=run_meta, validation_notes=all_warnings, summary_ctx=summary_ctx)
+                st.session_state['results'] = {'merged_df': merged_df, 'run_meta': run_meta, 'notes': all_warnings,
+                                               'ctx': summary_ctx, 'excel': None}
 
                 # ── PO GRID：有上傳既有 GRID → 更新；否則重建 ──
                 grid_title = grid_title_input.strip() or summary_ctx['title']
@@ -2067,11 +1945,14 @@ def render_grid_section(go):
             st.info("既有 GRID 缺少部分品項的列，更新模式無法新增列。另外提供一份完整重建版（不含原檔的手填內容）。")
             st.download_button("📥 下載 PO GRID（完整重建版）", data=grebuild['data'],
                                file_name=grebuild['filename'], mime=xlsx_mime, key="dl_grid_rebuild")
-    if st.session_state.get('last_report'):
-        lr = st.session_state['last_report']
-        st.download_button("📥 下載核對報告 (Excel)", data=lr['data'], file_name=lr['name'], mime=xlsx_mime,
-                           key="dl_report_persist")
 
 
+# ── 結果區：放在按鈕區塊外、存在 session_state，按下載或展開明細後畫面不會消失 ──
+if st.session_state.get('results'):
+    _r = st.session_state['results']
+    show_results(_r['merged_df'], 'PDF', run_meta=_r['run_meta'], validation_notes=_r['notes'], summary_ctx=_r['ctx'])
+    st.download_button("📥 下載核對報告 (Excel：Validation Summary + 核對結果 + 執行摘要)", data=_r['excel'],
+                       file_name=_r['excel_name'],
+                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', key="dl_report")
 if st.session_state.get('grid_out'):
     render_grid_section(st.session_state['grid_out'])
