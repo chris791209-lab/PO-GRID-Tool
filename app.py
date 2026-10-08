@@ -1945,8 +1945,11 @@ def build_factory_map(prod_df, dispatch):
         })
     df = pd.DataFrame(rows)
     df['_o'] = df['對應依據'].str.startswith('未能').astype(int)
-    df = df.sort_values(['_o', 'AC', '分派表工廠']).drop(columns='_o').reset_index(drop=True)
-    return df[['分派表工廠', 'PCN 工廠名稱', 'AC', 'AE（Program）', '品項數（分派表）', '品項數（PCN）', '對應依據']]
+    # 對不上的工廠在名稱欄直接標示，不另外顯示「對應依據」欄
+    df.loc[df['PCN 工廠名稱'] == '（PCN 沒有）', 'PCN 工廠名稱'] = '（PCN 沒有，請人工確認）'
+    df.loc[df['分派表工廠'] == '（分派表沒有）', '分派表工廠'] = '（分派表沒有，請人工確認）'
+    df = df.sort_values(['_o', 'AC', '分派表工廠'], ascending=[False, True, True]).drop(columns='_o').reset_index(drop=True)
+    return df[['分派表工廠', 'PCN 工廠名稱', 'AC', 'AE（Program）', '品項數（分派表）', '品項數（PCN）']]
 
 
 def build_validation_summary(merged_df, ctx=None):
@@ -2039,7 +2042,7 @@ def build_validation_summary(merged_df, ctx=None):
     ]
     fmap = ctx.get('factory_map')
     if isinstance(fmap, pd.DataFrame) and len(fmap) > 0:
-        n_bad = int(fmap['對應依據'].str.startswith('未能').sum())
+        n_bad = int((fmap['PCN 工廠名稱'].str.contains('請人工確認') | fmap['分派表工廠'].str.contains('請人工確認')).sum())
         checks.append(('工廠 → AC / AE 對照：未能對應的工廠', n_bad, st_(n_bad)))
     for title, df in [
         ('PO 品項不在 PCN — 明細', unk_df), ('成本不符 — 明細', cost_df), ('零售不符 — 明細', retail_df),
