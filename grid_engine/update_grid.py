@@ -307,6 +307,34 @@ def cell_style(xml, ref):
     return m.group(1) if m else '0'
 
 
+# PO-type fills — must match build_grid.py's TYPE_FILL (and verify_layout.py)
+TYPE_FILL = {'TS': 'FFF2CC', 'T1': 'E2EFDA', 'T2': 'DDEBF7', 'T3': 'E4DFEC', 'H1': 'D9E1F2',
+             'H3': 'EDEDED', 'BAS': 'FCE4D6', 'SEA': 'D9D2E9', 'SET': 'D0E0E3',
+             'NWT': 'FFF2CC', 'SPO': 'E2EFDA'}
+
+
+def clone_style_with_fill(base, xf_id, hex_rgb):
+    """Append a copy of cellXfs[xf_id] whose fill is a solid hex_rgb; return the new xf index.
+    Used when a PO-type label is new to the workbook, so the inserted column gets the
+    correct colour instead of the neighbour's."""
+    p = os.path.join(base, 'xl', 'styles.xml')
+    x = open(p, encoding='utf-8').read()
+    m = re.search(r'(<cellXfs\b[^>]*>)(.*?)(</cellXfs>)', x, re.S)
+    xfs = re.findall(r'<xf\b[^>]*/>|<xf\b[^>]*>.*?</xf>', m.group(2), re.S)
+    src = xfs[int(xf_id)] if xf_id is not None and int(xf_id) < len(xfs) else '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    fill = ('<fill><patternFill patternType="solid"><fgColor rgb="FF%s"/>'
+            '<bgColor indexed="64"/></patternFill></fill>' % hex_rgb)
+    x, fill_id = _append_children(x, 'fills', 'fill', [fill])
+    new_xf = re.sub(r'fillId="\d+"', 'fillId="%d"' % fill_id, src, count=1)
+    if 'fillId=' not in new_xf:
+        new_xf = new_xf.replace('<xf ', '<xf fillId="%d" ' % fill_id, 1)
+    if 'applyFill' not in new_xf:
+        new_xf = new_xf.replace('<xf ', '<xf applyFill="1" ', 1)
+    x, new_id = _append_children(x, 'cellXfs', 'xf', [new_xf])
+    open(p, 'w', encoding='utf-8').write(x)
+    return str(new_id)
+
+
 def find_type_style(sheets_xml, label):
     """Style ids already used for this PO-type label, as (row1, row3).
 
@@ -381,6 +409,211 @@ def rewrite_totals(xml, total_col_num, first_po, last_po):
 
 
 VALIDATION_SHEET = 'Validation Summary'
+
+
+# ---------------------------------------------------------------------------
+# Optional: rewrite the Validation Summary tab from a caller-supplied summary
+# (--summary-json). Used by the TG Team PO platform so the updated GRID shows
+# the same Chinese summary as its validation report, followed by this run's
+# call-outs. Pure XML: new styles are appended to styles.xml, the summary
+# sheet's sheetData is replaced, nothing else in the workbook is touched.
+# ---------------------------------------------------------------------------
+def _xml_text(v):
+    return (str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            .replace('"', '&quot;'))
+
+
+def _append_children(x, tag, child, new_items):
+    """Append child elements to <tag> in styles.xml; return (xml, first new index)."""
+    m = re.search(r'<%s\b[^>]*/>' % tag, x)
+    if m:                                   # self-closing, empty
+        x = x[:m.start()] + '<%s count="0"></%s>' % (tag, tag) + x[m.end():]
+    m = re.search(r'(<%s\b[^>]*>)(.*?)(</%s>)' % (tag, tag), x, re.S)
+    if not m:
+        return x, None
+    start = len(re.findall(r'<%s\b' % child, m.group(2)))
+    inner = m.group(2) + ''.join(new_items)
+    open_tag = re.sub(r'count="\d+"', 'count="%d"' % (start + len(new_items)), m.group(1))
+    if 'count=' not in open_tag:
+        open_tag = open_tag[:-1] + ' count="%d">' % (start + len(new_items))
+    return x[:m.start()] + open_tag + inner + m.group(3) + x[m.end():], start
+
+
+def add_summary_styles(base):
+    p = os.path.join(base, 'xl', 'styles.xml')
+    x = open(p, encoding='utf-8').read()
+    # number formats
+    money_code = '&quot;$&quot;#,##0.00##'
+    pct_code = '0.0&quot;%&quot;'
+    x = re.sub(r'<numFmts\b([^>]*?)\s*/>', r'<numFmts\1></numFmts>', x)
+    if '<numFmts' not in x:
+        x = re.sub(r'(<styleSheet\b[^>]*>)', r'\1<numFmts count="0"></numFmts>', x, count=1)
+    ids = [int(i) for i in re.findall(r'numFmtId="(\d+)"', re.search(r'<numFmts\b.*?</numFmts>', x, re.S).group(0))]
+    money_id = max(ids + [190]) + 1
+    pct_id = money_id + 1
+    x, _ = _append_children(x, 'numFmts', 'numFmt', [
+        '<numFmt numFmtId="%d" formatCode="%s"/>' % (money_id, money_code),
+        '<numFmt numFmtId="%d" formatCode="%s"/>' % (pct_id, pct_code)])
+    fonts = ['<font><sz val="10"/><name val="Arial"/></font>',
+             '<font><b/><sz val="10"/><name val="Arial"/></font>',
+             '<font><b/><sz val="14"/><name val="Arial"/></font>',
+             '<font><b/><i/><sz val="12"/><name val="Arial"/></font>',
+             '<font><sz val="9"/><color rgb="FF808080"/><name val="Arial"/></font>',
+             '<font><b/><sz val="11"/><name val="Arial"/></font>',
+             '<font><b/><sz val="10"/><color rgb="FFC00000"/><name val="Arial"/></font>',
+             '<font><b/><sz val="10"/><color rgb="FF548235"/><name val="Arial"/></font>']
+    x, f0 = _append_children(x, 'fonts', 'font', fonts)
+    fills = ['<fill><patternFill patternType="solid"><fgColor rgb="FF%s"/><bgColor indexed="64"/></patternFill></fill>' % c
+             for c in ('D9D9D9', 'E2EFDA', 'F8CBAD')]
+    x, fl0 = _append_children(x, 'fills', 'fill', fills)
+    spec = {   # name: (numFmtId, font offset, fill offset or None)
+        'plain': (0, 0, None), 'bold': (0, 1, None), 'title': (0, 2, None), 'subtitle': (0, 3, None),
+        'run': (0, 4, None), 'section': (0, 5, None), 'hdr': (0, 1, 0), 'ok': (0, 0, 1), 'review': (0, 0, 2),
+        'money': (money_id, 0, None), 'qty': (3, 0, None), 'pct': (pct_id, 0, None),
+        'red': (0, 6, None), 'green': (0, 7, None)}
+    xfs, names = [], []
+    for name, (nf, fo, fi) in spec.items():
+        xfs.append('<xf numFmtId="%d" fontId="%d" fillId="%d" borderId="0" xfId="0" applyFont="1"%s%s/>'
+                   % (nf, f0 + fo, 0 if fi is None else fl0 + fi,
+                      ' applyFill="1"' if fi is not None else '',
+                      ' applyNumberFormat="1"' if nf else ''))
+        names.append(name)
+    x, x0 = _append_children(x, 'cellXfs', 'xf', xfs)
+    open(p, 'w', encoding='utf-8').write(x)
+    return {n: x0 + i for i, n in enumerate(names)}
+
+
+def write_summary_xml(sheet_path, data, styles, inserted, attention):
+    money = set(data.get('money_cols', []))
+    qty = set(data.get('qty_cols', []))
+    rows = []
+
+    def put(r, cells):
+        out = []
+        for col, v, st in cells:
+            ref = '%s%d' % (num_to_col(col), r)
+            if v is None or v == '':
+                continue
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out.append('<c r="%s" s="%d"><v>%s</v></c>' % (ref, styles[st], repr(v) if isinstance(v, float) else v))
+            else:
+                out.append('<c r="%s" s="%d" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+                           % (ref, styles[st], _xml_text(v)))
+        rows.append('<row r="%d">%s</row>' % (r, ''.join(out)))
+
+    put(1, [(1, data.get('title', ''), 'title')])
+    put(2, [(1, 'PO Validation Summary', 'subtitle')])
+    if data.get('run'):
+        put(3, [(1, data['run'], 'run')])
+    r = 5
+    for k, v in data.get('headline', []):
+        st = 'plain'
+        if k == '結論':
+            st = 'red' if '需確認' in str(v) else 'green'
+        put(r, [(1, k, 'bold'), (2, v, st)])
+        r += 1
+    r += 1
+    put(r, [(1, 'Check 檢核項目', 'hdr'), (2, 'Count', 'hdr'), (3, 'Status', 'hdr')])
+    r += 1
+    for label, n, status in data.get('checks', []):
+        st = 'review' if status == 'REVIEW' else ('ok' if status == 'OK' else 'plain')
+        put(r, [(1, label, st), (2, n, st), (3, status, st)])
+        r += 1
+
+    details = list(data.get('details', []))
+    if inserted:
+        details.append({'title': '本次更新：新增的 PO 欄',
+                        'columns': ['PO', '工作表', '欄', '類型', 'Ship Window', '目的地'],
+                        'rows': [[i.get('po'), i.get('sheet'), i.get('column'), i.get('label'),
+                                  i.get('window'), i.get('dest')] for i in inserted]})
+    if attention:
+        details.append({'title': '本次更新：需要人工處理',
+                        'columns': ['DPCI / PO', '工作表', '問題', '建議'],
+                        'rows': [[a_.get('dpci') or a_.get('po') or '', a_.get('sheet', ''),
+                                  a_.get('issue', '') + (' (POs: %s)' % ', '.join(a_['pos'][:6]) if a_.get('pos') else ''),
+                                  a_.get('next_step', '')] for a_ in attention]})
+    for d in details:
+        r += 1
+        put(r, [(1, d['title'], 'section')])
+        r += 1
+        cols = d['columns']
+        put(r, [(j, h, 'hdr') for j, h in enumerate(cols, 1)])
+        r += 1
+        for row in d['rows']:
+            cells = []
+            for j, v in enumerate(row, 1):
+                st = 'plain'
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    st = ('money' if cols[j - 1] in money else 'qty' if cols[j - 1] in qty
+                          else 'pct' if cols[j - 1] == '差異 %' else 'plain')
+                cells.append((j, v, st))
+            put(r, cells)
+            r += 1
+
+    xml = open(sheet_path, encoding='utf-8').read()
+    body = '<sheetData>%s</sheetData>' % ''.join(rows)
+    if re.search(r'<sheetData\s*/>', xml):
+        xml = re.sub(r'<sheetData\s*/>', body, xml, count=1)
+    else:
+        xml = re.sub(r'<sheetData>.*?</sheetData>', lambda m: body, xml, count=1, flags=re.S)
+    cols_xml = ('<cols><col min="1" max="1" width="54" customWidth="1"/>'
+                + ''.join('<col min="%d" max="%d" width="%s" customWidth="1"/>' % (i, i, w)
+                          for i, w in zip(range(2, 9), [26, 22, 22, 22, 40, 14, 14])) + '</cols>')
+    if '<cols>' in xml:
+        xml = re.sub(r'<cols>.*?</cols>', lambda m: cols_xml, xml, count=1, flags=re.S)
+    else:
+        xml = xml.replace('<sheetData>', cols_xml + '<sheetData>', 1)
+    for tag in ('mergeCells', 'conditionalFormatting', 'dataValidations'):
+        xml = re.sub(r'<%s\b.*?</%s>' % (tag, tag), '', xml, flags=re.S)
+    xml = re.sub(r'<dimension ref="[^"]*"/>', '<dimension ref="A1:H%d"/>' % max(r, 1), xml)
+    open(sheet_path, 'w', encoding='utf-8').write(xml)
+    return r
+
+
+def add_summary_sheet_first(base, name=None):
+    """Create an empty first-tab worksheet (for GRIDs built by hand without one)."""
+    name = name or VALIDATION_SHEET
+    ws_dir = os.path.join(base, 'xl', 'worksheets')
+    n = 1
+    while os.path.exists(os.path.join(ws_dir, 'sheet%d.xml' % n)):
+        n += 1
+    fname = 'sheet%d.xml' % n
+    open(os.path.join(ws_dir, fname), 'w', encoding='utf-8').write(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<dimension ref="A1"/><sheetViews><sheetView workbookViewId="0"/></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="15"/><sheetData/>'
+        '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>')
+    rels_p = os.path.join(base, 'xl', '_rels', 'workbook.xml.rels')
+    rels = open(rels_p, encoding='utf-8').read()
+    used = set(re.findall(r'\bId="([^"]+)"', rels))
+    k = 1
+    while 'rIdVS%d' % k in used:
+        k += 1
+    rid = 'rIdVS%d' % k
+    rels = rels.replace('</Relationships>',
+                        '<Relationship Id="%s" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+                        'relationships/worksheet" Target="worksheets/%s"/></Relationships>' % (rid, fname))
+    open(rels_p, 'w', encoding='utf-8').write(rels)
+    ct_p = os.path.join(base, '[Content_Types].xml')
+    ct = open(ct_p, encoding='utf-8').read()
+    ct = ct.replace('</Types>', '<Override PartName="/xl/worksheets/%s" ContentType="application/'
+                    'vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>' % fname)
+    open(ct_p, 'w', encoding='utf-8').write(ct)
+    wb_p = os.path.join(base, 'xl', 'workbook.xml')
+    wb = open(wb_p, encoding='utf-8').read()
+    ids = [int(i) for i in re.findall(r'sheetId="(\d+)"', wb)]
+    ns = ('' if re.search(r'<workbook\b[^>]*xmlns:r=', wb)
+          else ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"')
+    wb = re.sub(r'(<sheets>)', lambda m: m.group(1) + '<sheet%s name="%s" sheetId="%d" r:id="%s"/>'
+                % (ns, name, max(ids + [0]) + 1, rid), wb, count=1)
+    # every sheet moved one place right: keep sheet-scoped names pointing at the same sheet
+    wb = re.sub(r'localSheetId="(\d+)"', lambda m: 'localSheetId="%d"' % (int(m.group(1)) + 1), wb)
+    wb = re.sub(r'activeTab="\d+"', 'activeTab="0"', wb)
+    wb = re.sub(r'firstSheet="\d+"', 'firstSheet="0"', wb)
+    open(wb_p, 'w', encoding='utf-8').write(wb)
+    return os.path.join(ws_dir, fname)
 
 
 def append_callouts(sh, inserted, attention):
@@ -585,6 +818,9 @@ def main():
                          'the GRID yet, instead of skipping it.')
     ap.add_argument('--no-insert', action='store_true',
                     help='never insert a column; only fill existing ones')
+    ap.add_argument('--summary-json',
+                    help='rewrite the Validation Summary tab from this summary JSON '
+                         '(this run\'s call-outs are appended to it)')
     ap.add_argument('--force-text', action='store_true',
                     help='allow overwriting cells that currently hold text labels')
     a = ap.parse_args()
@@ -639,6 +875,7 @@ def main():
     all_sheet_xml = [(open(sp, encoding='utf-8').read(), shared)
                      for sp in sheets.values()]
     grid_dpcis = set()
+    new_type_styles = {}
 
     for sname, spath in sheets.items():
         sh = Sheet(spath, shared)
@@ -688,8 +925,22 @@ def main():
                          'next_step': 'the build gate forbids a blank header — '
                                       'check the PO PDF, then rerun'})
                     continue
-                tstyle = find_type_style(all_sheet_xml, meta['dclabel'])
+                tstyle = new_type_styles.get(meta['dclabel']) or find_type_style(all_sheet_xml, meta['dclabel'])
+                made_style = False
+                if not (tstyle[0] and tstyle[1]) and meta['dclabel'] in TYPE_FILL and po_cols:
+                    # label new to this workbook: clone a neighbouring PO header style with the right fill
+                    ncol = sorted(po_cols.values(), key=col_to_num)[-1]
+                    s1 = re.search(r'<c r="%s1"[^>]*\bs="(\d+)"' % ncol, sh.xml)
+                    s3 = re.search(r'<c r="%s3"[^>]*\bs="(\d+)"' % ncol, sh.xml)
+                    fill = TYPE_FILL[meta['dclabel']]
+                    tstyle = (clone_style_with_fill(base, s1.group(1) if s1 else None, fill),
+                              clone_style_with_fill(base, s3.group(1) if s3 else None, fill))
+                    new_type_styles[meta['dclabel']] = tstyle
+                    made_style = True
                 res = insert_po_column(sh, po, meta, needed[po], tstyle, DEST)
+                if made_style:
+                    res['type_style_found'] = True
+                    res['note'] = 'PO 類型 %s 原檔沒有，已依標準配色新增' % meta['dclabel']
                 if res.get('error'):
                     report['needs_attention'].append(
                         {'sheet': sname, 'po': po, 'issue': res['error'],
@@ -791,7 +1042,15 @@ def main():
 
     # ---- call-outs onto the Validation Summary tab ------------------------
     vs_path = sheets.get(VALIDATION_SHEET)
-    if vs_path and not a.dry_run:
+    if a.summary_json and not a.dry_run:
+        if not vs_path:
+            vs_path = add_summary_sheet_first(base)
+            report['validation_sheet_added'] = True
+        styles = add_summary_styles(base)
+        report['validation_rows_added'] = write_summary_xml(
+            vs_path, json.load(open(a.summary_json, encoding='utf-8')), styles,
+            report['inserted'], report['needs_attention'])
+    elif vs_path and not a.dry_run:
         vs = Sheet(vs_path, shared)
         n = append_callouts(vs, report['inserted'], report['needs_attention'])
         if n:

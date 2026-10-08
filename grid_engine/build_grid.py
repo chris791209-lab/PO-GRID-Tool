@@ -162,6 +162,73 @@ def place_image(ws, row, path, report, dpci):
         return False
 
 
+def write_summary_from_json(wb, data):
+    """First tab written from a caller-supplied summary (e.g. the TG Team PO
+    platform's Chinese summary), so the GRID and the validation report show
+    the same checks in the same words. Layout: title, run line, headline
+    figures, the check table (OK green / REVIEW orange), then one detail
+    table per non-empty finding."""
+    ws = wb.create_sheet('Validation Summary', 0)
+    grey = PatternFill('solid', fgColor='D9D9D9')
+    green = PatternFill('solid', fgColor='E2EFDA')
+    orange = PatternFill('solid', fgColor='F8CBAD')
+    money = set(data.get('money_cols', []))
+    qty = set(data.get('qty_cols', []))
+    ws['A1'] = data.get('title', '')
+    ws['A1'].font = Font(FONT, 14, bold=True)
+    ws['A2'] = 'PO Validation Summary'
+    ws['A2'].font = Font(FONT, 12, bold=True, italic=True)
+    if data.get('run'):
+        ws['A3'] = data['run']
+        ws['A3'].font = Font(FONT, 9, color='808080')
+    r = 5
+    for k, v in data.get('headline', []):
+        ws.cell(r, 1, k).font = Font(FONT, 10, bold=True)
+        c = ws.cell(r, 2, v)
+        c.alignment = Alignment(horizontal='left')
+        if k == '結論':
+            c.font = Font(FONT, 10, bold=True, color='C00000' if '需確認' in str(v) else '548235')
+        r += 1
+    r += 1
+    for j, h in enumerate(['Check 檢核項目', 'Count', 'Status'], 1):
+        c = ws.cell(r, j, h)
+        c.font, c.fill = Font(FONT, 10, bold=True), grey
+    r += 1
+    for label, n, status in data.get('checks', []):
+        fill = orange if status == 'REVIEW' else (green if status == 'OK' else None)
+        for j, v in enumerate([label, n, status], 1):
+            c = ws.cell(r, j, v)
+            c.font = Font(FONT, 10)
+            if fill:
+                c.fill = fill
+        r += 1
+    for d in data.get('details', []):
+        r += 1
+        ws.cell(r, 1, d['title']).font = Font(FONT, 11, bold=True)
+        r += 1
+        cols = d['columns']
+        for j, h in enumerate(cols, 1):
+            c = ws.cell(r, j, h)
+            c.font, c.fill = Font(FONT, 10, bold=True), grey
+        r += 1
+        for row in d['rows']:
+            for j, v in enumerate(row, 1):
+                c = ws.cell(r, j, v)
+                c.font = Font(FONT, 10)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    if cols[j - 1] in money:
+                        c.number_format = '"$"#,##0.00##'
+                    elif cols[j - 1] in qty:
+                        c.number_format = '#,##0'
+                    elif cols[j - 1] == '差異 %':
+                        c.number_format = '0.0"%"'
+            r += 1
+    ws.column_dimensions['A'].width = 54
+    for col, w in zip('BCDEFGH', [26, 22, 22, 22, 40, 14, 14]):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = 'A5'
+
+
 def write_validation_summary(wb, recon, title, gaps):
     """First tab: the PO-vs-master cross-check results, so a mismatch is
     visible in the workbook itself and not just in a chat message or a JSON
@@ -262,6 +329,9 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--report', default='build_report.json')
     ap.add_argument('--no-recalc', action='store_true')
+    ap.add_argument('--summary-json',
+                    help='write the first tab from this summary JSON instead of '
+                         'the built-in English recon summary')
     ap.add_argument('--allow-header-gaps', action='store_true',
                     help='build even if a PO column lacks a type label '
                          'or shipping window (normally an error)')
@@ -361,7 +431,10 @@ def main():
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
-    write_validation_summary(wb, recon, a.title, gaps)
+    if a.summary_json:
+        write_summary_from_json(wb, json.load(open(a.summary_json, encoding='utf-8')))
+    else:
+        write_validation_summary(wb, recon, a.title, gaps)
     used, report = set(), {'sheets': [], 'no_image': [], 'no_po_meta': [],
                            'header_gaps': gaps, 'unmapped_dc': {}}
 

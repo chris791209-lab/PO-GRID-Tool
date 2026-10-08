@@ -826,22 +826,20 @@ def parse_po_pdfs(pdf_files, progress=None, known_dpcis=None):
             if lose is not head and _sig(lose_items) != _sig(items):   # 內容相同的重複檔不提示
                 info['superseded'].append({'po': po, 'kept': head['file'], 'dropped': lose['file'],
                                            'from_qty': lose.get('total_qty'), 'to_qty': head.get('total_qty')})
+        live.append((head, items))
+
+    # 重複 PO 只以「同一 PO#（同 DC）」判斷：取日期最新的版本（上面已處理）。
+    # 不同 PO# 即使品項與數量相同，也視為不同的訂單，全部計入。
+    info['dup_resolved'], info['duplicates'] = [], []
+
+    for head, items in live:
         probs = _po_gate_check(head, items)
         if probs:
-            info['gate_problems'].append({'po': po, 'file': head['file'], 'issues': probs})
-        live.append((head, items))
+            info['gate_problems'].append({'po': head['po'], 'file': head['file'], 'issues': probs})
         info['live_docs'].append({'po': head['po'], 'dc': head['dc'], 'file': head['file'],
                                   'fname_date': head.get('fname_date') or
                                   ''.join((head.get('doc_date') or '')[:5].split('/')),
                                   'text': head.get('_text', '')})
-
-    # ── 不同 PO# 但 (DPCI, 數量) 完全相同 → 疑似重複下單 ──
-    fp = {}
-    for head, items in live:
-        key = tuple(sorted((i['sku'], i['qty']) for i in items if i['kind'] in ('line', 'prepack')))
-        if key:
-            fp.setdefault(key, set()).add(head['po'])
-    info['duplicates'] = [sorted(v) for v in fp.values() if len(v) > 1]
 
     rows = []
     for head, items in live:
@@ -1020,7 +1018,226 @@ def _json_tail(text):
         return {}
 
 
-def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_grid, title):
+def cache_sum_values(xlsx_bytes):
+    """
+    GRID 的 PO TOTAL 是 =SUM() 公式；openpyxl 存檔時沒有計算結果，
+    Outlook／Teams／手機預覽不會重算，會顯示空白。這裡把每個 SUM 的結果直接寫進儲存格快取值，
+    公式本身不變（Excel 開檔仍會重算）。
+    """
+    import zipfile
+    zin = zipfile.ZipFile(io.BytesIO(xlsx_bytes))
+    out = io.BytesIO()
+    cell_re = re.compile(r'<c r="([A-Z]+)(\d+)"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+
+    def col_num(c):
+        n = 0
+        for ch in c:
+            n = n * 26 + ord(ch) - 64
+        return n
+
+    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.startswith('xl/worksheets/sheet') and item.filename.endswith('.xml'):
+                xml = data.decode('utf-8')
+                vals = {}
+                for m in cell_re.finditer(xml):
+                    attrs, inner = m.group(3), m.group(4) or ''
+                    if 't="s"' in attrs or 'inlineStr' in attrs or 't="str"' in attrs or '<f' in inner:
+                        continue
+                    v = re.search(r'<v>([^<]*)</v>', inner)
+                    if v:
+                        try:
+                            vals[(col_num(m.group(1)), int(m.group(2)))] = float(v.group(1))
+                        except ValueError:
+                            pass
+
+                def fill(m):
+                    attrs, inner = m.group(3), m.group(4) or ''
+                    f = re.search(r'<f(?:\s[^>]*)?>\s*SUM\(\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)\)\s*</f>', inner)
+                    if not f:
+                        return m.group(0)
+                    c1, r1, c2, r2 = col_num(f.group(1)), int(f.group(2)), col_num(f.group(3)), int(f.group(4))
+                    total = sum(vals.get((c, r), 0.0) for c in range(c1, c2 + 1) for r in range(r1, r2 + 1))
+                    total_txt = str(int(total)) if float(total).is_integer() else repr(total)
+                    attrs2 = re.sub(r'\s+t="[^"]*"', '', attrs)
+                    return '<c r="%s%s"%s>%s<v>%s</v></c>' % (
+                        m.group(1), m.group(2), attrs2,
+                        re.search(r'<f(?:\s[^>]*)?>.*?</f>', inner, re.S).group(0), total_txt)
+                xml = cell_re.sub(fill, xml)
+                data = xml.encode('utf-8')
+            zout.writestr(item, data)
+    return out.getvalue()
+
+
+def grid_expectations(po_df, prod_df=None):
+    """由本次解析的 PO 列算出 GRID 應有的內容：(DPCI, PO) → 件數、(Assortment, PO) → 箱數、DPCI → PCN Commit。"""
+    qty, box = {}, {}
+    for _, r in po_df.iterrows():
+        po = str(r['PO NUMBER'])
+        if r['Row_Type'] == 'box':
+            box[(r['Original_DPCI'], po)] = box.get((r['Original_DPCI'], po), 0) + int(r['Final_QTY'])
+        else:
+            qty[(r['Final_DPCI'], po)] = qty.get((r['Final_DPCI'], po), 0) + int(r['Final_QTY'])
+    plan = {}
+    if prod_df is not None and len(prod_df) and 'Ent Ttl Rcpt U' in prod_df.columns:
+        pm = prod_df.drop_duplicates(subset=['DPCI'])
+        plan = {d: float(v) for d, v in zip(pm['DPCI'], pm['Ent Ttl Rcpt U']) if pd.notna(v)}
+    return {'qty': qty, 'box': box, 'plan': plan, 'pos': {str(p) for p in po_df['PO NUMBER'].unique()}}
+
+
+def verify_grid_content(xlsx_bytes, exp, cancelled_pos=(), is_update=False):
+    """
+    逐格核對 GRID 內容是否與本次 PO 一致（產生新版與更新版都跑）：
+      1. 每個 DPCI × PO 的件數 = PO 上的件數（含 Assortment 內含）
+      2. Assortment 標題列的箱數 = PO 上的箱數
+      3. 本次 PO 欄沒有多出 PO 上沒有的數量
+      4. PO TOTAL = 該列各 PO 欄加總
+      5. 100% COMMIT Q'TY = PCN 的 Ent Ttl Rcpt U（有上傳 PCN 時）
+      6. 已取消的 PO 不應出現在 GRID 上
+    回傳 {'ok', 'cells', 'problems': [...], 'new_rows': [...]}
+    """
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True, read_only=True)
+    wbf = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=False, read_only=True)
+    probs, new_rows, seen, cells = [], [], {}, 0
+    grid_dpcis, total_rows = set(), 0
+    for ws in wb.worksheets:
+        if ws.title == 'Validation Summary':
+            continue
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        frows = [list(r) for r in wbf[ws.title].iter_rows(values_only=True)]
+        if len(rows) < 6:
+            continue
+        r3 = rows[2] + [None] * 5
+        lbl = next((i for i, v in enumerate(r3) if isinstance(v, str) and v.replace(' ', '').upper() == 'TGPO#'), None)
+        if lbl is None:
+            continue
+        po_cols = {i: str(v).strip() for i, v in enumerate(r3) if i > lbl and v is not None
+                   and re.fullmatch(r'\d{6,12}', str(v).strip())}
+        r2 = rows[1] + [None] * 5
+        tcol = next((i for i, v in enumerate(r2) if isinstance(v, str) and 'TOTAL' in v.upper()), None)
+        ccol = next((i for i, v in enumerate(r2) if isinstance(v, str) and 'COMMIT' in v.upper()), None)
+        for r_i, row in enumerate(rows[5:], start=6):
+            row = row + [None] * (max(po_cols or {0: 0}) + 5)
+            a = row[0]
+            if not (isinstance(a, str) and re.match(r'^\d{3}-\d{2}-\d{4}', a.strip())):
+                continue
+            dpci = a.strip()[:11]
+            grid_dpcis.add(dpci)
+            is_hdr = any(isinstance(row[c], str) and '(' in row[c] for c in po_cols)
+            vals = []
+            for c, po in po_cols.items():
+                v = row[c]
+                if is_hdr:
+                    m = re.search(r'\((\d[\d,]*)\)', str(v or ''))
+                    seen[('box', dpci, po)] = (ws.title, int(m.group(1).replace(',', '')) if m else None)
+                    continue
+                num = float(v) if isinstance(v, (int, float)) else None
+                if num is not None:
+                    vals.append(num)
+                seen[('qty', dpci, po)] = (ws.title, num)
+            if is_hdr:
+                continue
+            total_rows += 1
+            if tcol is not None and po_cols:
+                # PO TOTAL 公式必須涵蓋這列所有 PO 欄
+                f = frows[r_i - 1][tcol] if r_i - 1 < len(frows) and tcol < len(frows[r_i - 1]) else None
+                want = 'SUM(%s%d:%s%d)' % (get_column_letter(min(po_cols) + 1), r_i, get_column_letter(max(po_cols) + 1), r_i)
+                if not (isinstance(f, str) and f.replace('$', '').upper().lstrip('=') == want):
+                    probs.append({'檢查': 'PO TOTAL 公式沒有涵蓋全部 PO 欄', '工作表': ws.title, 'DPCI': dpci, 'PO': '',
+                                  'GRID': f, '應為': '=' + want})
+            if tcol is not None and isinstance(row[tcol], (int, float)) and abs(row[tcol] - sum(vals)) > 0.5:
+                probs.append({'檢查': 'PO TOTAL 不等於各 PO 加總', '工作表': ws.title, 'DPCI': dpci, 'PO': '',
+                              'GRID': row[tcol], '應為': sum(vals)})
+            if ccol is not None and exp['plan'].get(dpci) is not None and isinstance(row[ccol], (int, float)) \
+                    and abs(row[ccol] - exp['plan'][dpci]) > 0.5:
+                probs.append({'檢查': "100% COMMIT 與 PCN 不同", '工作表': ws.title, 'DPCI': dpci, 'PO': '',
+                              'GRID': row[ccol], '應為': exp['plan'][dpci]})
+        for c, po in po_cols.items():
+            if po in set(cancelled_pos):
+                probs.append({'檢查': '已取消的 PO 仍在 GRID 上', '工作表': ws.title, 'DPCI': '', 'PO': po,
+                              'GRID': '有此欄', '應為': '刪除此欄'})
+    wb.close()
+    wbf.close()
+
+    for (dpci, po), q in exp['qty'].items():
+        cells += 1
+        hit = seen.get(('qty', dpci, po))
+        if hit is None:
+            if dpci not in grid_dpcis:
+                new_rows.append((dpci, po, q))
+            else:
+                probs.append({'檢查': 'GRID 少了這張 PO 的數量', '工作表': '', 'DPCI': dpci, 'PO': po, 'GRID': '', '應為': q})
+        elif hit[1] is None or abs(hit[1] - q) > 0.5:
+            probs.append({'檢查': '數量與 PO 不同', '工作表': hit[0], 'DPCI': dpci, 'PO': po,
+                          'GRID': hit[1] if hit[1] is not None else '空白', '應為': q})
+    for (dpci, po), n in exp['box'].items():
+        cells += 1
+        hit = seen.get(('box', dpci, po))
+        if hit is None:
+            if dpci not in grid_dpcis:
+                new_rows.append((dpci, po, n))
+            else:
+                probs.append({'檢查': 'GRID 少了這張 PO 的 Assortment 箱數', '工作表': '', 'DPCI': dpci, 'PO': po, 'GRID': '', '應為': n})
+        elif hit[1] != n:
+            probs.append({'檢查': 'Assortment 箱數與 PO 不同', '工作表': hit[0], 'DPCI': dpci, 'PO': po,
+                          'GRID': hit[1] if hit[1] is not None else '空白', '應為': n})
+    for (kind, dpci, po), (sheet, v) in seen.items():
+        if kind == 'qty' and po in exp['pos'] and v not in (None, 0) and (dpci, po) not in exp['qty']:
+            probs.append({'檢查': 'GRID 有數量但這張 PO 上沒有', '工作表': sheet, 'DPCI': dpci, 'PO': po, 'GRID': v, '應為': 0})
+    # 新版 GRID 不應有缺列；更新版缺列是已知限制（需人工加列），另外列出
+    if new_rows and not is_update:
+        for dpci, po, q in new_rows:
+            probs.append({'檢查': 'GRID 少了這個品項', '工作表': '', 'DPCI': dpci, 'PO': po, 'GRID': '', '應為': q})
+        new_rows = []
+    return {'ok': not probs, 'cells': cells, 'rows': total_rows, 'problems': probs,
+            'new_rows': sorted({d for d, _, _ in new_rows})}
+
+
+def summary_to_json(title, run_text, checks, details, headline):
+    """把 Validation Summary 轉成 GRID 腳本可讀的 JSON（GRID 第一頁與核對報告一致）。"""
+    def clean(v):
+        if v is None:
+            return None
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating, float)):
+            return None if pd.isna(v) else (int(v) if float(v).is_integer() else float(v))
+        if isinstance(v, (bool, np.bool_)):
+            return str(bool(v))
+        return v if isinstance(v, (int, str)) else str(v)
+    return {
+        'title': title, 'run': run_text,
+        'headline': [[k, clean(v)] for k, v in headline],
+        'checks': [[a, clean(b), c] for a, b, c in checks],
+        'details': [{'title': t, 'columns': [str(c) for c in df.columns],
+                     'rows': [[clean(v) for v in row] for row in df.itertuples(index=False)]}
+                    for t, df in details],
+        'money_cols': sorted(MONEY_COLS), 'qty_cols': sorted(QTY_COLS)}
+
+
+def build_light_summary(pinfo):
+    """沒有 PCN 時（只更新 GRID）的簡易總結：只列不需要主檔就能判斷的項目。"""
+    ctx = {k: pinfo.get(k, []) for k in ['duplicates', 'dup_resolved', 'superseded', 'cancelled',
+                                          'gate_problems', 'skipped_other_program', 'warnings']}
+    fake = pd.DataFrame(columns=['PO NUMBER', 'Final_DPCI', 'Original_DPCI', 'Row_Type', 'Cost Match',
+                                 'Retail Match', 'Total QTY Match', 'Target Commit QTY', 'Final_Product_Cost',
+                                 'Asst_Role', 'Asst_QTY_Check', 'UPC Status', 'Final_QTY', 'PO Total QTY',
+                                 'QTY Diff', 'QTY Diff %', 'Final_QTY_for_count', 'ITEM UNIT COST',
+                                 'ITEM UNIT RETAIL', 'Target_Cost', 'Suggested Unit Retail', 'PO UPC',
+                                 'Target UPC', 'Expected_Component_QTY'])
+    checks, details, _ = build_validation_summary(fake, ctx)
+    keep = ('同一 PO', 'PO 內部驗算', '無法解析', '已取消', '其他 Program')
+    checks = [c for c in checks if c[0].startswith(keep)]
+    details = [d for d in details if d[0].startswith(keep)]
+    headline = [('有效 PO 張數', pinfo.get('n_pos', 0)),
+                ('說明', '未上傳 PCN：只更新 GRID，未執行成本／零售／數量核對')]
+    return checks, details, headline
+
+
+def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_grid, title, summary=None):
     """
     產生 PO GRID。existing_grid 有上傳 → 更新模式（保留原檔圖片與手填內容，只補數量／插入新 PO 欄）；
     沒上傳 → 重建模式（每間工廠一個工作表）。
@@ -1030,7 +1247,7 @@ def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_g
     eng = _grid_engine_dir()
     res = {'ok': False, 'mode': 'update' if existing_grid is not None else 'create',
            'data': None, 'filename': None, 'report': {}, 'notes': [], 'log': ''}
-    need = ['parse_po_pdfs.py', 'reconcile.py', 'build_grid.py', 'update_grid.py']
+    need = ['parse_po_pdfs.py', 'reconcile.py', 'build_grid.py', 'update_grid.py', 'verify_layout.py']
     lost = [n for n in need if not os.path.exists(os.path.join(eng, n))]
     if lost:
         res['notes'].append("找不到 grid_engine 資料夾內的腳本：" + ", ".join(lost) + "。請確認已連同 app.py 一起部署。")
@@ -1068,6 +1285,22 @@ def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_g
             res['notes'].append(f"PO 內部驗算有問題：{parse_rep['problems_by_kind']}（GRID 仍會產生，請複核這些 PO）")
 
         safe_title = re.sub(r'[^\w\-]+', '_', title).strip('_') or 'PO_GRID'
+        sum_json = None
+        if summary:
+            sum_json = os.path.join(td, 'summary.json')
+            with open(sum_json, 'w', encoding='utf-8') as fh:
+                json.dump(summary, fh, ensure_ascii=False)
+
+        def finish(path):
+            """補上 PO TOTAL 計算值，並跑 Skill 的版面檢查。"""
+            data = cache_sum_values(open(path, 'rb').read())
+            chk = os.path.join(td, 'check.xlsx')
+            with open(chk, 'wb') as fh:
+                fh.write(data)
+            pv = run([os.path.join(eng, 'verify_layout.py'), chk])
+            v = _json_tail(pv.stdout)
+            res['verify'] = {'conforms': bool(v.get('conforms')), 'problems': v.get('problems', [])} if v else None
+            return data
 
         # ───────── 更新既有 GRID ─────────
         if existing_grid is not None:
@@ -1076,14 +1309,17 @@ def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_g
             with open(gpath, 'wb') as fh:
                 fh.write(existing_grid.read())
             out = os.path.join(td, 'grid_out.xlsx')
-            p = run([os.path.join(eng, 'update_grid.py'), '--grid', gpath,
-                     '--data', os.path.join(work, 'grid.json'),
-                     '--po-meta', os.path.join(work, 'items.json'), '--out', out])
+            upd = [os.path.join(eng, 'update_grid.py'), '--grid', gpath,
+                   '--data', os.path.join(work, 'grid.json'),
+                   '--po-meta', os.path.join(work, 'items.json'), '--out', out]
+            if sum_json:
+                upd += ['--summary-json', sum_json]
+            p = run(upd)
             res['report'] = _json_tail(p.stdout)
             if not os.path.exists(out):
                 res['notes'].append("更新既有 GRID 失敗（版面可能與標準 GRID 不同）。可改為不上傳既有 GRID，直接重建。")
                 return res
-            res['data'] = open(out, 'rb').read()
+            res['data'] = finish(out)
             base = re.sub(r'\.xlsx$', '', getattr(existing_grid, 'name', safe_title), flags=re.I)
             res['filename'] = f"{base}_updated_{datetime.now().strftime('%m%d')}.xlsx"
             res['ok'] = True
@@ -1139,6 +1375,8 @@ def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_g
         build = [os.path.join(eng, 'build_grid.py'), '--recon', os.path.join(work, 'recon.json'),
                  '--items', os.path.join(work, 'items.json'), '--title', title,
                  '--out', out, '--report', rpt, '--no-recalc']
+        if sum_json:
+            build += ['--summary-json', sum_json]
         if n_img:
             build += ['--images', img_dir]
         p = run(build)
@@ -1155,7 +1393,7 @@ def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_g
         rep['findings_counts'] = recon_rep.get('findings_counts', {})
         rep['images_supplied'] = n_img
         res['report'] = rep
-        res['data'] = open(out, 'rb').read()
+        res['data'] = finish(out)
         res['filename'] = f"{safe_title}_PO_GRID_{datetime.now().strftime('%Y%m%d')}.xlsx"
         res['ok'] = True
         return res
@@ -1589,7 +1827,6 @@ def build_validation_summary(merged_df, ctx=None):
                             'PO': _pos(g['PO NUMBER'])} for d, g in um.groupby('Final_DPCI')])
 
     no_df = pd.DataFrame(ctx.get('not_ordered', []))
-    dup_df = pd.DataFrame([{'PO（品項與數量完全相同）': ' / '.join(g)} for g in ctx.get('duplicates', [])])
     sup_df = pd.DataFrame([{'PO': x['po'], '採用': x['kept'], '捨棄': x['dropped'],
                             'Total Qty（舊→新）': f"{x.get('from_qty') or '?'} → {x.get('to_qty') or '?'}"}
                            for x in ctx.get('superseded', [])])
@@ -1611,19 +1848,19 @@ def build_validation_summary(merged_df, ctx=None):
         ('混裝不符：Box 與零件數量／混裝表 (Assortment mismatch)', len(asst_df_), st_(len(asst_df_))),
         ('UPC 不符', len(upc_df), st_(len(upc_df))),
         ('尚未下單(未收到PO的Item) (Not yet ordered)', len(no_df), st_(len(no_df))),
-        ('疑似重複 PO：不同 PO# 內容相同 (Duplicate PO groups)', len(dup_df), st_(len(dup_df))),
         ('PO 內部驗算未通過 (Self-check failed)', len(gate_df), st_(len(gate_df))),
         ('無法解析的檔案／其他警告', len(warn_df), st_(len(warn_df))),
         ('已取消的 PO（已排除）', len(can_df), ''),
-        ('多版本 PO（已採用最新版）', len(sup_df), ''),
+
+        ('同一 PO 有多個版本（已採用最新日期的版本）', len(sup_df), ''),
         ('其他 Program 的訂單（已略過）', len(skip_df), ''),
     ]
     for title, df in [
         ('PO 品項不在主檔 — 明細', unk_df), ('成本不符 — 明細', cost_df), ('零售不符 — 明細', retail_df),
         ('PO數量 vs PCN Commit — 明細', qty_df), ('混裝不符 — 明細', asst_df_),
-        ('UPC 不符 — 明細', upc_df), ('尚未下單(未收到PO的Item) — 明細', no_df), ('疑似重複 PO — 明細', dup_df),
+        ('UPC 不符 — 明細', upc_df), ('尚未下單(未收到PO的Item) — 明細', no_df), 
         ('PO 內部驗算未通過 — 明細', gate_df), ('無法解析的檔案／其他警告 — 明細', warn_df),
-        ('已取消的 PO — 明細', can_df), ('多版本 PO — 明細', sup_df), ('其他 Program 的訂單 — 明細', skip_df)]:
+        ('已取消的 PO — 明細', can_df), ('同一 PO 多個版本 — 明細', sup_df), ('其他 Program 的訂單 — 明細', skip_df)]:
         if len(df) > 0:
             details.append((title, df))
 
@@ -1865,9 +2102,10 @@ st.sidebar.markdown("---")
 st.sidebar.header("📊 步驟 3（選填）：PO GRID")
 st.sidebar.caption("核對完成後會一併產生一份新的 PO GRID（每間工廠一個工作表）。"
                    "以下三項都可以不填：① GRID 標題　② 產品圖片　③ 更新 PO GRID")
+st.sidebar.markdown("**① GRID 標題**")
+st.sidebar.caption("顯示在每個工作表左上角，也會用在下載的檔名。空白時用產品資料表（或上傳 GRID）的檔名。")
 grid_title_input = st.sidebar.text_input(
-    "① GRID 標題", value="", placeholder="例：D240 27C2 EASTER",
-    help="顯示在每個工作表左上角，也會用在下載的檔名。空白時用產品資料表的檔名。")
+    "GRID 標題", value="", placeholder="例：D240 27C2 EASTER", label_visibility="collapsed")
 st.sidebar.markdown("**② 產品圖片**")
 st.sidebar.caption("放進 GRID 的 PICTURE 欄，二選一或混用：\n\n"
                    "• **圖片 zip**：檔名要含 DPCI（例：240-04-8085.png），zip 裡再包 zip 也可以\n\n"
@@ -1877,7 +2115,7 @@ grid_image_files = st.sidebar.file_uploader(
     "產品圖片", type=['zip', 'xlsx', 'xlsm', 'png', 'jpg', 'jpeg'],
     accept_multiple_files=True, key="grid_imgs", label_visibility="collapsed")
 st.sidebar.markdown("**③ 更新 PO GRID**")
-st.sidebar.caption("要在現有的 PO GRID 上加入新 PO 時，把那份 GRID 上傳到這裡。"
+st.sidebar.caption("要在現有的 PO GRID 上加入新 PO 時，把那份 GRID 上傳到這裡（只更新 GRID 時可不上傳 PCN）。"
                    "會在原檔上補入數量、為新 PO 加欄，原檔的圖片與手填內容（AGE、工廠料號等）都保留。")
 grid_existing_file = st.sidebar.file_uploader(
     "更新 PO GRID", type=['xlsx'], key="grid_existing", label_visibility="collapsed")
@@ -1893,105 +2131,139 @@ if True:
     if st.button("🚀 解析 PDF 並執行核對", type="primary", key="btn_pdf"):
         st.session_state.pop('grid_out', None)
         st.session_state.pop('results', None)
-        if not product_files or not pdf_files:
-            st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表」，並在上方上傳 PDF！")
+        update_only = (not product_files) and grid_existing_file is not None
+        if not pdf_files:
+            st.warning("⚠️ 請先在上方上傳 PO PDF。")
+        elif not product_files and grid_existing_file is None:
+            st.warning("⚠️ 請在側邊欄上傳「產品資料表 PCN」。若只要更新既有 GRID，可改在「③ 更新 PO GRID」上傳 GRID。")
         else:
             prog = st.progress(0.0, text="PDF 解析中...")
             def _tick(i, n, name):
                 prog.progress(i / n, text=f"PDF 解析中 {i}/{n}：{name}（無文字層的 PDF 需 OCR，每份約 10–20 秒）")
-            prod_df = process_products(product_files)
-            known = set(prod_df['DPCI'].dropna().astype(str)) if 'DPCI' in prod_df.columns else set()
-            asst_df = process_assortments(asst_files) if asst_files else None
-            if asst_df is not None and len(asst_df) > 0:
-                known |= set(asst_df['Assortment_DPCI']) | set(asst_df['Component_DPCI'])
+            prod_df, asst_df, known = pd.DataFrame(), None, set()
+            if not update_only:
+                prod_df = process_products(product_files)
+                known = set(prod_df['DPCI'].dropna().astype(str)) if 'DPCI' in prod_df.columns else set()
+                asst_df = process_assortments(asst_files) if asst_files else None
+                if asst_df is not None and len(asst_df) > 0:
+                    known |= set(asst_df['Assortment_DPCI']) | set(asst_df['Component_DPCI'])
+            else:
+                # 沒有 PCN：以上傳 GRID 的 DPCI 判斷合併列印裡哪些訂單屬於本季
+                try:
+                    import openpyxl
+                    grid_existing_file.seek(0)
+                    wbg = openpyxl.load_workbook(io.BytesIO(grid_existing_file.read()), read_only=True)
+                    for wsg in wbg.worksheets:
+                        for (v,) in wsg.iter_rows(min_col=1, max_col=1, values_only=True):
+                            if isinstance(v, str) and re.match(r'^\d{3}-\d{2}-\d{4}', v.strip()):
+                                known.add(v.strip()[:11])
+                    wbg.close()
+                    grid_existing_file.seek(0)
+                except Exception:
+                    pass
             po_df, pinfo = parse_po_pdfs(pdf_files, progress=_tick, known_dpcis=known or None)
             prog.empty()
 
-            for cb in pinfo['combined']:
-                st.info(f"📑 {cb['file']} 為合併列印，已自動拆成 {cb['orders']} 張訂單，其中 {cb['kept']} 張屬於本主檔。")
-            if pinfo['skipped_other_program']:
-                with st.expander(f"ℹ️ {len(pinfo['skipped_other_program'])} 張訂單的品項不在主檔內（其他 Program），已略過（點擊展開）", expanded=False):
-                    for sk in pinfo['skipped_other_program']:
-                        st.write(f"• PO {sk['po']}（{sk['file']}）：{', '.join(sk['dpcis'])}")
-
-            all_warnings = list(pinfo['warnings'])
-
-            if pinfo['ocr_files']:
-                with st.expander(f"ℹ️ {len(pinfo['ocr_files'])} 份 PDF 無文字層，已透過 OCR 解析（點擊展開檔名）", expanded=False):
-                    for n in pinfo['ocr_files']:
-                        st.write(f"• {n}")
             for w in pinfo['warnings']:
                 st.warning(w)
-
-            if pinfo['cancelled']:
-                msg = [f"PO {c['po']}（取消通知：{c['file']}；已排除：{', '.join(c['dropped']) or '—'}）" for c in pinfo['cancelled']]
-                st.warning("🚫 **以下 PO 已被客人取消（CANCEL ORDER），不計入核對**：\n\n" + "\n\n".join("• " + m for m in msg))
-                all_warnings.append("已取消 PO（不計入）：" + ", ".join(c['po'] for c in pinfo['cancelled']))
-            if pinfo['superseded']:
-                with st.expander(f"⚠️ {len(pinfo['superseded'])} 張 PO 有多個版本，已採用最新版（點擊展開）", expanded=False):
-                    for s in pinfo['superseded']:
-                        st.write(f"• PO {s['po']}：採用 {s['kept']}，捨棄 {s['dropped']}（Total Qty {s['from_qty'] or '?'} → {s['to_qty'] or '?'}）")
-                all_warnings.append("多版本 PO（已取最新）：" + ", ".join(s['po'] for s in pinfo['superseded']))
-            if pinfo['duplicates']:
-                with st.expander(f"⚠️ {len(pinfo['duplicates'])} 組 PO 的品項與數量完全相同，請確認是否重複下單（點擊展開）", expanded=False):
-                    for g_ in pinfo['duplicates']:
-                        st.write("• " + " / ".join(g_))
-                all_warnings.append("品項與數量完全相同的 PO：" + "；".join(" / ".join(g_) for g_ in pinfo['duplicates']))
-            # ── G5 PO 內部一致性自我驗證（Σ行小計=PO Total、數量×單價=行小計、Σ數量=Total Qty）──
             if pinfo['gate_problems']:
-                with st.expander(f"⚠️ G5 PO 內部驗算：{len(pinfo['gate_problems'])} 張 PO 未通過，該 PO 的解析結果請人工複核（點擊展開）", expanded=True):
+                with st.expander(f"⚠️ PO 內部驗算：{len(pinfo['gate_problems'])} 張 PO 未通過，該 PO 的解析結果請人工複核（點擊展開）", expanded=True):
                     for gp in pinfo['gate_problems']:
                         st.warning(f"PO {gp['po']}（{gp['file']}）：" + "；".join(gp['issues']))
-                all_warnings += [f"G5 驗算未過 PO {gp['po']}：" + "；".join(gp['issues']) for gp in pinfo['gate_problems']]
+            all_warnings = list(pinfo['warnings'])
+            all_warnings += [f"PO 內部驗算未過 PO {gp['po']}：" + "；".join(gp['issues']) for gp in pinfo['gate_problems']]
 
             if len(po_df) == 0:
                 st.error("❌ 所有 PDF 均無法解析出訂單資料，請確認格式後再試。")
             else:
-                n_gate_ok = pinfo['n_pos'] - len(pinfo['gate_problems'])
-                st.success(f"✅ {pinfo['n_files']} 份 PDF → {pinfo['n_pos']} 張有效 PO、{len(po_df)} 筆品項列；"
-                           f"{n_gate_ok}/{pinfo['n_pos']} 張通過 PO 內部驗算。")
+                ocr_note = f"（其中 {len(pinfo['ocr_files'])} 份無文字層，已 OCR）" if pinfo['ocr_files'] else ""
+                st.success(f"✅ {pinfo['n_files']} 份 PDF{ocr_note} → {pinfo['n_pos']} 張有效 PO、{len(po_df):,} 筆品項列；"
+                           f"{pinfo['n_pos'] - len(pinfo['gate_problems'])}/{pinfo['n_pos']} 張通過 PO 內部驗算。")
+                run_meta = {'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'input_files': f"PDFs: {pinfo['n_files']} files / {pinfo['n_pos']} POs" +
+                            (f" | PCN: {', '.join(f.name for f in product_files)}" if product_files else " | 未上傳 PCN")}
+                run_text = f"執行時間 {run_meta['timestamp']}　｜　{run_meta['input_files']}"
 
-                dispatch_arg = dispatch_df_global if len(dispatch_df_global) > 0 else None
-                merged_df = run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=dispatch_arg)
+                if update_only:
+                    st.info("ℹ️ 未上傳 PCN：本次只更新 PO GRID，不執行成本／零售／數量核對。")
+                    grid_title = grid_title_input.strip() or re.sub(r'\.xlsx$', '', grid_existing_file.name, flags=re.I)
+                    checks, details, headline = build_light_summary(pinfo)
+                    with st.spinner("PO GRID 更新中..."):
+                        gupd = run_grid_engine(pinfo['live_docs'], [], [], [], grid_existing_file, grid_title,
+                                               summary=summary_to_json(grid_title, run_text, checks, details, headline))
+                        if gupd['ok']:
+                            gupd['content'] = verify_grid_content(
+                                gupd['data'], grid_expectations(po_df), [c['po'] for c in pinfo['cancelled']], is_update=True)
+                    st.session_state['grid_out'] = {'new': None, 'update': gupd}
+                else:
+                    dispatch_arg = dispatch_df_global if len(dispatch_df_global) > 0 else None
+                    merged_df = run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=dispatch_arg)
 
-                summary_ctx = {k: pinfo[k] for k in ['duplicates', 'superseded', 'cancelled', 'gate_problems',
-                                                      'skipped_other_program', 'warnings']}
-                summary_ctx['title'] = re.sub(r'\.(xlsx|xls|csv)$', '', product_files[0].name, flags=re.I)
-                summary_ctx['not_ordered'] = []
-                # 主檔有計畫量但完全沒有 PO 的品項
-                if 'Ent Ttl Rcpt U' in prod_df.columns and 'DPCI' in prod_df.columns:
-                    ordered = set(merged_df.loc[merged_df['Row_Type'] != 'box', 'Final_DPCI'])
-                    pm = prod_df.drop_duplicates(subset=['DPCI'])
-                    pm_valid = pm[pm['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')]
-                    summary_ctx['plan_total'] = float(pm_valid['Ent Ttl Rcpt U'].fillna(0).sum())
-                    not_ordered = pm[(pm['Ent Ttl Rcpt U'].fillna(0) > 0) & ~pm['DPCI'].isin(ordered)
-                                     & pm['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')]
-                    if len(not_ordered) > 0:
-                        all_warnings.append("尚無 PO 的品項：" + ", ".join(not_ordered['DPCI']))
-                        dcol = 'Product Description' if 'Product Description' in not_ordered.columns else None
-                        summary_ctx['not_ordered'] = [
-                            {'DPCI': d, '品名': (str(n)[:60] if dcol else ''), 'PCN Commit Qty': int(q)}
-                            for d, n, q in zip(not_ordered['DPCI'],
-                                               not_ordered[dcol] if dcol else [''] * len(not_ordered),
-                                               not_ordered['Ent Ttl Rcpt U'])]
+                    summary_ctx = {k: pinfo[k] for k in ['duplicates', 'dup_resolved', 'superseded', 'cancelled',
+                                                          'gate_problems', 'skipped_other_program', 'warnings']}
+                    summary_ctx['title'] = re.sub(r'\.(xlsx|xls|csv)$', '', product_files[0].name, flags=re.I)
+                    summary_ctx['not_ordered'] = []
+                    # 主檔有計畫量但完全沒有 PO 的品項
+                    if 'Ent Ttl Rcpt U' in prod_df.columns and 'DPCI' in prod_df.columns:
+                        ordered = set(merged_df.loc[merged_df['Row_Type'] != 'box', 'Final_DPCI'])
+                        pm = prod_df.drop_duplicates(subset=['DPCI'])
+                        pm_valid = pm[pm['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')]
+                        summary_ctx['plan_total'] = float(pm_valid['Ent Ttl Rcpt U'].fillna(0).sum())
+                        not_ordered = pm_valid[(pm_valid['Ent Ttl Rcpt U'].fillna(0) > 0) & ~pm_valid['DPCI'].isin(ordered)]
+                        if len(not_ordered) > 0:
+                            all_warnings.append("尚無 PO 的品項：" + ", ".join(not_ordered['DPCI']))
+                            dcol = 'Product Description' if 'Product Description' in not_ordered.columns else None
+                            summary_ctx['not_ordered'] = [
+                                {'DPCI': d, '品名': (str(n)[:60] if dcol else ''), 'PCN Commit Qty': int(q)}
+                                for d, n, q in zip(not_ordered['DPCI'],
+                                                   not_ordered[dcol] if dcol else [''] * len(not_ordered),
+                                                   not_ordered['Ent Ttl Rcpt U'])]
 
-                run_meta = {
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'input_files': f"PDFs: {pinfo['n_files']} files / {pinfo['n_pos']} POs | Products: {', '.join(f.name for f in product_files)}"
-                }
-                st.session_state['results'] = {'merged_df': merged_df, 'run_meta': run_meta, 'notes': all_warnings,
-                                               'ctx': summary_ctx, 'excel': None}
+                    st.session_state['results'] = {'merged_df': merged_df, 'run_meta': run_meta, 'notes': all_warnings,
+                                                   'ctx': summary_ctx, 'excel': None}
 
-                # ── PO GRID：有上傳既有 GRID → 更新；否則重建 ──
-                grid_title = grid_title_input.strip() or summary_ctx['title']
-                with st.spinner("PO GRID 產生中..."):
-                    gnew = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
-                                           grid_image_files or [], None, grid_title)
-                    gupd = None
-                    if grid_existing_file is not None:
-                        gupd = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
-                                               [], grid_existing_file, grid_title)
-                st.session_state['grid_out'] = {'new': gnew, 'update': gupd}
+                    # ── PO GRID：一律產生新的；有上傳現有 GRID 時另外產生更新版。第一頁與核對報告同一份總結 ──
+                    grid_title = grid_title_input.strip() or summary_ctx['title']
+                    checks, details, headline = build_validation_summary(merged_df, summary_ctx)
+                    sj = summary_to_json(grid_title, run_text, checks, details, headline)
+                    with st.spinner("PO GRID 產生中..."):
+                        gnew = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
+                                               grid_image_files or [], None, grid_title, summary=sj)
+                        gupd = None
+                        if grid_existing_file is not None:
+                            gupd = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
+                                                   [], grid_existing_file, grid_title, summary=sj)
+                        exp = grid_expectations(po_df, prod_df)
+                        cancelled = [c['po'] for c in pinfo['cancelled']]
+                        if gnew['ok']:
+                            gnew['content'] = verify_grid_content(gnew['data'], exp, cancelled)
+                        if gupd is not None and gupd['ok']:
+                            gupd['content'] = verify_grid_content(gupd['data'], exp, cancelled, is_update=True)
+                    st.session_state['grid_out'] = {'new': gnew, 'update': gupd}
+
+
+def _show_verify(res, is_update=False):
+    c = res.get('content')
+    if c:
+        if c['ok']:
+            st.caption(f"✅ 內容檢查通過：{c['cells']:,} 格 PO 數量／Assortment 箱數與 PO 一致，"
+                       f"{c['rows']:,} 列 PO TOTAL 正確" + ("、100% COMMIT 與 PCN 一致" if not is_update else "") + "。")
+        else:
+            with st.expander(f"❌ 內容檢查發現 {len(c['problems'])} 項與 PO 不一致（點擊展開）", expanded=True):
+                st.dataframe(styled_for_screen(pd.DataFrame(c['problems'])), hide_index=True, use_container_width=True)
+        if c.get('new_rows'):
+            st.caption(f"ℹ️ {len(c['new_rows'])} 個品項在上傳的 GRID 沒有列，未寫入（見上方「需要人工處理」）："
+                       + ", ".join(c['new_rows']))
+    v = res.get('verify')
+    if not v:
+        return
+    if v['conforms']:
+        st.caption("✅ 版面檢查通過：與 Skill 的 PO GRID 版面規格一致。")
+    else:
+        with st.expander(f"⚠️ 版面檢查發現 {len(v['problems'])} 項與標準版面不同"
+                         + ("（可能是上傳的 GRID 原本就有）" if is_update else "") + "（點擊展開）"):
+            for pr in v['problems'][:50]:
+                st.write("• " + (pr if isinstance(pr, str) else json.dumps(pr, ensure_ascii=False)))
 
 
 def render_grid_section(go):
@@ -2022,6 +2294,7 @@ def render_grid_section(go):
             if rep_.get('unmapped_dc'):
                 st.warning("以下 DC 代碼尚無確認過的目的地，DES PORT 列直接顯示代碼，請人工確認：" +
                            "；".join(f"{dc}（PO {', '.join(pos)}）" for dc, pos in rep_['unmapped_dc'].items()))
+            _show_verify(gnew)
             st.download_button("📥 下載 PO GRID", data=gnew['data'], file_name=gnew['filename'],
                                mime=xlsx_mime, key="dl_grid_new")
 
@@ -2057,6 +2330,7 @@ def render_grid_section(go):
                                             'PO': x.get('po') or ', '.join(x.get('pos', [])),
                                             '問題': x.get('issue', ''), '建議': x.get('next_step', '')} for x in att]),
                              hide_index=True, use_container_width=True)
+        _show_verify(gupd, is_update=True)
         st.download_button("📥 下載更新後的 PO GRID", data=gupd['data'], file_name=gupd['filename'],
                            mime=xlsx_mime, key="dl_grid_update")
 
