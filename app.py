@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 import io
 import re
+import os
+import json
 from datetime import datetime
 
 # ==========================================
@@ -47,21 +49,24 @@ def clean_dpci(series):
     """清理 DPCI 字串，強制移除所有空白、斜線與隱藏字元"""
     if series is None:
         return series
-    cleaned = series.astype(str)
-    cleaned = cleaned.str.replace(r'[\s\u00a0\u200b\u3000\ufeff]+', '', regex=True)
-    cleaned = cleaned.str.replace(r'[/\\]', '-', regex=True)
-    cleaned = cleaned.str.replace(r'\.0$', '', regex=True)
-    return cleaned
+    # 用 Python 的 re 逐筆處理：雲端的 pandas 字串引擎（Arrow/RE2）的 \s 不含不換行空白，
+    # 也不接受 \u 跳脫，會讓「240-04-0531\xa0」這類儲存格比對不到
+    def _one(v):
+        v = re.sub(r'[\s\u00a0\u200b\u3000\ufeff]+', '', str(v))
+        v = re.sub(r'[/\\]', '-', v)
+        return re.sub(r'\.0$', '', v)
+    return series.map(_one)
 
 def clean_upc(series):
     """清理 UPC/Barcode 字串，避免因 Excel 浮點數轉換產生 .0 導致比對失敗"""
     if series is None:
         return series
-    cleaned = series.astype(str)
-    cleaned = cleaned.str.replace(r'\.0$', '', regex=True)
-    cleaned = cleaned.str.replace(r'\s+', '', regex=True)
-    cleaned = cleaned.replace('nan', np.nan)
-    return cleaned
+    def _one(v):
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return np.nan
+        v = re.sub(r'[\s\u00a0]+', '', re.sub(r'\.0$', '', str(v)))
+        return np.nan if v in ('', 'nan', 'None', '<NA>') else v
+    return series.map(_one)
 
 def fuzzy_col(df_cols, *keywords, require_all=False):
     """
@@ -757,7 +762,7 @@ def parse_po_pdfs(pdf_files, progress=None, known_dpcis=None):
     """
     info = {'ocr_files': [], 'warnings': [], 'gate_problems': [], 'superseded': [],
             'cancelled': [], 'duplicates': [], 'n_files': len(pdf_files), 'n_pos': 0,
-            'combined': [], 'skipped_other_program': []}
+            'combined': [], 'skipped_other_program': [], 'live_docs': []}
     parsed = []
     for n, f in enumerate(pdf_files, 1):
         name = getattr(f, 'name', str(f))
@@ -790,6 +795,7 @@ def parse_po_pdfs(pdf_files, progress=None, known_dpcis=None):
                     info['skipped_other_program'].append(
                         {'po': head['po'], 'file': name, 'dpcis': sorted(skus)[:3]})
                     continue
+            head['_text'] = otext
             parsed.append((head, items))
             kept += 1
         if is_combined:
@@ -824,6 +830,10 @@ def parse_po_pdfs(pdf_files, progress=None, known_dpcis=None):
         if probs:
             info['gate_problems'].append({'po': po, 'file': head['file'], 'issues': probs})
         live.append((head, items))
+        info['live_docs'].append({'po': head['po'], 'dc': head['dc'], 'file': head['file'],
+                                  'fname_date': head.get('fname_date') or
+                                  ''.join((head.get('doc_date') or '')[:5].split('/')),
+                                  'text': head.get('_text', '')})
 
     # ── 不同 PO# 但 (DPCI, 數量) 完全相同 → 疑似重複下單 ──
     fp = {}
@@ -866,6 +876,265 @@ def parse_po_pdfs(pdf_files, progress=None, known_dpcis=None):
             'ITEM DESCRIPTION', 'Final_QTY', 'Box_QTY', 'ITEM UNIT COST', 'ITEM UNIT RETAIL', 'LINE TOTAL',
             'PO UPC', 'VCP QUANTITY', 'COMPONENT ASSORT QTY', 'Is_Shipper_Display']
     return pd.DataFrame(rows, columns=cols), info
+
+# ==========================================
+# 5b. PO GRID（呼叫與 po-grid Skill 相同的腳本：grid_engine/ 資料夾）
+# ==========================================
+def _grid_engine_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'grid_engine')
+
+
+def extract_spk_images(xlsx_bytes, out_dir):
+    """
+    從 SPK Workspace 活頁簿抽出產品圖，依 DPCI 存成 <DPCI>.png。
+    多個工作表都有圖時只取 Products（Claims 是瑕疵照，不是產品照）。
+    回傳 (已存張數, 訊息 list)
+    """
+    import openpyxl
+    from PIL import Image as _PILImage
+    notes, saved = [], 0
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    except Exception as e:
+        return 0, [f"SPK 檔讀取失敗：{e}"]
+    with_imgs = [ws for ws in wb.worksheets if getattr(ws, '_images', None)]
+    if not with_imgs:
+        return 0, ["SPK 檔內找不到浮動圖片（若圖片是「儲存格內圖片」格式，請改上傳圖片 zip）。"]
+    if len(with_imgs) > 1:
+        prod = [ws for ws in with_imgs if ws.title.strip().lower() == 'products']
+        if prod:
+            notes.append(f"SPK 有 {len(with_imgs)} 個工作表含圖片，只取 Products。")
+            with_imgs = prod
+    for ws in with_imgs:
+        dpci_col = None
+        for row in ws.iter_rows(min_row=1, max_row=15):
+            for c in row:
+                if isinstance(c.value, str) and c.value.strip().upper() == 'DPCI':
+                    dpci_col, hdr_row = c.column, c.row
+                    break
+            if dpci_col:
+                break
+        if not dpci_col:
+            notes.append(f"工作表 {ws.title}：找不到 DPCI 欄，已略過。")
+            continue
+        missing = 0
+        for img in ws._images:
+            try:
+                r = img.anchor._from.row + 1
+                v = ws.cell(r, dpci_col).value
+                d = re.sub(r'[\s ]', '', str(v or '')).replace('/', '-')
+                if not re.match(r'^\d{3}-\d{2}-\d{4}$', d):
+                    missing += 1
+                    continue
+                im = _PILImage.open(io.BytesIO(img._data()))
+                im.save(os.path.join(out_dir, d + '.png'))
+                saved += 1
+            except Exception:
+                missing += 1
+        if missing:
+            notes.append(f"工作表 {ws.title}：{missing} 張圖片所在列沒有有效 DPCI，已略過。")
+    return saved, notes
+
+
+def collect_grid_images(image_files, out_dir):
+    """圖片 zip（可巢狀）、單張圖片、SPK .xlsx → 全部攤平成 out_dir/<DPCI>.png|jpg。回傳 (張數, 訊息)。"""
+    import zipfile
+    notes, count = [], 0
+
+    def take_zip(data, depth=0):
+        nonlocal count
+        try:
+            z = zipfile.ZipFile(io.BytesIO(data))
+        except Exception as e:
+            notes.append(f"圖片 zip 讀取失敗：{e}")
+            return
+        for n in z.namelist():
+            low = n.lower()
+            base = os.path.basename(n)
+            if low.endswith('.zip') and depth < 3:
+                take_zip(z.read(n), depth + 1)
+            elif low.endswith(('.png', '.jpg', '.jpeg')) and base and not base.startswith('.'):
+                stem = re.sub(r'[\s ]', '', os.path.splitext(base)[0])
+                m = re.search(r'(\d{3})[-_ ]?(\d{2})[-_ ]?(\d{4})', stem)
+                if not m:
+                    continue
+                with open(os.path.join(out_dir, '%s-%s-%s%s' % (m.group(1), m.group(2), m.group(3),
+                                                              os.path.splitext(base)[1].lower())), 'wb') as fh:
+                    fh.write(z.read(n))
+                count += 1
+
+    for f in image_files or []:
+        name = getattr(f, 'name', '')
+        try:
+            f.seek(0)
+        except Exception:
+            pass
+        data = f.read()
+        low = name.lower()
+        if low.endswith('.zip'):
+            take_zip(data)
+        elif low.endswith(('.xlsx', '.xlsm')):
+            n, ns = extract_spk_images(data, out_dir)
+            count += n
+            notes += [f"{name}：{x}" for x in ns]
+        elif low.endswith(('.png', '.jpg', '.jpeg')):
+            m = re.search(r'(\d{3})[-_ ]?(\d{2})[-_ ]?(\d{4})', name)
+            if m:
+                with open(os.path.join(out_dir, '%s-%s-%s%s' % (m.group(1), m.group(2), m.group(3),
+                                                              os.path.splitext(low)[1])), 'wb') as fh:
+                    fh.write(data)
+                count += 1
+    return count, notes
+
+
+def _json_tail(text):
+    """腳本 stdout 末段的 JSON 物件（解析不到回傳 {}）。"""
+    try:
+        return json.loads(text[text.index('{'):text.rindex('}') + 1])
+    except Exception:
+        return {}
+
+
+def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_grid, title):
+    """
+    產生 PO GRID。existing_grid 有上傳 → 更新模式（保留原檔圖片與手填內容，只補數量／插入新 PO 欄）；
+    沒上傳 → 重建模式（每間工廠一個工作表）。
+    回傳 dict：ok / mode / data(bytes) / filename / report / notes / log
+    """
+    import subprocess, sys, tempfile
+    eng = _grid_engine_dir()
+    res = {'ok': False, 'mode': 'update' if existing_grid is not None else 'create',
+           'data': None, 'filename': None, 'report': {}, 'notes': [], 'log': ''}
+    need = ['parse_po_pdfs.py', 'reconcile.py', 'build_grid.py', 'update_grid.py']
+    lost = [n for n in need if not os.path.exists(os.path.join(eng, n))]
+    if lost:
+        res['notes'].append("找不到 grid_engine 資料夾內的腳本：" + ", ".join(lost) + "。請確認已連同 app.py 一起部署。")
+        return res
+
+    def run(args):
+        p = subprocess.run([sys.executable] + args, capture_output=True, text=True, timeout=900)
+        res['log'] += f"\n$ {os.path.basename(args[0])}\n{p.stdout[-3000:]}\n{p.stderr[-1500:]}"
+        return p
+
+    with tempfile.TemporaryDirectory() as td:
+        pos_dir = os.path.join(td, 'pos')
+        os.makedirs(pos_dir)
+        cache, used = {}, set()
+        for d in live_docs:
+            mmdd = d.get('fname_date') or '0101'
+            name = f"240_{d['po']}_{mmdd}.pdf"
+            if name in used:
+                name = f"240_{d['po']}-{d['dc']}_{mmdd}.pdf"
+            used.add(name)
+            path = os.path.join(pos_dir, name)
+            open(path, 'wb').close()               # 佔位檔；文字直接由快取提供，不需再讀 PDF
+            cache[path] = d['text']
+        work = os.path.join(td, 'work')
+        os.makedirs(work)
+        with open(os.path.join(work, 'text.json'), 'w', encoding='utf-8') as fh:
+            json.dump(cache, fh, ensure_ascii=False)
+
+        p = run([os.path.join(eng, 'parse_po_pdfs.py'), '--input', pos_dir, '--outdir', work])
+        parse_rep = _json_tail(p.stdout)
+        if not os.path.exists(os.path.join(work, 'items.json')):
+            res['notes'].append("PO 解析步驟失敗，無法產生 GRID。")
+            return res
+        if parse_rep.get('problems_by_kind'):
+            res['notes'].append(f"PO 內部驗算有問題：{parse_rep['problems_by_kind']}（GRID 仍會產生，請複核這些 PO）")
+
+        safe_title = re.sub(r'[^\w\-]+', '_', title).strip('_') or 'PO_GRID'
+
+        # ───────── 更新既有 GRID ─────────
+        if existing_grid is not None:
+            gpath = os.path.join(td, 'grid_in.xlsx')
+            existing_grid.seek(0)
+            with open(gpath, 'wb') as fh:
+                fh.write(existing_grid.read())
+            out = os.path.join(td, 'grid_out.xlsx')
+            p = run([os.path.join(eng, 'update_grid.py'), '--grid', gpath,
+                     '--data', os.path.join(work, 'grid.json'),
+                     '--po-meta', os.path.join(work, 'items.json'), '--out', out])
+            res['report'] = _json_tail(p.stdout)
+            if not os.path.exists(out):
+                res['notes'].append("更新既有 GRID 失敗（版面可能與標準 GRID 不同）。可改為不上傳既有 GRID，直接重建。")
+                return res
+            res['data'] = open(out, 'rb').read()
+            base = re.sub(r'\.xlsx$', '', getattr(existing_grid, 'name', safe_title), flags=re.I)
+            res['filename'] = f"{base}_updated_{datetime.now().strftime('%m%d')}.xlsx"
+            res['ok'] = True
+            return res
+
+        # ───────── 重建 ─────────
+        args = [os.path.join(eng, 'reconcile.py'), '--items', os.path.join(work, 'items.json'), '--outdir', work]
+        xl_masters = [m for m in master_files if getattr(m, 'name', '').lower().endswith(('.xlsx', '.xlsm'))]
+        if not xl_masters:
+            res['notes'].append("產生 GRID 需要 Excel 格式（.xlsx）的產品資料表。")
+            return res
+        for k, mf in enumerate(xl_masters):
+            mpath = os.path.join(td, f'master_{k}.xlsx')
+            mf.seek(0)
+            with open(mpath, 'wb') as fh:
+                fh.write(mf.read())
+            label = title if len(xl_masters) == 1 else re.sub(r'\.xls[xm]$', '', mf.name, flags=re.I)
+            args += ['--master', f"{label}={mpath}"]
+        import openpyxl
+        for k, af in enumerate(asst_files or []):
+            apath = os.path.join(td, f'asst_{k}.xlsx')
+            af.seek(0)
+            with open(apath, 'wb') as fh:
+                fh.write(af.read())
+            try:
+                wb = openpyxl.load_workbook(apath, read_only=True, data_only=True)
+                for ws in wb.worksheets:
+                    hit = False
+                    for row in ws.iter_rows(min_row=1, max_row=40, values_only=True):
+                        cells = {str(c).strip() for c in row if c}
+                        if cells & {'Component Item DPCI', 'Item DPCI'} and 'Assortment DPCI' in cells:
+                            hit = True
+                            break
+                    if hit:
+                        args += ['--assortment', f"{apath}:{ws.title}"]
+                wb.close()
+            except Exception as e:
+                res['notes'].append(f"混裝表 {getattr(af, 'name', '')} 讀取失敗：{e}")
+        p = run(args)
+        if not os.path.exists(os.path.join(work, 'recon.json')):
+            msg = (p.stdout + p.stderr).strip().splitlines()[-1:] or ['']
+            res['notes'].append("主檔比對步驟失敗：" + msg[0][:300])
+            return res
+        recon_rep = _json_tail(p.stdout)
+
+        img_dir = os.path.join(td, 'imgs')
+        os.makedirs(img_dir)
+        n_img, img_notes = collect_grid_images(image_files, img_dir)
+        res['notes'] += img_notes
+
+        out = os.path.join(td, 'grid.xlsx')
+        rpt = os.path.join(td, 'build_report.json')
+        build = [os.path.join(eng, 'build_grid.py'), '--recon', os.path.join(work, 'recon.json'),
+                 '--items', os.path.join(work, 'items.json'), '--title', title,
+                 '--out', out, '--report', rpt, '--no-recalc']
+        if n_img:
+            build += ['--images', img_dir]
+        p = run(build)
+        if not os.path.exists(out):
+            gaps = _json_tail(p.stdout).get('gaps')
+            if gaps:
+                res['notes'].append("以下 PO 讀不到 PO 類型或 Shipping Window，該欄表頭會留空，請人工補上：" +
+                                    ", ".join(f"{g_['po']}（{g_['missing']}）" for g_ in gaps))
+                p = run(build + ['--allow-header-gaps'])
+        if not os.path.exists(out):
+            res['notes'].append("GRID 建立步驟失敗。")
+            return res
+        rep = json.load(open(rpt, encoding='utf-8')) if os.path.exists(rpt) else {}
+        rep['findings_counts'] = recon_rep.get('findings_counts', {})
+        rep['images_supplied'] = n_img
+        res['report'] = rep
+        res['data'] = open(out, 'rb').read()
+        res['filename'] = f"{safe_title}_PO_GRID_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        res['ok'] = True
+        return res
+
 
 # ==========================================
 # 6. 共通驗證引擎（G2 / G4 / G6 / N2 / N3 / N4 / N6 整合）
@@ -1609,6 +1878,8 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
     run_meta = run_meta or {'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'input_files': source_label}
     excel_bytes = make_excel_bytes(result_df, run_meta, source_label, validation_notes=validation_notes, merged_df_full=merged_df, summary_ctx=summary_ctx)
     safe_label = re.sub(r'[^\w\-]', '_', source_label)
+    st.session_state['last_report'] = {
+        'data': excel_bytes, 'name': f'PO_Validation_{safe_label}_{datetime.now().strftime("%Y%m%d_%H%M")}.xlsx'}
     st.download_button(
         "📥 下載完整核對報告 (Excel：核對結果 + PO GRID + 驗核摘要 + 執行摘要)",
         data=excel_bytes,
@@ -1641,6 +1912,15 @@ st.sidebar.header("🏭 步驟 2（選填）：工廠 & 人員")
 dispatch_files = st.sidebar.file_uploader("工廠&人員隸屬清單（Factory / AE / AC）", type=['csv', 'xlsx'], accept_multiple_files=True)
 dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.DataFrame()
 
+st.sidebar.markdown("---")
+st.sidebar.header("📊 步驟 3（選填）：PO GRID")
+grid_title_input = st.sidebar.text_input("GRID 標題（例：D240 27C2 EASTER）", value="")
+grid_image_files = st.sidebar.file_uploader(
+    "產品圖片：圖片 zip（檔名為 DPCI）或 SPK Workspace .xlsx", type=['zip', 'xlsx', 'xlsm', 'png', 'jpg', 'jpeg'],
+    accept_multiple_files=True, key="grid_imgs")
+grid_existing_file = st.sidebar.file_uploader(
+    "既有 PO GRID（有上傳 → 更新這份；沒上傳 → 重建新的）", type=['xlsx'], key="grid_existing")
+
 # ==========================================
 # 主介面：PDF 上傳解析
 # ==========================================
@@ -1650,6 +1930,8 @@ if True:
     pdf_files = st.file_uploader("", type=['pdf'], accept_multiple_files=True, key="pdf_po", label_visibility="collapsed")
 
     if st.button("🚀 解析 PDF 並執行核對", type="primary", key="btn_pdf"):
+        st.session_state.pop('grid_out', None)
+        st.session_state.pop('last_report', None)
         if not product_files or not pdf_files:
             st.warning("⚠️ 請確保已在側邊欄上傳「產品資料表」，並在上方上傳 PDF！")
         else:
@@ -1739,3 +2021,76 @@ if True:
                     'input_files': f"PDFs: {pinfo['n_files']} files / {pinfo['n_pos']} POs | Products: {', '.join(f.name for f in product_files)}"
                 }
                 show_results(merged_df, 'PDF', run_meta=run_meta, validation_notes=all_warnings, summary_ctx=summary_ctx)
+
+                # ── PO GRID：有上傳既有 GRID → 更新；否則重建 ──
+                grid_title = grid_title_input.strip() or summary_ctx['title']
+                with st.spinner("PO GRID 產生中..."):
+                    gres = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
+                                           grid_image_files or [], grid_existing_file, grid_title)
+                    grebuild = None
+                    if gres['ok'] and gres['mode'] == 'update':
+                        no_row = [x for x in gres['report'].get('needs_attention', []) if x.get('dpci')]
+                        if no_row:      # 既有 GRID 缺列 → 另外提供一份完整重建版
+                            grebuild = run_grid_engine(pinfo['live_docs'], product_files, asst_files or [],
+                                                       grid_image_files or [], None, grid_title)
+                st.session_state['grid_out'] = {'main': gres, 'rebuild': grebuild}
+
+
+def render_grid_section(go):
+    """PO GRID 結果與下載（存在 session_state，按下載後不會消失）。"""
+    gres, grebuild = go['main'], go.get('rebuild')
+    st.markdown("---")
+    st.markdown("### 📊 PO GRID")
+    for n in gres['notes']:
+        st.warning(n)
+    if not gres['ok']:
+        st.error("PO GRID 未能產生。")
+        with st.expander("技術訊息"):
+            st.code(gres['log'][-3000:])
+        return
+    rep_ = gres['report']
+    xlsx_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    if gres['mode'] == 'create':
+        st.success(f"已重建 PO GRID：{rep_.get('sheet_count', '?')} 個工廠工作表、{rep_.get('item_count', '?')} 個品項、"
+                   f"{rep_.get('image_count', 0)} 張圖片。")
+        if rep_.get('no_image') and rep_.get('images_supplied'):
+            with st.expander(f"🖼️ {len(rep_['no_image'])} 個品項沒有對應圖片（點擊展開）"):
+                st.write(", ".join(rep_['no_image']))
+        elif not rep_.get('images_supplied'):
+            st.info("未上傳圖片，PICTURE 欄留空。可在側邊欄上傳圖片 zip 或 SPK 檔後重跑。")
+        if rep_.get('unmapped_dc'):
+            st.warning("以下 DC 代碼尚無確認過的目的地，DES PORT 列直接顯示代碼，請人工確認：" +
+                       "；".join(f"{dc}（PO {', '.join(pos)}）" for dc, pos in rep_['unmapped_dc'].items()))
+        st.download_button("📥 下載 PO GRID（重建）", data=gres['data'], file_name=gres['filename'],
+                           mime=xlsx_mime, key="dl_grid_main")
+    else:
+        ins = rep_.get('inserted', [])
+        st.success(f"已更新既有 PO GRID：寫入 {len(rep_.get('written', []))} 格數量、新增 {len(ins)} 個 PO 欄；"
+                   f"原有圖片 {rep_.get('media_before', 0)} 張{'完整保留' if rep_.get('image_integrity') else '請檢查'}。")
+        if ins:
+            with st.expander(f"➕ 新增的 PO 欄（{len(ins)}）", expanded=True):
+                st.dataframe(pd.DataFrame([{'工作表': i.get('sheet'), 'PO': i.get('po'), '欄': i.get('column'),
+                                            '類型': i.get('label'), 'Ship Window': i.get('window'),
+                                            '目的地': i.get('dest'), '備註': i.get('note', '')} for i in ins]),
+                             hide_index=True, use_container_width=True)
+        att = rep_.get('needs_attention', [])
+        if att:
+            with st.expander(f"⚠️ {len(att)} 項需要人工處理（點擊展開）", expanded=True):
+                st.dataframe(pd.DataFrame([{'工作表': x.get('sheet', ''), 'DPCI': x.get('dpci', ''),
+                                            'PO': x.get('po') or ', '.join(x.get('pos', [])),
+                                            '問題': x.get('issue', ''), '建議': x.get('next_step', '')} for x in att]),
+                             hide_index=True, use_container_width=True)
+        st.download_button("📥 下載 PO GRID（更新版，保留原檔圖片與手填內容）", data=gres['data'],
+                           file_name=gres['filename'], mime=xlsx_mime, key="dl_grid_main")
+        if grebuild and grebuild['ok']:
+            st.info("既有 GRID 缺少部分品項的列，更新模式無法新增列。另外提供一份完整重建版（不含原檔的手填內容）。")
+            st.download_button("📥 下載 PO GRID（完整重建版）", data=grebuild['data'],
+                               file_name=grebuild['filename'], mime=xlsx_mime, key="dl_grid_rebuild")
+    if st.session_state.get('last_report'):
+        lr = st.session_state['last_report']
+        st.download_button("📥 下載核對報告 (Excel)", data=lr['data'], file_name=lr['name'], mime=xlsx_mime,
+                           key="dl_report_persist")
+
+
+if st.session_state.get('grid_out'):
+    render_grid_section(st.session_state['grid_out'])
