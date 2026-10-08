@@ -97,6 +97,14 @@ def short_name(f):
     return (re.sub(r'\s+', ' ', s).strip() or str(f))[:28]
 
 
+def maker_name(f):
+    """Factory name for the MAKER cell: legal suffixes stripped, NOT cut to 28
+    characters (that limit only exists for sheet tabs)."""
+    s = re.sub(r'\b(CO|LTD|LIMITED|COMPANY|INC|CORP)\b\.?,?', '', str(f), flags=re.I)
+    s = re.sub(r'[.,]+', ' ', s)
+    return re.sub(r'\s+', ' ', s).strip() or str(f)
+
+
 def sheet_title(name, used):
     t = re.sub(r'[\\/*?:\[\]]', '-', short_name(name))[:31] or 'SHEET'
     base, n = t, 2
@@ -443,7 +451,7 @@ def main():
                 c.border, c.font = BORDER, Font(FONT, 10)
                 if col == 4:
                     c.alignment = Alignment('left', 'center', wrap_text=True)
-                elif col in (1, 2, 6, 7, 9):
+                elif col in (1, 2, 6, 7, 8, 9):
                     c.alignment = Alignment('center', 'center', wrap_text=True)
                 else:
                     c.alignment = Alignment('center', 'center')
@@ -458,7 +466,9 @@ def main():
             ws.cell(r, 4, rec['desc'])
             ws.cell(r, 5, str(rec['barcode'] or ''))
             ws.cell(r, 6, rec['material'])
-            ws.cell(r, 8, '%s / %s' % (short_name(factory), rec['factory_id'] or ''))
+            # factory name and ID on separate lines so the column can stay narrow
+            ws.cell(r, 8, '%s\n%s' % (maker_name(factory), rec['factory_id'] or '')
+                    if rec['factory_id'] else maker_name(factory))
             retail = rec['retail']
             seal = ('$%.2f' % retail) if isinstance(retail, (int, float)) else ''
             if rec.get('pack_format'):
@@ -520,8 +530,12 @@ def main():
                 write_item(r, rec)
                 r += 1
 
+        # MAKER (H) width follows the longest factory name on this sheet
+        # (very long names wrap onto a second line inside the 78pt-high row)
+        maker_w = min(len(maker_name(factory)), 30) * 1.1 + 2
+        ws.column_dimensions['H'].width = round(max(maker_w, 12.625), 2)
         ws.freeze_panes = 'D6'
-        ws.sheet_view.zoomScale = 80
+        ws.sheet_view.zoomScale = 100
         report['sheets'].append({'sheet': ws.title, 'factory': factory,
                                  'items': len(recs), 'po_cols': len(pos),
                                  'assortments': sorted(sheet_asst)})

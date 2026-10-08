@@ -1863,11 +1863,12 @@ dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.
 
 st.sidebar.markdown("---")
 st.sidebar.header("📊 步驟 3（選填）：PO GRID")
-st.sidebar.caption("核對完成後會一併產生一份新的 PO GRID（每間工廠一個工作表）。以下三項都可以不填。")
+st.sidebar.caption("核對完成後會一併產生一份新的 PO GRID（每間工廠一個工作表）。"
+                   "以下三項都可以不填：① GRID 標題　② 產品圖片　③ 更新 PO GRID")
 grid_title_input = st.sidebar.text_input(
-    "GRID 標題", value="", placeholder="例：D240 27C2 EASTER",
+    "① GRID 標題", value="", placeholder="例：D240 27C2 EASTER",
     help="顯示在每個工作表左上角，也會用在下載的檔名。空白時用產品資料表的檔名。")
-st.sidebar.markdown("**產品圖片**")
+st.sidebar.markdown("**② 產品圖片**")
 st.sidebar.caption("放進 GRID 的 PICTURE 欄，二選一或混用：\n\n"
                    "• **圖片 zip**：檔名要含 DPCI（例：240-04-8085.png），zip 裡再包 zip 也可以\n\n"
                    "• **SPK Workspace 匯出的 .xlsx**：自動抽出 Products 工作表的縮圖，依 DPCI 對應\n\n"
@@ -1875,7 +1876,7 @@ st.sidebar.caption("放進 GRID 的 PICTURE 欄，二選一或混用：\n\n"
 grid_image_files = st.sidebar.file_uploader(
     "產品圖片", type=['zip', 'xlsx', 'xlsm', 'png', 'jpg', 'jpeg'],
     accept_multiple_files=True, key="grid_imgs", label_visibility="collapsed")
-st.sidebar.markdown("**更新 PO GRID**")
+st.sidebar.markdown("**③ 更新 PO GRID**")
 st.sidebar.caption("要在現有的 PO GRID 上加入新 PO 時，把那份 GRID 上傳到這裡。"
                    "會在原檔上補入數量、為新 PO 加欄，原檔的圖片與手填內容（AGE、工廠料號等）都保留。")
 grid_existing_file = st.sidebar.file_uploader(
