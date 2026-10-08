@@ -1447,6 +1447,63 @@ def build_po_grid(merged_df):
 
     return grid_pivot
 
+# ==========================================
+# 顯示格式：金額加 $、數量加千分位（畫面與 Excel 共用同一份欄位清單）
+# ==========================================
+MONEY_COLS = {'主檔成本', 'PO 單價', '主檔零售', 'PO 零售',
+              'ITEM UNIT COST', 'Target_Cost', 'ITEM UNIT RETAIL', 'Suggested Unit Retail', 'Asst_Box_Cost'}
+QTY_COLS = {'PO 數量', 'PO 數量（含 Assortment 內含）', 'PCN Commit Qty', '差異', 'Case Pack',
+            '應為（箱數×入數）', 'DPCI 合計',
+            'Final_QTY', 'Box_QTY', 'Final_QTY_for_count', 'PO Total QTY', 'QTY Diff',
+            'PO VCP / Assort QTY', 'Target Case / Assort QTY', 'COMPONENT ASSORT QTY', 'Expected_Component_QTY'}
+XL_MONEY_FMT = '"$"#,##0.00##'
+XL_QTY_FMT = '#,##0'
+
+
+def fmt_money(v):
+    """$1.09、$0.219、$1,234.50；空值回傳空字串。"""
+    try:
+        if v is None or pd.isna(v):
+            return ''
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    txt = f"{abs(v):,.4f}".rstrip('0')
+    if len(txt.split('.')[1]) < 2:
+        txt = f"{abs(v):,.2f}"
+    return ('-$' if v < 0 else '$') + txt
+
+
+def fmt_qty(v):
+    try:
+        if v is None or pd.isna(v):
+            return ''
+        return f"{float(v):,.0f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def styled_for_screen(df):
+    """依欄名套用 $ 與千分位（只改顯示，不改資料）。"""
+    fmt = {c: fmt_money for c in df.columns if c in MONEY_COLS and pd.api.types.is_numeric_dtype(df[c])}
+    fmt.update({c: fmt_qty for c in df.columns if c in QTY_COLS and pd.api.types.is_numeric_dtype(df[c])})
+    if '差異 %' in df.columns and pd.api.types.is_numeric_dtype(df['差異 %']):
+        fmt['差異 %'] = lambda v: '' if pd.isna(v) else f"{v:,.1f}%"
+    return df.style.format(fmt, na_rep='')
+
+
+def apply_excel_number_formats(ws, header_row=1, first_data_row=None, last_row=None):
+    """依表頭名稱幫整欄設定 Excel 數字格式（數值仍是數字，可加總）。"""
+    first_data_row = first_data_row or header_row + 1
+    last_row = last_row or ws.max_row
+    for c in ws[header_row]:
+        name = str(c.value).strip() if c.value is not None else ''
+        f = XL_MONEY_FMT if name in MONEY_COLS else (XL_QTY_FMT if name in QTY_COLS else None)
+        if f:
+            for r in range(first_data_row, last_row + 1):
+                ws.cell(r, c.column).number_format = f
+
+
 def build_validation_summary(merged_df, ctx=None):
     """
     第一頁總結（對齊 po-grid Skill 的 Validation Summary）：
@@ -1480,13 +1537,13 @@ def build_validation_summary(merged_df, ctx=None):
     cm = m[(m['Cost Match'] == False) & ~m.index.isin(unk.index)]
     cost_df = pd.DataFrame([{
         'DPCI': d, '品名': _desc(g), '類型': {'line': '一般', 'box': 'Assortment', 'component': 'Assortment'}.get(g['Row_Type'].iloc[0], ''),
-        '主檔成本': g['Target_Cost'].iloc[0], 'PO 單價': ', '.join(sorted({f"{v:g}" for v in g['ITEM UNIT COST'].dropna()})) or '讀不到',
+        '主檔成本': g['Target_Cost'].iloc[0], 'PO 單價': ', '.join(fmt_money(v) for v in sorted(set(g['ITEM UNIT COST'].dropna()))) or '讀不到',
         'PO': _pos(g['PO NUMBER'])} for d, g in cm.groupby('Final_DPCI')])
     # 3. 零售不符
     rm = m[(m['Retail Match'] == False) & ~m.index.isin(unk.index)]
     retail_df = pd.DataFrame([{
         'DPCI': d, '品名': _desc(g), '主檔零售': g['Suggested Unit Retail'].iloc[0] if 'Suggested Unit Retail' in g else np.nan,
-        'PO 零售': ', '.join(sorted({f"{v:.2f}" for v in g['ITEM UNIT RETAIL'].dropna()})) or '讀不到',
+        'PO 零售': ', '.join(fmt_money(v) for v in sorted(set(g['ITEM UNIT RETAIL'].dropna()))) or '讀不到',
         'PO': _pos(g['PO NUMBER'])} for d, g in rm.groupby('Final_DPCI')])
     # 4. 數量 vs 計畫
     qm = m[not_box & (m['Total QTY Match'] == False) & m['Target Commit QTY'].notna()].drop_duplicates('Final_DPCI')
@@ -1603,13 +1660,21 @@ def write_summary_sheet(wb, title, checks, details, headline, run_meta):
             c.font = Font(bold=True)
             c.fill = grey
         r += 1
+        cols = list(df.columns)
         for row in df.itertuples(index=False):
             for j, v in enumerate(row, 1):
                 if isinstance(v, (np.floating, float)):
                     v = None if pd.isna(v) else (int(v) if float(v).is_integer() else float(v))
                 elif isinstance(v, np.integer):
                     v = int(v)
-                ws.cell(r, j, v)
+                c = ws.cell(r, j, v)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    if cols[j - 1] in MONEY_COLS:
+                        c.number_format = XL_MONEY_FMT
+                    elif cols[j - 1] in QTY_COLS:
+                        c.number_format = XL_QTY_FMT
+                    elif cols[j - 1] == '差異 %':
+                        c.number_format = '0.0"%"'
             r += 1
     ws.column_dimensions['A'].width = 54
     for col, w in zip('BCDEFGH', [26, 22, 22, 22, 40, 14, 14]):
@@ -1646,6 +1711,7 @@ def make_excel_bytes(result_df, run_meta, source_label, validation_notes=None, m
         # 格式：凍結首列、自動欄寬
         ws = writer.sheets['核對結果']
         ws.freeze_panes = 'A2'
+        apply_excel_number_formats(ws)
         for col_cells in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col_cells if cell.value), default=8)
             ws.column_dimensions[col_cells[0].column_letter].width = min(max_len + 2, 30)
@@ -1712,7 +1778,7 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
     st.dataframe(chk_df.style.apply(_chk_color, axis=1), hide_index=True, use_container_width=True)
     for dtitle, ddf in details:
         with st.expander(f"{dtitle}（{len(ddf)}）", expanded=len(ddf) <= 10 and '已略過' not in dtitle and '其他 Program' not in dtitle):
-            st.dataframe(ddf, hide_index=True, use_container_width=True)
+            st.dataframe(styled_for_screen(ddf), hide_index=True, use_container_width=True)
 
     # ── 逐筆異常（只列有問題的 PO 品項列；完整逐筆結果在 Excel「核對結果」）──
     errors_df = result_df[result_df['All Match (Pass)'] == False]
@@ -1728,12 +1794,10 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
         view = errors_df[[c for c in screen_cols if c in errors_df.columns]].rename(columns=screen_cols)
         if '類型' in view.columns:
             view['類型'] = view['類型'].astype(str).str.replace(r'^[^\w(]+', '', regex=True)
-        fmt = {c: '{:,.0f}' for c in ['PO 數量', 'DPCI 合計', 'PCN Commit Qty'] if c in view.columns}
-        fmt.update({c: '{:g}' for c in ['PO 單價', '主檔成本', 'PO 零售', '主檔零售', '差異 %'] if c in view.columns})
         bool_cols = [c for c in ['成本', '零售', '數量'] if c in view.columns]
         def _bad(v):
             return 'background-color: #F8CBAD; color: #000' if v is False or v == False else ''
-        styler = view.style.format(fmt, na_rep='')
+        styler = styled_for_screen(view)
         styler = styler.map(_bad, subset=bool_cols) if hasattr(styler, 'map') else styler.applymap(_bad, subset=bool_cols)
         with st.expander(f"❌ 逐筆異常明細（{len(errors_df)} 筆 PO 品項列）", expanded=False):
             st.dataframe(styler, hide_index=True, use_container_width=True)
@@ -1774,12 +1838,24 @@ dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.
 
 st.sidebar.markdown("---")
 st.sidebar.header("📊 步驟 3（選填）：PO GRID")
-grid_title_input = st.sidebar.text_input("GRID 標題（例：D240 27C2 EASTER）", value="")
+st.sidebar.caption("核對完成後會一併產生 PO GRID（每間工廠一個工作表）。以下三項都可以不填。")
+grid_title_input = st.sidebar.text_input(
+    "GRID 標題", value="", placeholder="例：D240 27C2 EASTER",
+    help="顯示在每個工作表左上角，也會用在下載的檔名。空白時用產品資料表的檔名。")
+st.sidebar.markdown("**產品圖片**")
+st.sidebar.caption("放進 GRID 的 PICTURE 欄，二選一或混用：\n\n"
+                   "• **圖片 zip**：檔名要含 DPCI（例：240-04-8085.png），zip 裡再包 zip 也可以\n\n"
+                   "• **SPK Workspace 匯出的 .xlsx**：自動抽出 Products 工作表的縮圖，依 DPCI 對應\n\n"
+                   "不上傳 → PICTURE 欄留空。")
 grid_image_files = st.sidebar.file_uploader(
-    "產品圖片：圖片 zip（檔名為 DPCI）或 SPK Workspace .xlsx", type=['zip', 'xlsx', 'xlsm', 'png', 'jpg', 'jpeg'],
-    accept_multiple_files=True, key="grid_imgs")
+    "產品圖片", type=['zip', 'xlsx', 'xlsm', 'png', 'jpg', 'jpeg'],
+    accept_multiple_files=True, key="grid_imgs", label_visibility="collapsed")
+st.sidebar.markdown("**上一版 PO GRID**")
+st.sidebar.caption("• **不上傳** → 用本次上傳的全部 PO 產生一份全新的 GRID（第一次做、或想重整版面時用）\n\n"
+                   "• **上傳** → 在這份 GRID 上補數量、為新 PO 加欄，原檔的圖片與手填內容（AGE、工廠料號等）都保留。"
+                   "若有新品項需要加列，會另外附一份全新版本。")
 grid_existing_file = st.sidebar.file_uploader(
-    "既有 PO GRID（有上傳 → 更新這份；沒上傳 → 重建新的）", type=['xlsx'], key="grid_existing")
+    "上一版 PO GRID", type=['xlsx'], key="grid_existing", label_visibility="collapsed")
 
 # ==========================================
 # 主介面：PDF 上傳解析
@@ -1910,17 +1986,19 @@ def render_grid_section(go):
     rep_ = gres['report']
     xlsx_mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     if gres['mode'] == 'create':
-        st.success(f"已重建 PO GRID：{rep_.get('sheet_count', '?')} 個工廠工作表、{rep_.get('item_count', '?')} 個品項、"
-                   f"{rep_.get('image_count', 0)} 張圖片。")
+        n_items = rep_.get('item_count', 0) or 0
+        st.success(f"✅ 已依本次全部 PO 產生新的 PO GRID：{rep_.get('sheet_count', '?')} 間工廠（每間一個工作表）、"
+                   f"{n_items:,} 個品項，產品圖片 {rep_.get('image_count', 0):,} / {n_items:,} 張。")
         if rep_.get('no_image') and rep_.get('images_supplied'):
-            with st.expander(f"🖼️ {len(rep_['no_image'])} 個品項沒有對應圖片（點擊展開）"):
+            with st.expander(f"🖼️ {len(rep_['no_image'])} 個品項找不到對應圖片，PICTURE 欄留空（點擊展開）"):
                 st.write(", ".join(rep_['no_image']))
         elif not rep_.get('images_supplied'):
-            st.info("未上傳圖片，PICTURE 欄留空。可在側邊欄上傳圖片 zip 或 SPK 檔後重跑。")
+            st.caption("PICTURE 欄目前是空的。要放產品圖，請在左側「步驟 3 › 產品圖片」上傳圖片 zip 或 SPK 檔，"
+                       "再按一次「解析 PDF 並執行核對」。")
         if rep_.get('unmapped_dc'):
             st.warning("以下 DC 代碼尚無確認過的目的地，DES PORT 列直接顯示代碼，請人工確認：" +
                        "；".join(f"{dc}（PO {', '.join(pos)}）" for dc, pos in rep_['unmapped_dc'].items()))
-        st.download_button("📥 下載 PO GRID（重建）", data=gres['data'], file_name=gres['filename'],
+        st.download_button("📥 下載 PO GRID", data=gres['data'], file_name=gres['filename'],
                            mime=xlsx_mime, key="dl_grid_main")
     else:
         ins = rep_.get('inserted', [])
