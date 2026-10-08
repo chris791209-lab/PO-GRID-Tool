@@ -483,6 +483,27 @@ def add_summary_styles(base):
     return {n: x0 + i for i, n in enumerate(names)}
 
 
+def _zh_attention(x):
+    """Chinese wording for a needs-attention item (used only with --summary-json)."""
+    issue, nxt = str(x.get('issue', '')), str(x.get('next_step', ''))
+    table = [
+        ('DPCI is on a PO but has no row', '這個品項在上傳的 GRID 上沒有列',
+         '新品項：更新無法自動加列，請手動加列，或改用新產生的 PO GRID'),
+        ('PO has no column and no header metadata', '這張 PO 在 GRID 上沒有欄位，也讀不到表頭資料',
+         '請確認 PO PDF，或改用新產生的 PO GRID'),
+        ('PO type label or shipping window missing', '讀不到 PO 類型或 Shipping Window', '請確認 PO PDF 後重跑'),
+    ]
+    for key, zi, zn in table:
+        if issue.startswith(key):
+            return zi, zn
+    m = re.match(r'new PO-type label (\S+) has no fill', issue)
+    if m:
+        return 'PO 類型 %s 在原檔沒有對應底色' % m.group(1), '請手動調整這一欄的底色，或改用新產生的 PO GRID'
+    if 'rebuild' in nxt or 'po-grid' in nxt:
+        nxt = '請改用新產生的 PO GRID'
+    return issue, nxt
+
+
 def write_summary_xml(sheet_path, data, styles, inserted, attention):
     money = set(data.get('money_cols', []))
     qty = set(data.get('qty_cols', []))
@@ -530,8 +551,8 @@ def write_summary_xml(sheet_path, data, styles, inserted, attention):
         details.append({'title': '本次更新：需要人工處理',
                         'columns': ['DPCI / PO', '工作表', '問題', '建議'],
                         'rows': [[a_.get('dpci') or a_.get('po') or '', a_.get('sheet', ''),
-                                  a_.get('issue', '') + (' (POs: %s)' % ', '.join(a_['pos'][:6]) if a_.get('pos') else ''),
-                                  a_.get('next_step', '')] for a_ in attention]})
+                                  _zh_attention(a_)[0] + ('（PO：%s）' % ', '.join(a_['pos'][:6]) if a_.get('pos') else ''),
+                                  _zh_attention(a_)[1]] for a_ in attention]})
     for d in details:
         r += 1
         put(r, [(1, d['title'], 'section')])

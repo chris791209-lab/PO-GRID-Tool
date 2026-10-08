@@ -1361,7 +1361,7 @@ def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_g
         p = run(args)
         if not os.path.exists(os.path.join(work, 'recon.json')):
             msg = (p.stdout + p.stderr).strip().splitlines()[-1:] or ['']
-            res['notes'].append("主檔比對步驟失敗：" + msg[0][:300])
+            res['notes'].append("PCN 比對步驟失敗：" + msg[0][:300])
             return res
         recon_rep = _json_tail(p.stdout)
 
@@ -1713,7 +1713,7 @@ def build_po_grid(merged_df):
 # ==========================================
 # 顯示格式：金額加 $、數量加千分位（畫面與 Excel 共用同一份欄位清單）
 # ==========================================
-MONEY_COLS = {'主檔成本', 'PO 單價', '主檔零售', 'PO 零售',
+MONEY_COLS = {'PCN 成本', 'PO 單價', 'PCN 零售', 'PO 零售',
               'ITEM UNIT COST', 'Target_Cost', 'ITEM UNIT RETAIL', 'Suggested Unit Retail', 'Asst_Box_Cost'}
 QTY_COLS = {'PO 數量', 'PO 數量（含 Assortment 內含）', 'PCN Commit Qty', '差異', 'Case Pack',
             '應為（箱數×入數）', 'DPCI 合計',
@@ -1800,12 +1800,12 @@ def build_validation_summary(merged_df, ctx=None):
     cm = m[(m['Cost Match'] == False) & ~m.index.isin(unk.index)]
     cost_df = pd.DataFrame([{
         'DPCI': d, '品名': _desc(g), '類型': {'line': '一般', 'box': 'Assortment', 'component': 'Assortment'}.get(g['Row_Type'].iloc[0], ''),
-        '主檔成本': g['Target_Cost'].iloc[0], 'PO 單價': ', '.join(fmt_money(v) for v in sorted(set(g['ITEM UNIT COST'].dropna()))) or '讀不到',
+        'PCN 成本': g['Target_Cost'].iloc[0], 'PO 單價': ', '.join(fmt_money(v) for v in sorted(set(g['ITEM UNIT COST'].dropna()))) or '讀不到',
         'PO': _pos(g['PO NUMBER'])} for d, g in cm.groupby('Final_DPCI')])
     # 3. 零售不符
     rm = m[(m['Retail Match'] == False) & ~m.index.isin(unk.index)]
     retail_df = pd.DataFrame([{
-        'DPCI': d, '品名': _desc(g), '主檔零售': g['Suggested Unit Retail'].iloc[0] if 'Suggested Unit Retail' in g else np.nan,
+        'DPCI': d, '品名': _desc(g), 'PCN 零售': g['Suggested Unit Retail'].iloc[0] if 'Suggested Unit Retail' in g else np.nan,
         'PO 零售': ', '.join(fmt_money(v) for v in sorted(set(g['ITEM UNIT RETAIL'].dropna()))) or '讀不到',
         'PO': _pos(g['PO NUMBER'])} for d, g in rm.groupby('Final_DPCI')])
     # 4. 數量 vs 計畫
@@ -1823,7 +1823,7 @@ def build_validation_summary(merged_df, ctx=None):
         '說明': re.sub(r'^[^\w]+', '', str(r['Asst_Role']))} for _, r in am.iterrows()])
     # 7. UPC
     um = m[m.get('UPC Status', '') == '❌ 不符']
-    upc_df = pd.DataFrame([{'DPCI': d, 'PO UPC': g['PO UPC'].iloc[0], '主檔 Barcode': g['Target UPC'].iloc[0],
+    upc_df = pd.DataFrame([{'DPCI': d, 'PO UPC': g['PO UPC'].iloc[0], 'PCN Barcode': g['Target UPC'].iloc[0],
                             'PO': _pos(g['PO NUMBER'])} for d, g in um.groupby('Final_DPCI')])
 
     no_df = pd.DataFrame(ctx.get('not_ordered', []))
@@ -1841,9 +1841,9 @@ def build_validation_summary(merged_df, ctx=None):
     def st_(n):
         return 'OK' if n == 0 else 'REVIEW'
     checks = [
-        ('PO 品項不在主檔 (Unknown DPCI)', len(unk_df), st_(len(unk_df))),
-        ('成本不符：PO 單價 vs 主檔 FCA/FOB (Cost mismatch)', len(cost_df), st_(len(cost_df))),
-        ('零售不符：PO Resale vs 主檔 (Retail mismatch)', len(retail_df), st_(len(retail_df))),
+        ('PO 品項不在 PCN (Unknown DPCI)', len(unk_df), st_(len(unk_df))),
+        ('成本不符：PO 單價 vs PCN FCA/FOB (Cost mismatch)', len(cost_df), st_(len(cost_df))),
+        ('零售不符：PO Resale vs PCN (Retail mismatch)', len(retail_df), st_(len(retail_df))),
         ('PO數量 vs PCN Commit：超出整箱進位與 ±10% (Qty vs plan)', len(qty_df), st_(len(qty_df))),
         ('混裝不符：Box 與零件數量／混裝表 (Assortment mismatch)', len(asst_df_), st_(len(asst_df_))),
         ('UPC 不符', len(upc_df), st_(len(upc_df))),
@@ -1856,7 +1856,7 @@ def build_validation_summary(merged_df, ctx=None):
         ('其他 Program 的訂單（已略過）', len(skip_df), ''),
     ]
     for title, df in [
-        ('PO 品項不在主檔 — 明細', unk_df), ('成本不符 — 明細', cost_df), ('零售不符 — 明細', retail_df),
+        ('PO 品項不在 PCN — 明細', unk_df), ('成本不符 — 明細', cost_df), ('零售不符 — 明細', retail_df),
         ('PO數量 vs PCN Commit — 明細', qty_df), ('混裝不符 — 明細', asst_df_),
         ('UPC 不符 — 明細', upc_df), ('尚未下單(未收到PO的Item) — 明細', no_df), 
         ('PO 內部驗算未通過 — 明細', gate_df), ('無法解析的檔案／其他警告 — 明細', warn_df),
@@ -2049,8 +2049,8 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
     else:
         screen_cols = {
             'PO NUMBER': 'PO', 'DC': 'DC', 'Asst_Role': '類型', 'Final_DPCI': 'DPCI',
-            'Final_QTY': 'PO 數量', 'ITEM UNIT COST': 'PO 單價', 'Target_Cost': '主檔成本',
-            'ITEM UNIT RETAIL': 'PO 零售', 'Suggested Unit Retail': '主檔零售',
+            'Final_QTY': 'PO 數量', 'ITEM UNIT COST': 'PO 單價', 'Target_Cost': 'PCN 成本',
+            'ITEM UNIT RETAIL': 'PO 零售', 'Suggested Unit Retail': 'PCN 零售',
             'PO Total QTY': 'DPCI 合計', 'PCN Commit Qty': 'PCN Commit Qty', 'QTY Diff %': '差異 %',
             'UPC Status': 'UPC', 'Cost Match': '成本', 'Retail Match': '零售', 'Total QTY Match': '數量'}
         view = errors_df[[c for c in screen_cols if c in errors_df.columns]].rename(columns=screen_cols)
@@ -2242,6 +2242,25 @@ if True:
                     st.session_state['grid_out'] = {'new': gnew, 'update': gupd}
 
 
+def zh_attention(x):
+    """把 GRID 更新程式的英文提示轉成中文（畫面與 GRID 第一頁共用同一套說法）。"""
+    issue, nxt = str(x.get('issue', '')), str(x.get('next_step', ''))
+    m = re.match(r'new PO-type label (\S+) has no fill', issue)
+    table = [
+        ('DPCI is on a PO but has no row', '這個品項在上傳的 GRID 上沒有列', '新品項：更新無法自動加列，請手動加列，或改用新產生的 PO GRID'),
+        ('PO has no column and no header metadata', '這張 PO 在 GRID 上沒有欄位，也讀不到表頭資料', '請確認 PO PDF，或改用新產生的 PO GRID'),
+        ('PO type label or shipping window missing', '讀不到 PO 類型或 Shipping Window', '請確認 PO PDF 後重跑'),
+    ]
+    for key, zi, zn in table:
+        if issue.startswith(key):
+            return zi, zn
+    if m:
+        return f'PO 類型 {m.group(1)} 在原檔沒有對應底色', '請手動調整這一欄的底色，或改用新產生的 PO GRID'
+    if 'rebuild' in nxt or 'po-grid' in nxt:
+        nxt = '請改用新產生的 PO GRID'
+    return issue, nxt
+
+
 def _show_verify(res, is_update=False):
     c = res.get('content')
     if c:
@@ -2258,7 +2277,7 @@ def _show_verify(res, is_update=False):
     if not v:
         return
     if v['conforms']:
-        st.caption("✅ 版面檢查通過：與 Skill 的 PO GRID 版面規格一致。")
+        st.caption("✅ 版面檢查通過：與標準 PO GRID 版面一致。")
     else:
         with st.expander(f"⚠️ 版面檢查發現 {len(v['problems'])} 項與標準版面不同"
                          + ("（可能是上傳的 GRID 原本就有）" if is_update else "") + "（點擊展開）"):
@@ -2317,7 +2336,7 @@ def render_grid_section(go):
             with st.expander(f"➕ 新增的 PO 欄（{len(ins)}）", expanded=False):
                 st.dataframe(pd.DataFrame([{'工作表': i.get('sheet'), 'PO': i.get('po'), '欄': i.get('column'),
                                             '類型': i.get('label'), 'Ship Window': i.get('window'),
-                                            '目的地': i.get('dest'), '備註': i.get('note', '')} for i in ins]),
+                                            '目的地': i.get('dest'), '備註': (i.get('note', '') if re.search(r'[\u4e00-\u9fff]', i.get('note', '')) else '')} for i in ins]),
                              hide_index=True, use_container_width=True)
         att = rep_.get('needs_attention', [])
         no_row = [x for x in att if x.get('dpci')]
@@ -2328,7 +2347,7 @@ def render_grid_section(go):
                                "可手動加列，或直接改用上方新產生的 PO GRID。")
                 st.dataframe(pd.DataFrame([{'工作表': x.get('sheet', ''), 'DPCI': x.get('dpci', ''),
                                             'PO': x.get('po') or ', '.join(x.get('pos', [])),
-                                            '問題': x.get('issue', ''), '建議': x.get('next_step', '')} for x in att]),
+                                            '問題': zh_attention(x)[0], '建議': zh_attention(x)[1]} for x in att]),
                              hide_index=True, use_container_width=True)
         _show_verify(gupd, is_update=True)
         st.download_button("📥 下載更新後的 PO GRID", data=gupd['data'], file_name=gupd['filename'],
