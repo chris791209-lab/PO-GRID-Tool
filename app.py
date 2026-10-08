@@ -1286,12 +1286,6 @@ def run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None):
     merged_df['UPC Status'] = np.where(
         ~upc_both_exist, '⚪ 無資料', np.where(merged_df['UPC Match'], '✅ 相符', '❌ 不符'))
 
-    # ---- G6: Box 成本反算：Σ(零件 FCA × 每箱入數) vs PO 上的 Box 單價 ----
-    merged_df['Asst_Cost_Status'] = np.where(
-        ~is_box | merged_df['Calc_Box_Cost'].isna() | merged_df['ITEM UNIT COST'].isna(), '⚪ N/A',
-        np.where((merged_df['Calc_Box_Cost'] - merged_df['ITEM UNIT COST']).abs() <= 0.005 + 1e-9,
-                 '✅ 反算相符', '❌ 反算不符'))
-
     # ---- N3: 零件數量展開：Box 箱數 × 每箱入數（混裝表）vs PO 零件數量 ----
     merged_df['Expected_Component_QTY'] = np.where(
         is_comp, pd.to_numeric(merged_df['Box_QTY'], errors='coerce') * merged_df['Units_in_Assortment'], np.nan)
@@ -1485,7 +1479,7 @@ def build_validation_summary(merged_df, ctx=None):
     # 2. 成本不符
     cm = m[(m['Cost Match'] == False) & ~m.index.isin(unk.index)]
     cost_df = pd.DataFrame([{
-        'DPCI': d, '品名': _desc(g), '類型': {'line': '一般', 'box': '混裝 Box', 'component': 'Box 零件'}.get(g['Row_Type'].iloc[0], ''),
+        'DPCI': d, '品名': _desc(g), '類型': {'line': '一般', 'box': 'Assortment', 'component': 'Assortment'}.get(g['Row_Type'].iloc[0], ''),
         '主檔成本': g['Target_Cost'].iloc[0], 'PO 單價': ', '.join(sorted({f"{v:g}" for v in g['ITEM UNIT COST'].dropna()})) or '讀不到',
         'PO': _pos(g['PO NUMBER'])} for d, g in cm.groupby('Final_DPCI')])
     # 3. 零售不符
@@ -1507,12 +1501,6 @@ def build_validation_summary(merged_df, ctx=None):
         'PO': r['PO NUMBER'], 'Box DPCI': r['Original_DPCI'], '零件 DPCI': r['Final_DPCI'] if r['Row_Type'] == 'component' else '',
         'PO 數量': r['Final_QTY'], '應為（箱數×入數）': r.get('Expected_Component_QTY', np.nan),
         '說明': re.sub(r'^[^\w]+', '', str(r['Asst_Role']))} for _, r in am.iterrows()])
-    # 6. Box 成本反算
-    bm = m[m.get('Asst_Cost_Status', '') == '❌ 反算不符']
-    box_df = pd.DataFrame([{
-        'Box DPCI': r['Original_DPCI'], 'PO': r['PO NUMBER'], 'PO Box 單價': r['ITEM UNIT COST'],
-        'Σ(零件主檔成本×入數)': round(r['Calc_Box_Cost'], 4), '差額': round(r['ITEM UNIT COST'] - r['Calc_Box_Cost'], 4)}
-        for _, r in bm.iterrows()])
     # 7. UPC
     um = m[m.get('UPC Status', '') == '❌ 不符']
     upc_df = pd.DataFrame([{'DPCI': d, 'PO UPC': g['PO UPC'].iloc[0], '主檔 Barcode': g['Target UPC'].iloc[0],
@@ -1537,11 +1525,10 @@ def build_validation_summary(merged_df, ctx=None):
         ('PO 品項不在主檔 (Unknown DPCI)', len(unk_df), st_(len(unk_df))),
         ('成本不符：PO 單價 vs 主檔 FCA/FOB (Cost mismatch)', len(cost_df), st_(len(cost_df))),
         ('零售不符：PO Resale vs 主檔 (Retail mismatch)', len(retail_df), st_(len(retail_df))),
-        ('數量 vs 計畫：超出整箱進位與 ±10% (Qty vs plan)', len(qty_df), st_(len(qty_df))),
+        ('PO數量 vs PCN Commit：超出整箱進位與 ±10% (Qty vs plan)', len(qty_df), st_(len(qty_df))),
         ('混裝不符：Box 與零件數量／混裝表 (Assortment mismatch)', len(asst_df_), st_(len(asst_df_))),
-        ('Box 成本反算不符 (Box cost reverse-check)', len(box_df), st_(len(box_df))),
         ('UPC 不符', len(upc_df), st_(len(upc_df))),
-        ('主檔有計畫但尚未下單 (Not yet ordered)', len(no_df), st_(len(no_df))),
+        ('尚未下單(未收到PO的Item) (Not yet ordered)', len(no_df), st_(len(no_df))),
         ('疑似重複 PO：不同 PO# 內容相同 (Duplicate PO groups)', len(dup_df), st_(len(dup_df))),
         ('PO 內部驗算未通過 (Self-check failed)', len(gate_df), st_(len(gate_df))),
         ('無法解析的檔案／其他警告', len(warn_df), st_(len(warn_df))),
@@ -1551,8 +1538,8 @@ def build_validation_summary(merged_df, ctx=None):
     ]
     for title, df in [
         ('PO 品項不在主檔 — 明細', unk_df), ('成本不符 — 明細', cost_df), ('零售不符 — 明細', retail_df),
-        ('數量 vs 計畫 — 明細', qty_df), ('混裝不符 — 明細', asst_df_), ('Box 成本反算不符 — 明細', box_df),
-        ('UPC 不符 — 明細', upc_df), ('尚未下單 — 明細', no_df), ('疑似重複 PO — 明細', dup_df),
+        ('PO數量 vs PCN Commit — 明細', qty_df), ('混裝不符 — 明細', asst_df_),
+        ('UPC 不符 — 明細', upc_df), ('尚未下單(未收到PO的Item) — 明細', no_df), ('疑似重複 PO — 明細', dup_df),
         ('PO 內部驗算未通過 — 明細', gate_df), ('無法解析的檔案／其他警告 — 明細', warn_df),
         ('已取消的 PO — 明細', can_df), ('多版本 PO — 明細', sup_df), ('其他 Program 的訂單 — 明細', skip_df)]:
         if len(df) > 0:
@@ -1725,9 +1712,6 @@ def make_excel_bytes(result_df, run_meta, source_label, validation_notes=None, m
         summary_rows.append({'檢核項目': 'UPC', '相符筆數': total - upc_fail - upc_na, '異常筆數': upc_fail, '建議動作': '請確認條碼' if upc_fail > 0 else '無需處理'})
 
         # Assortment cost
-        asst_fail = int((result_df.get('Asst_Cost_Status', pd.Series()) == '❌ 反算不符').sum())
-        summary_rows.append({'檢核項目': '混裝成本反算', '相符筆數': 0, '異常筆數': asst_fail, '建議動作': '請確認混裝箱成本計算' if asst_fail > 0 else '無需處理'})
-
         # Factory match
         factory_fail = int((result_df.get('Factory_Match_Status', pd.Series()) == '⚠️ 工廠不符').sum())
         if factory_fail > 0:
@@ -1793,7 +1777,7 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
         'Case QTY Match', 'PO VCP / Assort QTY', 'Target Case / Assort QTY',
         'Total QTY Match', 'PO Total QTY', 'Target Commit QTY', 'QTY Diff', 'QTY Diff %',
         'UPC Status', 'PO UPC', 'Target UPC',
-        'Asst_Cost_Status', 'Asst_Box_Cost', 'Calc_Box_Cost',
+        'Asst_Box_Cost',
         'Asst_QTY_Check', 'COMPONENT ASSORT QTY', 'Expected_Component_QTY',
         'Factory_Match_Status', 'Factory Name', 'Dispatch_Factory',
         'Dispatch_AC', 'Dispatch_AE', 'AC_Rule_Check', 'AE_Rule_Check',
@@ -1831,9 +1815,6 @@ def show_results(merged_df, source_label, run_meta=None, validation_notes=None, 
         upc_mismatch = int((result_df.get('UPC Status', pd.Series()) == '❌ 不符').sum())
         if upc_mismatch > 0:
             col_errors['UPC 不符'] = upc_mismatch
-        asst_mismatch = int((result_df.get('Asst_Cost_Status', pd.Series()) == '❌ 反算不符').sum())
-        if asst_mismatch > 0:
-            col_errors['混裝成本反算不符'] = asst_mismatch
         factory_mismatch = int((result_df.get('Factory_Match_Status', pd.Series()) == '⚠️ 工廠不符').sum())
         if factory_mismatch > 0:
             col_errors['Factory 工廠不符 (N6)'] = factory_mismatch
