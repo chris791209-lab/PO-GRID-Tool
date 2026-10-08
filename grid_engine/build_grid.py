@@ -186,6 +186,7 @@ def write_summary_from_json(wb, data):
         ws.cell(r, 1, k).font = Font(FONT, 10, bold=True)
         c = ws.cell(r, 2, v)
         c.alignment = Alignment(horizontal='left')
+        c.font = Font(FONT, 10)
         if k == '結論':
             c.font = Font(FONT, 10, bold=True, color='C00000' if '需確認' in str(v) else '548235')
         r += 1

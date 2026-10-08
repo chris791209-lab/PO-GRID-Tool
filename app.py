@@ -2197,7 +2197,24 @@ def make_excel_bytes(result_df, run_meta, source_label, validation_notes=None, m
             checks, details, headline = build_validation_summary(merged_df_full, ctx)
             write_summary_sheet(writer.book, ctx.get('title') or 'PO Validation', checks, details, headline, run_meta)
 
+        # 全部工作表統一 Arial（未指定字型時 Excel 會以預設的新細明體顯示）
+        _apply_arial(writer.book)
+
     return output.getvalue()
+
+
+def _apply_arial(wb):
+    from copy import copy
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for c in row:
+                if c.value is None:
+                    continue
+                f = copy(c.font)
+                f.name = 'Arial'
+                if not f.sz:
+                    f.sz = 10
+                c.font = f
 
 def show_results(merged_df, source_label, run_meta=None, validation_notes=None, summary_ctx=None):
     """
