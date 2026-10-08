@@ -1715,7 +1715,7 @@ def build_po_grid(merged_df):
 # ==========================================
 MONEY_COLS = {'PCN 成本', 'PO 單價', 'PCN 零售', 'PO 零售',
               'ITEM UNIT COST', 'Target_Cost', 'ITEM UNIT RETAIL', 'Suggested Unit Retail', 'Asst_Box_Cost'}
-QTY_COLS = {'PO 數量', 'PO 數量（含 Assortment 內含）', 'PCN Commit Qty', '差異', 'Case Pack',
+QTY_COLS = {'品項數（分派表）', '品項數（PCN）', 'PO 數量', 'PO 數量（含 Assortment 內含）', 'PCN Commit Qty', '差異', 'Case Pack',
             '應為（箱數×入數）', 'DPCI 合計',
             'Final_QTY', 'Box_QTY', 'Final_QTY_for_count', 'PO Total QTY', 'QTY Diff',
             'PO VCP / Assort QTY', 'Target Case / Assort QTY', 'COMPONENT ASSORT QTY', 'Expected_Component_QTY'}
@@ -1765,6 +1765,188 @@ def apply_excel_number_formats(ws, header_row=1, first_data_row=None, last_row=N
         if f:
             for r in range(first_data_row, last_row + 1):
                 ws.cell(r, c.column).number_format = f
+
+
+# ==========================================
+# 工廠 → AC / AE 分派表（選填二）
+# ==========================================
+def parse_dispatch_table(file):
+    """
+    讀取「工廠 → AC / AE」分派表。表格位置不固定：找含「工廠」與「AC」的表頭列（同一頁可有多張表），
+    合併儲存格會往下展開（Program、AE 常是合併格）。
+    回傳 {工廠: {'items': 品項數, 'ac': set, 'ae': set, 'programs': set}}
+    """
+    import openpyxl
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+    wb = openpyxl.load_workbook(io.BytesIO(file.read()), data_only=True)
+    out = {}
+    for ws in wb.worksheets:
+        grid = {}
+        for row in ws.iter_rows():
+            for c in row:
+                if c.value is not None:
+                    grid[(c.row, c.column)] = c.value
+        for rng in ws.merged_cells.ranges:          # 合併格：每一格都填上左上角的值
+            v = grid.get((rng.min_row, rng.min_col))
+            for r in range(rng.min_row, rng.max_row + 1):
+                for c in range(rng.min_col, rng.max_col + 1):
+                    grid.setdefault((r, c), v)
+
+        def txt(r, c):
+            v = grid.get((r, c))
+            return str(v).strip() if v is not None else ''
+
+        for (r, c), v in sorted(grid.items()):
+            if not (isinstance(v, str) and v.strip() in ('工廠', 'Factory', 'factory')):
+                continue
+            cols, cc = {}, c - 1
+            while cc >= 1 and txt(r, cc):              # 往左找 Program
+                if txt(r, cc).lower() in ('program', '專案'):
+                    cols['program'] = cc
+                cc -= 1
+            cc = c + 1
+            while txt(r, cc):
+                h = txt(r, cc).lower()
+                if h in ('item', 'items', '品項', '品項數', 'qty'):
+                    cols['items'] = cc
+                elif h == 'ac':
+                    cols['ac'] = cc
+                elif h == 'ae':
+                    cols['ae'] = cc
+                cc += 1
+            if 'ac' not in cols and 'ae' not in cols:
+                continue
+            per_table = {}
+            rr = r + 1
+            while True:
+                f = txt(rr, c)
+                if not f or re.match(r'^(總計|合計|total)', f, re.I) or re.search(r'\d+\s*間', f):
+                    break
+                d = per_table.setdefault(f, {'items': 0, 'ac': set(), 'ae': set(), 'programs': set(), 'ae_prog': set()})
+                if 'items' in cols:
+                    try:
+                        d['items'] += int(float(txt(rr, cols['items']) or 0))
+                    except ValueError:
+                        pass
+                for k in ('ac', 'ae'):
+                    if k in cols and txt(rr, cols[k]):
+                        d[k].add(txt(rr, cols[k]))
+                if 'program' in cols and txt(rr, cols['program']):
+                    d['programs'].add(txt(rr, cols['program']))
+                if 'ae' in cols and txt(rr, cols['ae']):
+                    d['ae_prog'].add((txt(rr, cols['ae']), txt(rr, cols['program']) if 'program' in cols else ''))
+                rr += 1
+            for f, d in per_table.items():
+                o = out.setdefault(f, {'items': 0, 'ac': set(), 'ae': set(), 'programs': set(), 'ae_prog': set(), '_n': 0})
+                o['ac'] |= d['ac']; o['ae'] |= d['ae']; o['programs'] |= d['programs']; o['ae_prog'] |= d['ae_prog']
+                # 有 Program 的明細表是逐 Program 加總；工廠總表是一廠一列 → 取較完整的那張（較大值）
+                o['items'] = max(o['items'], d['items'])
+    for o in out.values():
+        o.pop('_n', None)
+    return out
+
+
+def _name_keys(name):
+    """中文名 → 所有拼音組合（含破音字）；英文名 → 小寫字母。"""
+    if re.search(r'[一-鿿]', name):
+        try:
+            from pypinyin import pinyin, Style
+            opts = pinyin(name, style=Style.NORMAL, heteronym=True)
+            keys = ['']
+            for o in opts:
+                keys = [k + p for k in keys for p in o[:3]][:64]
+            return [re.sub(r'[^a-z]', '', k.lower()) for k in keys]
+        except ImportError:
+            return []
+    return [re.sub(r'[^a-z]', '', name.lower())]
+
+
+def match_factories(pcn_counts, dispatch):
+    """
+    PCN 英文工廠名 ↔ 分派表工廠名（中文或英文）：
+    ① 拼音／英文名包含或相近（例：聖源 → LIAOYANG SHENGYUAN、晟山 → Seng San）
+    ② 剩下的以品項數唯一相符配對（例：太陽 1 項 → Wenzhou Sun Stationery 1 項）
+    回傳 list[(pcn_name or None, dispatch_name or None, 依據)]
+    """
+    import difflib
+    stop = {'co', 'ltd', 'limited', 'company', 'inc', 'corp', 'international', 'technology', 'industry',
+            'products', 'product', 'plastic', 'arts', 'crafts', 'gifts', 'packaging', 'materials',
+            'electronics', 'stationery', 'handicraft', 'toys', 'viet', 'nam', 'vietnam'}
+
+    def windows(pcn):
+        toks = [t for t in re.findall(r'[a-z]+', pcn.lower()) if t not in stop]
+        w = set()
+        for i in range(len(toks)):
+            for j in range(i + 1, min(i + 3, len(toks)) + 1):
+                w.add(''.join(toks[i:j]))
+        return w, re.sub(r'[^a-z]', '', pcn.lower())
+
+    scores = []
+    for d in dispatch:
+        keys = [k for k in _name_keys(d) if len(k) >= 3]
+        for pcn in pcn_counts:
+            wins, compact = windows(pcn)
+            best = 0.0
+            for k in keys:
+                if k in compact:
+                    best = 1.0
+                    break
+                for w in wins:
+                    best = max(best, difflib.SequenceMatcher(None, k, w).ratio())
+            if best >= 0.75:
+                scores.append((best, d, pcn))
+    pairs, used_d, used_p = [], set(), set()
+    for sc, d, pcn in sorted(scores, reverse=True):
+        if d in used_d or pcn in used_p:
+            continue
+        pairs.append((pcn, d, '名稱／拼音' if sc >= 0.999 else f'拼音相近（{sc:.0%}）'))
+        used_d.add(d); used_p.add(pcn)
+    rest_d = [d for d in dispatch if d not in used_d]
+    rest_p = [p for p in pcn_counts if p not in used_p]
+    for d in list(rest_d):
+        n = dispatch[d].get('items')
+        cand = [p for p in rest_p if pcn_counts[p] == n]
+        same_n = [x for x in rest_d if dispatch[x].get('items') == n]
+        if n and len(cand) == 1 and len(same_n) == 1:
+            pairs.append((cand[0], d, f'品項數相同（{n}）'))
+            rest_d.remove(d); rest_p.remove(cand[0])
+    if len(rest_d) == 1 and len(rest_p) == 1:
+        pairs.append((rest_p[0], rest_d[0], '唯一剩下的工廠'))
+        rest_d, rest_p = [], []
+    pairs += [(None, d, '') for d in rest_d] + [(p, None, '') for p in rest_p]
+    return pairs
+
+
+def build_factory_map(prod_df, dispatch):
+    """產生 Summary 用的「工廠 → AC / AE」對照表。"""
+    if not dispatch or 'Factory Name' not in prod_df.columns:
+        return pd.DataFrame()
+    pm = prod_df[prod_df['DPCI'].astype(str).str.match(r'^\d{3}-\d{2}-\d{4}$')].drop_duplicates('DPCI')
+    pcn_counts = pm.groupby('Factory Name')['DPCI'].nunique().to_dict()
+    rows = []
+    for pcn, d, basis in match_factories(pcn_counts, dispatch):
+        info = dispatch.get(d, {}) if d else {}
+        by_ae = {}
+        for ae, prog in info.get('ae_prog', set()):
+            by_ae.setdefault(ae, set()).add(prog)
+        ae_txt = '、'.join(f"{ae}（{'、'.join(sorted(p for p in progs if p))}）" if any(progs) else ae
+                          for ae, progs in sorted(by_ae.items())) or '、'.join(sorted(info.get('ae', set())))
+        rows.append({
+            'PCN 工廠名稱': pcn or '（PCN 沒有）',
+            '分派表工廠': d or '（分派表沒有）',
+            'AC': '、'.join(sorted(info.get('ac', set()))),
+            'AE（Program）': ae_txt,
+            '品項數（分派表）': info.get('items') or None,
+            '品項數（PCN）': pcn_counts.get(pcn) if pcn else None,
+            '對應依據': basis or '未能對應，請人工確認',
+        })
+    df = pd.DataFrame(rows)
+    df['_o'] = df['對應依據'].str.startswith('未能').astype(int)
+    df = df.sort_values(['_o', 'AC', '分派表工廠']).drop(columns='_o').reset_index(drop=True)
+    return df[['分派表工廠', 'PCN 工廠名稱', 'AC', 'AE（Program）', '品項數（分派表）', '品項數（PCN）', '對應依據']]
 
 
 def build_validation_summary(merged_df, ctx=None):
@@ -1855,6 +2037,10 @@ def build_validation_summary(merged_df, ctx=None):
         ('同一 PO 有多個版本（已採用最新日期的版本）', len(sup_df), ''),
         ('其他 Program 的訂單（已略過）', len(skip_df), ''),
     ]
+    fmap = ctx.get('factory_map')
+    if isinstance(fmap, pd.DataFrame) and len(fmap) > 0:
+        n_bad = int(fmap['對應依據'].str.startswith('未能').sum())
+        checks.append(('工廠 → AC / AE 對照：未能對應的工廠', n_bad, st_(n_bad)))
     for title, df in [
         ('PO 品項不在 PCN — 明細', unk_df), ('成本不符 — 明細', cost_df), ('零售不符 — 明細', retail_df),
         ('PO數量 vs PCN Commit — 明細', qty_df), ('混裝不符 — 明細', asst_df_),
@@ -1863,6 +2049,8 @@ def build_validation_summary(merged_df, ctx=None):
         ('已取消的 PO — 明細', can_df), ('同一 PO 多個版本 — 明細', sup_df), ('其他 Program 的訂單 — 明細', skip_df)]:
         if len(df) > 0:
             details.append((title, df))
+    if isinstance(fmap, pd.DataFrame) and len(fmap) > 0:
+        details.append(('工廠 → AC / AE 對照', fmap))
 
     ordered = float(m.get('Final_QTY_for_count', pd.Series(dtype=float)).sum())
     plan = ctx.get('plan_total')
@@ -2095,8 +2283,10 @@ asst_files = st.sidebar.file_uploader("混裝箱表單（可多選／選填）",
 
 st.sidebar.markdown("---")
 st.sidebar.header("🏭 步驟 2（選填）：工廠 & 人員")
-dispatch_files = st.sidebar.file_uploader("工廠&人員隸屬清單（Factory / AE / AC）", type=['csv', 'xlsx'], accept_multiple_files=True)
-dispatch_df_global = process_dispatch(dispatch_files) if dispatch_files else pd.DataFrame()
+st.sidebar.caption("上傳工廠與 AC / AE 的分派表，核對結果與 PO GRID 第一頁會加一張「工廠 → AC / AE」對照表。"
+                   "PCN 的英文工廠名會自動對到分派表的中文名（依拼音與品項數）。")
+dispatch_files = st.sidebar.file_uploader("工廠 → AC / AE 分派表", type=['xlsx'], accept_multiple_files=True,
+                                          label_visibility="collapsed")
 
 st.sidebar.markdown("---")
 st.sidebar.header("📊 步驟 3（選填）：PO GRID")
@@ -2196,13 +2386,24 @@ if True:
                                 gupd['data'], grid_expectations(po_df), [c['po'] for c in pinfo['cancelled']], is_update=True)
                     st.session_state['grid_out'] = {'new': None, 'update': gupd}
                 else:
-                    dispatch_arg = dispatch_df_global if len(dispatch_df_global) > 0 else None
-                    merged_df = run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=dispatch_arg)
+                    merged_df = run_validation(po_df, prod_df, asst_df, mode='standard', dispatch_df=None)
 
                     summary_ctx = {k: pinfo[k] for k in ['duplicates', 'dup_resolved', 'superseded', 'cancelled',
                                                           'gate_problems', 'skipped_other_program', 'warnings']}
                     summary_ctx['title'] = re.sub(r'\.(xlsx|xls|csv)$', '', product_files[0].name, flags=re.I)
                     summary_ctx['not_ordered'] = []
+                    if dispatch_files:
+                        disp = {}
+                        for f_ in dispatch_files:
+                            try:
+                                for k, v in parse_dispatch_table(f_).items():
+                                    o = disp.setdefault(k, {'items': 0, 'ac': set(), 'ae': set(), 'programs': set(), 'ae_prog': set()})
+                                    o['items'] = max(o['items'], v['items'])
+                                    for kk in ('ac', 'ae', 'programs', 'ae_prog'):
+                                        o[kk] |= v[kk]
+                            except Exception as e:
+                                all_warnings.append(f"分派表 {f_.name} 讀取失敗：{e}")
+                        summary_ctx['factory_map'] = build_factory_map(prod_df, disp)
                     # 主檔有計畫量但完全沒有 PO 的品項
                     if 'Ent Ttl Rcpt U' in prod_df.columns and 'DPCI' in prod_df.columns:
                         ordered = set(merged_df.loc[merged_df['Row_Type'] != 'box', 'Final_DPCI'])
