@@ -40,6 +40,27 @@ DEST = {
 
 META_BY_PO = {}
 
+# A TG PO# cell: the PO number, with the DC-code suffix the current template
+# prints (10002036265-0581) or bare (older GRIDs). Columns are keyed by the
+# PO number alone, so both forms match the same PO.
+PO_CELL_RE = re.compile(r'^(\d{6,12})(?:-(\w{3,5}))?$')
+
+
+def po_of_cell(v):
+    m = PO_CELL_RE.match(str(v).strip()) if v is not None else None
+    return m.group(1) if m else None
+
+
+def has_des_port(sh):
+    """True for an older GRID that still has the DES PORT row (row 5).
+    Since the 2026-11 template change new GRIDs have no such row; the DC code
+    is the PO number's suffix in the TG PO# row instead."""
+    for ref in sh.row_cells(5):
+        v = sh.cell_text(ref)
+        if v and str(v).strip().upper().replace(' ', '') == 'DESPORT':
+            return True
+    return False
+
 
 def col_to_num(col):
     n = 0
@@ -496,6 +517,10 @@ def _zh_attention(x):
     for key, zi, zn in table:
         if issue.startswith(key):
             return zi, zn
+    mb = re.match(r'Assortment box has no header row in this GRID \(boxes: (.*)\)', issue)
+    if mb:
+        return ('這個 Assortment 在 GRID 上沒有標題列，箱數無處可寫（箱數：%s）' % mb.group(1),
+                '零件數量已寫入；請手動加 Assortment 標題列，或改用新產生的 PO GRID')
     m = re.match(r'new PO-type label (\S+) has no fill', issue)
     if m:
         return 'PO 類型 %s 在原檔沒有對應底色' % m.group(1), '請手動調整這一欄的底色，或改用新產生的 PO GRID'
@@ -720,7 +745,12 @@ def insert_po_column(sh, po, meta, qtys, type_styles, dest_map):
 
     neighbour = num_to_col(at + 1 if not after else at - 1)
     label = meta.get('dclabel') or ''
-    dest = dest_map.get(meta.get('dc', ''), meta.get('dc', ''))
+    dc = meta.get('dc', '') or ''
+    legacy = has_des_port(sh)
+    # older GRID: keep its own layout (bare PO number + DES PORT row);
+    # current template: PO number with DC suffix, no DES PORT row
+    po_text = po if legacy or not dc else '%s-%s' % (po, dc)
+    dest = dest_map.get(dc, dc) if legacy else ''
 
     st1, st3 = type_styles
     sh.xml = put_cell(sh.xml, 1, at,
@@ -728,10 +758,11 @@ def insert_po_column(sh, po, meta, qtys, type_styles, dest_map):
     sh.xml = put_cell(sh.xml, 2, at, cell_style(sh.xml, '%s2' % neighbour),
                       kind='blank')
     sh.xml = put_cell(sh.xml, 3, at,
-                      st3 or cell_style(sh.xml, '%s3' % neighbour), po)
+                      st3 or cell_style(sh.xml, '%s3' % neighbour), po_text)
     sh.xml = put_cell(sh.xml, 4, at, cell_style(sh.xml, '%s4' % neighbour),
                       ship_window(meta))
-    sh.xml = put_cell(sh.xml, 5, at, cell_style(sh.xml, '%s5' % neighbour), dest)
+    if legacy:
+        sh.xml = put_cell(sh.xml, 5, at, cell_style(sh.xml, '%s5' % neighbour), dest)
 
     written = 0
     for row, (kind, value) in sorted(qtys.items()):
@@ -750,7 +781,8 @@ def insert_po_column(sh, po, meta, qtys, type_styles, dest_map):
     if total_col2:
         sh.xml, totals = rewrite_totals(sh.xml, col_to_num(total_col2), first, last)
 
-    return {'po': po, 'column': num_to_col(at), 'label': label,
+    return {'po': po, 'po_label': po_text, 'dc': dc, 'legacy_layout': legacy,
+            'column': num_to_col(at), 'label': label,
             'window': ship_window(meta), 'dest': dest,
             'cells': written, 'totals_reformulated': totals,
             'type_style_found': bool(st1 and st3)}
@@ -759,8 +791,11 @@ def insert_po_column(sh, po, meta, qtys, type_styles, dest_map):
 def find_layout(sh, max_scan_row=6, max_col=60):
     """Locate: PO-number header row, DPCI column, TOTAL column.
 
-    The GRID layout is frozen: column M carries the row labels TG PO# / S/W /
-    DES PORT, and the PO numbers sit in that same row from column N rightwards.
+    The GRID layout is frozen: column M carries the row labels TG PO# / S/W
+    (plus DES PORT on GRIDs built before the 2026-11 template change), and the
+    PO numbers sit in the TG PO# row from column N rightwards — as PO-DC
+    (10002036265-0581) on the current template, bare on older GRIDs. Either
+    way the column is keyed by the PO number alone.
     Anchoring on the "TG PO#" label is exact, so it is tried first; it also
     removes any chance of reading a UPC or a commit quantity as a PO number.
 
@@ -786,9 +821,9 @@ def find_layout(sh, max_scan_row=6, max_col=60):
             col = COL_RE.match(ref).group(1)
             if col_to_num(col) <= label_col:
                 continue
-            v = sh.cell_text(ref)
-            if v and re.fullmatch(r'\d{6,12}', str(v).strip()):
-                found[str(v).strip()] = col
+            p = po_of_cell(sh.cell_text(ref))
+            if p:
+                found[p] = col
         if found:
             po_row, po_cols = r, found
             break
@@ -799,9 +834,9 @@ def find_layout(sh, max_scan_row=6, max_col=60):
             found = {}
             for ref in sh.row_cells(r):
                 col = COL_RE.match(ref).group(1)
-                v = sh.cell_text(ref)
-                if v and re.fullmatch(r'\d{6,12}', str(v).strip()):
-                    found[str(v).strip()] = col
+                p = po_of_cell(sh.cell_text(ref))
+                if p:
+                    found[p] = col
             if len(found) >= 2 and len(found) > len(po_cols):
                 po_cols, po_row = found, r
 
@@ -858,7 +893,7 @@ def main():
     sheets = sheet_name_map(base)
 
     report = {'written': [], 'skipped': [], 'totals_updated': [],
-              'inserted': [], 'needs_attention': [],
+              'inserted': [], 'needs_attention': [], 'box_labels': [],
               'media_before': media_before}
 
     # PO header metadata: ship window, DC and PO-type label for any PO we may
@@ -869,11 +904,14 @@ def main():
     if a.po_meta:
         meta_doc = json.load(open(a.po_meta, encoding='utf-8'))
         for h in meta_doc.get('pos', []):
-            META_BY_PO[re.sub(r'\\D', '', h.get('po', ''))] = h
+            META_BY_PO[re.sub(r'\D', '', h.get('po', ''))] = h
         for it in meta_doc.get('items', []):
-            if it.get('kind') == 'assortment':
-                p = re.sub(r'\\D', '', str(it.get('po', '')))
-                d = re.sub(r'\\D', '', str(it.get('sku', '')))
+            # parse_po_pdfs.py tags an assortment box line kind "ast"; older
+            # notes called it "assortment". Matching only the old name meant no
+            # box count was ever written on update.
+            if it.get('kind') in ('ast', 'assortment'):
+                p = re.sub(r'\D', '', str(it.get('po', '')))
+                d = re.sub(r'\D', '', str(it.get('sku', '')))
                 if p and d:
                     box_text.setdefault(d, {})[p] = it.get('qty')
 
@@ -1016,6 +1054,38 @@ def main():
                         {'sheet': sname, 'dpci': dpci, 'po': po,
                          'reason': 'cell %s absent in XML' % ref})
 
+        # Assortment header rows: box count "DPCI\n(boxes)" in each PO column
+        # that ordered the box. A newly inserted column already got it; this
+        # covers a PO column that was already on the sheet (e.g. a revised PO
+        # whose box count changed, or a header cell left blank).
+        for dpci, pos in box_text.items():
+            if dpci not in rows:
+                continue
+            r = rows[dpci]
+            pretty = '%s-%s-%s' % (dpci[:3], dpci[3:5], dpci[5:])
+            for po, boxes in pos.items():
+                col = po_cols.get(po)
+                if not col or boxes in (None, ''):
+                    continue
+                ref = '%s%d' % (col, r)
+                want = '%s\n(%s)' % (pretty, boxes)
+                cur = sh.cell_text(ref)
+                cur_s = re.sub(r'\s', '', str(cur or ''))
+                if cur_s == re.sub(r'\s', '', want):
+                    continue
+                # only ever replace an empty cell or an earlier box label of
+                # this same assortment; anything else is someone's own entry
+                if cur_s and not cur_s.startswith(pretty + '(') and not a.force_text:
+                    report['skipped'].append(
+                        {'sheet': sname, 'dpci': dpci, 'po': po, 'cell': ref,
+                         'current': cur, 'reason': 'assortment header cell holds '
+                         'other content; use --force-text to overwrite'})
+                    continue
+                sh.xml = put_cell(sh.xml, r, col_to_num(col), cell_style(sh.xml, ref), want)
+                report['box_labels'].append(
+                    {'sheet': sname, 'dpci': pretty, 'po': po, 'cell': ref,
+                     'boxes': boxes, 'from': cur})
+
         # recompute row TOTAL for touched rows
         if total_col and touched_rows:
             for r in sorted(touched_rows):
@@ -1060,6 +1130,20 @@ def main():
              'next_step': 'new item — update cannot add a row (it has no master '
                           'row data and no photo). Rebuild with po-grid-create, '
                           'or add the row by hand and rerun'})
+
+    # An assortment box ordered for the first time has no header row yet (the
+    # build only draws one for boxes a PO had already ordered). Its component
+    # quantities still go in; the box count has nowhere to go, so say so.
+    for dpci, pos in sorted(box_text.items()):
+        if dpci in grid_dpcis:
+            continue
+        pretty = '%s-%s-%s' % (dpci[:3], dpci[3:5], dpci[5:])
+        report['needs_attention'].append(
+            {'dpci': pretty, 'pos': sorted(pos),
+             'issue': 'Assortment box has no header row in this GRID (boxes: %s)'
+                      % ', '.join('%s=%s' % (p, pos[p]) for p in sorted(pos)),
+             'next_step': 'component quantities were written; add the assortment '
+                          'header row by hand, or rebuild'})
 
     # ---- call-outs onto the Validation Summary tab ------------------------
     vs_path = sheets.get(VALIDATION_SHEET)

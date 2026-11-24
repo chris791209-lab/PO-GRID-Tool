@@ -29,15 +29,10 @@ from PIL import Image as PILImage
 
 warnings.filterwarnings('ignore')
 
-# DC (Order # third segment) -> destination shown on row 5.
-# ONLY add a code here once it has been confirmed against a hand-built GRID or
-# by the account team. An unmapped DC falls through to its raw code and is
-# reported as a header problem — that is deliberate. A wrong city name is worse
-# than a visible code, because nothing downstream can tell it is wrong.
-# DC (Order # third segment) -> destination shown on row 5.
-# Only add a code the account team has confirmed. A wrong destination prints
-# cleanly across every column of that DC and looks entirely normal, so an
-# unmapped code is written raw and reported instead of guessed.
+# DC (Order # third segment) -> destination. No longer printed on the GRID
+# since the 2026-11 template change (the DC code is the PO number's suffix
+# instead); kept as the confirmed reference list and for update_grid.py, which
+# still writes the DES PORT row when it updates an older GRID that has one.
 DEST = {
     '0581': 'LAS',         # confirmed: 雄健 and 從盛 reference GRIDs
     '3891': 'SAVANNAH',    # confirmed: 雄健 and 從盛 reference GRIDs
@@ -77,9 +72,19 @@ FIELDS = ['DPCI', 'STYLE', 'PICTURE', 'DESCRIPTION', 'UPC', 'MATERIAL',
 WIDTHS = [13.5, 20.75, 17.625, 32.25, 17.75, 15.375, 5.75, 12.625, 12.875,
           4.375, 4.375, 6.5, 11.0]
 C_ASST_UNITS = 12                       # the narrow "assortment" column (L)
-C_ROWLBL = 13                           # names what rows 3/4/5 hold (M)
+C_ROWLBL = 13                           # names what rows 3/4 hold (M)
 FIRST_PO_COL = 14                       # PO columns start at N
-ROW_LABELS = {3: 'TG PO#', 4: 'S/W', 5: 'DES PORT'}
+# Template change 2026-11 (TG Team PO platform): the DES PORT row is gone.
+# The DC code now rides on the PO number in the TG PO# row
+# (10002036265-0581), so the header block is 4 rows and data starts on row 5.
+ROW_LABELS = {3: 'TG PO#', 4: 'S/W'}
+FIRST_DATA_ROW = 5
+
+
+def po_label(po, dc):
+    """TG PO# cell text: PO number with its DC-code suffix, e.g.
+    10002036265-0581. Falls back to the bare PO number if no DC was parsed."""
+    return '%s-%s' % (po, dc) if dc else str(po)
 
 THIN = Side(style='thin', color='BFBFBF')
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -437,7 +442,7 @@ def main():
     else:
         write_validation_summary(wb, recon, a.title, gaps)
     used, report = set(), {'sheets': [], 'no_image': [], 'no_po_meta': [],
-                           'header_gaps': gaps, 'unmapped_dc': {}}
+                           'header_gaps': gaps, 'unmapped_dc': {}, 'no_dc': []}
 
     for factory in sorted(fac, key=lambda f: (-len(fac[f]), str(f))):
         recs = {r['dpci']: r for r in sorted(fac[factory], key=lambda r: r['dpci'])}
@@ -466,7 +471,7 @@ def main():
             ws.column_dimensions[get_column_letter(i)].width = 17.375
         ws.column_dimensions[get_column_letter(c_total)].width = 17
         ws.column_dimensions[get_column_letter(c_commit)].width = 18.125
-        for r, h in ((1, 24.75), (2, 35.25), (3, 19.5), (4, 18.75), (5, 18.75)):
+        for r, h in ((1, 24.75), (2, 35.25), (3, 19.5), (4, 18.75)):
             ws.row_dimensions[r].height = h
 
         ws.cell(1, 1, a.title).font = Font(FONT, 14, bold=True)
@@ -490,20 +495,18 @@ def main():
             col, m = FIRST_PO_COL + i, po_meta[po]
             lbl = m.get('dclabel', '')
             # PO type and shipping window are hard-gated before any sheet is
-            # written. An unmapped DC is different: it is not a parse failure,
-            # it is a code nobody has confirmed a destination for yet. Show the
-            # raw code so it is visible on the sheet, and surface it in the
-            # report rather than blocking the build.
-            if m.get('dc') not in DEST:
-                report['unmapped_dc'].setdefault(m.get('dc'), []).append(po)
+            # written. The DC code is printed as the PO number's suffix, so no
+            # destination lookup is needed; a PO whose DC could not be read
+            # shows the bare number and is reported.
+            if not m.get('dc'):
+                report['no_dc'].append(po)
             fillc = TYPE_FILL.get(lbl)
             po_fill[po] = PatternFill('solid', fgColor=fillc) if fillc else None
             for row, val, fnt in ((1, lbl, Font(FONT, 10, bold=True)),
-                                  (3, po, Font(FONT, 10, bold=True)),
+                                  (3, po_label(po, m.get('dc')), Font(FONT, 10, bold=True)),
                                   (4, '%s-%s' % (m['ship_start'][:5], m['ship_end'][:5])
                                       if m.get('ship_start') and m.get('ship_end') else '',
-                                      Font(FONT, 9, bold=True)),
-                                  (5, DEST.get(m.get('dc'), m.get('dc')), Font(FONT, 9))):
+                                      Font(FONT, 9, bold=True))):
                 c = ws.cell(row, col, val)
                 c.font, c.alignment = fnt, Alignment('center', 'center')
                 if po_fill[po] and row in (1, 3):
@@ -568,7 +571,7 @@ def main():
             else:
                 report['no_image'].append(rec['dpci'])
 
-        r = 6
+        r = FIRST_DATA_ROW
         written = set()
         # assortment groups first: a header row carrying the box counts in the
         # PO columns they were ordered on, then that box's component items
@@ -608,7 +611,7 @@ def main():
         # (very long names wrap onto a second line inside the 78pt-high row)
         maker_w = min(len(maker_name(factory)), 30) * 1.1 + 2
         ws.column_dimensions['H'].width = round(max(maker_w, 12.625), 2)
-        ws.freeze_panes = 'D6'
+        ws.freeze_panes = 'D%d' % FIRST_DATA_ROW
         ws.sheet_view.zoomScale = 100
         report['sheets'].append({'sheet': ws.title, 'factory': factory,
                                  'items': len(recs), 'po_cols': len(pos),
@@ -635,7 +638,7 @@ def main():
     print(json.dumps({k: report[k] for k in
                       ('file', 'sheet_count', 'item_count', 'image_count',
                        'no_image', 'no_po_meta', 'header_gaps',
-                       'unmapped_dc', 'recalc') if k in report},
+                       'no_dc', 'recalc') if k in report},
                      ensure_ascii=False, indent=2))
 
 

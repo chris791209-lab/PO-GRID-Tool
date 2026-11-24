@@ -23,10 +23,20 @@ warnings.filterwarnings('ignore')
 
 HEADERS = ['DPCI', 'STYLE', 'PICTURE', 'DESCRIPTION', 'UPC', 'MATERIAL', 'AGE',
            'MAKER', 'Retail$/Packaging Type', 'IN', 'CTN', 'assortment']
-ROW_LABELS = {3: 'TG PO#', 4: 'S/W', 5: 'DES PORT'}
+import re
+
+# Current template (2026-11): no DES PORT row; TG PO# shows PO-DC
+# (10002036265-0581); data from row 5, freeze panes D5.
+ROW_LABELS = {3: 'TG PO#', 4: 'S/W'}
+FIRST_DATA_ROW = 5
+PO_DC_RE = re.compile(r'^\d{6,12}-\w{3,5}$')
+# Older GRIDs (built before the change) still carry a DES PORT row. They are
+# checked against the old rules and reported as layout "legacy", not failed:
+# the update path keeps their layout as it is.
+LEGACY_ROW_LABELS = {3: 'TG PO#', 4: 'S/W', 5: 'DES PORT'}
+LEGACY_FIRST_DATA_ROW = 6
 C_LABEL = 13                      # M
 FIRST_PO = 14                     # N
-FIRST_DATA_ROW = 6
 TYPE_FILL = {'TS': 'FFF2CC', 'T1': 'E2EFDA', 'T2': 'DDEBF7',
              'T3': 'E4DFEC', 'H1': 'D9E1F2', 'H3': 'EDEDED',
              'BAS': 'FCE4D6', 'SEA': 'D9D2E9', 'SET': 'D0E0E3',
@@ -48,6 +58,7 @@ def fill_of(cell):
 def check(path):
     wb = openpyxl.load_workbook(path)
     problems = []
+    layouts = {}
 
     def bad(sheet, what):
         problems.append({'sheet': sheet, 'problem': what})
@@ -62,13 +73,18 @@ def check(path):
             if str(got or '').strip() != h:
                 bad(t, 'col %d header is %r, expected %r' % (i, got, h))
 
-        for row, lbl in ROW_LABELS.items():
+        legacy = str(ws.cell(5, C_LABEL).value or '').strip().upper().replace(' ', '') == 'DESPORT'
+        layouts[t] = 'legacy' if legacy else 'current'
+        labels = LEGACY_ROW_LABELS if legacy else ROW_LABELS
+        first_data = LEGACY_FIRST_DATA_ROW if legacy else FIRST_DATA_ROW
+        for row, lbl in labels.items():
             got = ws.cell(row, C_LABEL).value
             if str(got or '').strip() != lbl:
                 bad(t, 'M%d is %r, expected %r' % (row, got, lbl))
 
-        if ws.freeze_panes != 'D6':
-            bad(t, 'freeze panes %r, expected D6' % ws.freeze_panes)
+        want_freeze = 'D%d' % first_data
+        if ws.freeze_panes != want_freeze:
+            bad(t, 'freeze panes %r, expected %s' % (ws.freeze_panes, want_freeze))
 
         first = None
         for r in range(1, ws.max_row + 1):
@@ -76,8 +92,8 @@ def check(path):
             if v and str(v).strip().count('-') == 2:
                 first = r
                 break
-        if first is not None and first != FIRST_DATA_ROW:
-            bad(t, 'first data row is %d, expected %d' % (first, FIRST_DATA_ROW))
+        if first is not None and first != first_data:
+            bad(t, 'first data row is %d, expected %d' % (first, first_data))
 
         po_cols = [c for c in range(FIRST_PO, ws.max_column + 1)
                    if ws.cell(3, c).value]
@@ -106,8 +122,11 @@ def check(path):
             if fill_of(ws.cell(4, c)) != SW_FILL:
                 bad(t, 'PO %s S/W fill %s, expected %s'
                     % (po, fill_of(ws.cell(4, c)), SW_FILL))
-            if not ws.cell(5, c).value:
-                bad(t, 'PO %s has no destination' % po)
+            if legacy:
+                if not ws.cell(5, c).value:
+                    bad(t, 'PO %s has no destination' % po)
+            elif not PO_DC_RE.match(str(po or '').strip()):
+                bad(t, 'PO %s in row 3 has no DC suffix (expected e.g. 10002036265-0581)' % po)
 
         if fill_of(ws.cell(4, C_LABEL)) != SW_FILL:
             bad(t, 'S/W label cell is not on the red band')
@@ -122,7 +141,7 @@ def check(path):
             bad(t, "expected the 100%% COMMIT column last, got %r"
                 % ws.cell(2, last + 2).value)
 
-        for r in range(FIRST_DATA_ROW, ws.max_row + 1):
+        for r in range(first_data, ws.max_row + 1):
             b = ws.cell(r, 2).value
             if b and str(b).startswith('ASSORTMENT-'):
                 if fill_of(ws.cell(r, 1)) != ASST_FILL:
@@ -130,7 +149,7 @@ def check(path):
                 if not ws.cell(r, 5).value:
                     bad(t, 'row %d assortment has no UPC' % r)
 
-    return wb, problems
+    return wb, problems, layouts
 
 
 def main():
@@ -139,8 +158,11 @@ def main():
     ap.add_argument('--quiet', action='store_true')
     a = ap.parse_args()
 
-    wb, problems = check(a.grid)
+    wb, problems, layouts = check(a.grid)
+    kinds = set(layouts.values())
     out = {'file': a.grid, 'sheets': len(wb.sheetnames),
+           'layout': 'mixed' if len(kinds) > 1 else (kinds.pop() if kinds else 'none'),
+           'legacy_sheets': sorted(k for k, v in layouts.items() if v == 'legacy'),
            'conforms': not problems, 'problem_count': len(problems),
            'problems': problems[:40]}
     if not a.quiet:
