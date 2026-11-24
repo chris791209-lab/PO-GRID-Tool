@@ -1086,6 +1086,19 @@ def grid_expectations(po_df, prod_df=None):
     return {'qty': qty, 'box': box, 'plan': plan, 'pos': {str(p) for p in po_df['PO NUMBER'].unique()}}
 
 
+_GRID_PO_RE = re.compile(r'^(\d{6,12})(?:-(\w{3,5}))?$')
+
+
+def _grid_po(v):
+    """GRID 的 TG PO# 儲存格 → PO 號（新版面帶 DC 後綴 10002036265-0581，舊版面只有 PO 號）。"""
+    if v is None:
+        return None
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    m = _GRID_PO_RE.match(str(v).strip())
+    return m.group(1) if m else None
+
+
 def verify_grid_content(xlsx_bytes, exp, cancelled_pos=(), is_update=False):
     """
     逐格核對 GRID 內容是否與本次 PO 一致（產生新版與更新版都跑）：
@@ -1108,18 +1121,22 @@ def verify_grid_content(xlsx_bytes, exp, cancelled_pos=(), is_update=False):
             continue
         rows = [list(r) for r in ws.iter_rows(values_only=True)]
         frows = [list(r) for r in wbf[ws.title].iter_rows(values_only=True)]
-        if len(rows) < 6:
+        if len(rows) < 5:
             continue
         r3 = rows[2] + [None] * 5
         lbl = next((i for i, v in enumerate(r3) if isinstance(v, str) and v.replace(' ', '').upper() == 'TGPO#'), None)
         if lbl is None:
             continue
-        po_cols = {i: str(v).strip() for i, v in enumerate(r3) if i > lbl and v is not None
-                   and re.fullmatch(r'\d{6,12}', str(v).strip())}
+        # 新版面：TG PO# 是「PO號-DC碼」（10002036265-0581），資料從第 5 列開始；
+        # 舊版面（有 DES PORT 列）：PO 號不帶後綴，資料從第 6 列開始
+        po_cols = {i: _grid_po(v) for i, v in enumerate(r3) if i > lbl and _grid_po(v)}
+        r5 = rows[4] + [None] * 5 if len(rows) > 4 else []
+        legacy = lbl < len(r5) and isinstance(r5[lbl], str) and r5[lbl].replace(' ', '').upper() == 'DESPORT'
+        first_data = 6 if legacy else 5
         r2 = rows[1] + [None] * 5
         tcol = next((i for i, v in enumerate(r2) if isinstance(v, str) and 'TOTAL' in v.upper()), None)
         ccol = next((i for i, v in enumerate(r2) if isinstance(v, str) and 'COMMIT' in v.upper()), None)
-        for r_i, row in enumerate(rows[5:], start=6):
+        for r_i, row in enumerate(rows[first_data - 1:], start=first_data):
             row = row + [None] * (max(po_cols or {0: 0}) + 5)
             a = row[0]
             if not (isinstance(a, str) and re.match(r'^\d{3}-\d{2}-\d{4}', a.strip())):
@@ -1299,7 +1316,8 @@ def run_grid_engine(live_docs, master_files, asst_files, image_files, existing_g
                 fh.write(data)
             pv = run([os.path.join(eng, 'verify_layout.py'), chk])
             v = _json_tail(pv.stdout)
-            res['verify'] = {'conforms': bool(v.get('conforms')), 'problems': v.get('problems', [])} if v else None
+            res['verify'] = {'conforms': bool(v.get('conforms')), 'problems': v.get('problems', []),
+                             'layout': v.get('layout', 'current')} if v else None
             return data
 
         # ───────── 更新既有 GRID ─────────
@@ -2475,6 +2493,10 @@ def zh_attention(x):
     for key, zi, zn in table:
         if issue.startswith(key):
             return zi, zn
+    mb = re.match(r'Assortment box has no header row in this GRID \(boxes: (.*)\)', issue)
+    if mb:
+        return (f'這個 Assortment 在 GRID 上沒有標題列，箱數無處可寫（箱數：{mb.group(1)}）',
+                '零件數量已寫入；請手動加 Assortment 標題列，或改用新產生的 PO GRID')
     if m:
         return f'PO 類型 {m.group(1)} 在原檔沒有對應底色', '請手動調整這一欄的底色，或改用新產生的 PO GRID'
     if 'rebuild' in nxt or 'po-grid' in nxt:
@@ -2497,7 +2519,9 @@ def _show_verify(res, is_update=False):
     v = res.get('verify')
     if not v:
         return
-    if v['conforms']:
+    if v['conforms'] and v.get('layout') in ('legacy', 'mixed'):
+        st.caption("✅ 版面檢查通過（舊版面：有 DES PORT 列、PO 號沒有 DC 後綴）。")
+    elif v['conforms']:
         st.caption("✅ 版面檢查通過：與標準 PO GRID 版面一致。")
     else:
         with st.expander(f"⚠️ 版面檢查發現 {len(v['problems'])} 項與標準版面不同"
@@ -2531,9 +2555,9 @@ def render_grid_section(go):
             elif not rep_.get('images_supplied'):
                 st.caption("PICTURE 欄目前是空的。要放產品圖，請在左側「步驟 3 › 產品圖片」上傳圖片 zip 或 SPK 檔，"
                            "再按一次「解析 PDF 並執行核對」。")
-            if rep_.get('unmapped_dc'):
-                st.warning("以下 DC 代碼尚無確認過的目的地，DES PORT 列直接顯示代碼，請人工確認：" +
-                           "；".join(f"{dc}（PO {', '.join(pos)}）" for dc, pos in rep_['unmapped_dc'].items()))
+            if rep_.get('no_dc'):
+                st.warning("以下 PO 讀不到 DC 代碼，TG PO# 只顯示 PO 號、沒有後綴，請對照 PO PDF 人工補上：" +
+                           ", ".join(rep_['no_dc']))
             _show_verify(gnew)
             st.download_button("📥 下載 PO GRID", data=gnew['data'], file_name=gnew['filename'],
                                mime=xlsx_mime, key="dl_grid_new")
@@ -2550,15 +2574,20 @@ def render_grid_section(go):
             return
         rep_ = gupd['report']
         ins = rep_.get('inserted', [])
-        st.success(f"✅ 已更新上傳的 PO GRID：寫入 {len(rep_.get('written', [])):,} 格數量、新增 {len(ins)} 個 PO 欄；"
+        n_box = len(rep_.get('box_labels', []))
+        st.success(f"✅ 已更新上傳的 PO GRID：寫入 {len(rep_.get('written', [])):,} 格數量、新增 {len(ins)} 個 PO 欄"
+                   + (f"、更新 {n_box} 格 Assortment 箱數" if n_box else "") + "；"
                    f"原檔圖片 {rep_.get('media_before', 0):,} 張"
                    f"{'與手填內容完整保留' if rep_.get('image_integrity') else '，請開檔確認'}。")
         if ins:
             with st.expander(f"➕ 新增的 PO 欄（{len(ins)}）", expanded=False):
-                st.dataframe(pd.DataFrame([{'工作表': i.get('sheet'), 'PO': i.get('po'), '欄': i.get('column'),
-                                            '類型': i.get('label'), 'Ship Window': i.get('window'),
-                                            '目的地': i.get('dest'), '備註': (i.get('note', '') if re.search(r'[\u4e00-\u9fff]', i.get('note', '')) else '')} for i in ins]),
+                st.dataframe(pd.DataFrame([{'工作表': i.get('sheet'), 'TG PO#': i.get('po_label') or i.get('po'),
+                                            '欄': i.get('column'), '類型': i.get('label'), 'Ship Window': i.get('window'),
+                                            '備註': (i.get('note', '') if re.search(r'[\u4e00-\u9fff]', i.get('note', '')) else '')} for i in ins]),
                              hide_index=True, use_container_width=True)
+            if any(i.get('legacy_layout') for i in ins):
+                st.caption("ℹ️ 上傳的 GRID 是舊版面（有 DES PORT 列、PO 號沒有 DC 後綴），新加的 PO 欄沿用原檔版面。"
+                           "要換成新版面，請改用上方新產生的 PO GRID。")
         att = rep_.get('needs_attention', [])
         no_row = [x for x in att if x.get('dpci')]
         if att:
