@@ -503,17 +503,19 @@ _PO_LINE_START = re.compile(r'^(\d{1,3}) (\d{9}) Vendors Style (\d{11,13})', re.
 _PO_PREPACK = re.compile(
     r'^(\d{1,3}) (\d{9}) (\S+) (\d{11,13})[^\d\n]*?(\d+\.\d+) ([\d,]+)\s*Each\s*$', re.M)
 _PO_LINE_START_V2 = re.compile(
-    r'^(\d{1,2}) Buyers Catalog Number:\s*(?:Vendors Style\s*)?'
+    r'^(\d{1,2}) Buyers Catalog Number:\s*(?:Vendors\s*(?:Style\s*)?)?'
     r'(\d{11,13})Product:\s*(\w+)\s*Unit\s*Price:\s*([\d,]+)\s*Each\s*([\d,]+\.\d{2})', re.M)
-_PO_DPCI_V2 = re.compile(r'^(\d{9})\s*(?:Number:\s*)?Product:\s*(.*?)\s*([\d,]+\.\d{2,4})\s*$', re.M)
+_PO_DPCI_V2 = re.compile(r'^(\d{9})\s*(?:Style\s*)?(?:Number:\s*)?Product:\s*(.*?)\s*([\d,]+\.\d{2,4})\s*$', re.M)
 _PO_STYLE_V2 = re.compile(r'Buyers Item Number:\s*(.*?)\s*Resale:\s*([\d.]+)', re.S)
 _PO_PREPACK_V2 = re.compile(r'^(\d{1,3}) (\d{9}) (\d{11,13}) ([\d.]+) ([\d,]+)\s*Each\s*$', re.M)
 _PO_LINE_START_V3 = re.compile(
-    r'^(\d{1,3}) Buyers Catalog Number:\s*(?:Vendors Style\s*)?'
+    r'^(\d{1,3}) Buyers Catalog Number:\s*(?:Vendors\s*(?:Style\s*)?)?'
     r'(\d{11,13})Product:\s*(\w+)\s*Unit\s*Price:\s*([\d.]+)\s+([\d,]+)\s*Each\s*'
     r'([\d,]+\.\d{2})', re.M)
 _PO_DPCI_V3 = re.compile(r'^(\d{9})\b', re.M)
 _PO_STYLE_V3 = re.compile(r'Buyers Item Number:\s*(\S+)')
+# SPS 網頁列印版：「Buyers Item Number: Number: <品名>」，Style 在下一行 10 位 Item Number 之後
+_PO_STYLE_WEB = re.compile(r'Buyers Item Number:[^\n]*\n\s*\d{8,10}\s+(\S+)')
 _PO_PREPACK_V3 = re.compile(
     r'^(\d{1,3}) (\d{9}) (\d{11,13})\s*(.*?)\s*(\d+\.\d+) ([\d,]+)\s*Each\s*$', re.M)
 _PO_SHIP_WIN = r'Shipping Window:(.{0,400}?)(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})'
@@ -553,6 +555,13 @@ def normalize_ocr_text(t):
     return t
 
 
+def normalize_label_colons(t):
+    """SPS 網頁版直接列印（Chrome「Transaction List : Fulfillment」）的欄位標籤是
+    「Order # :」「PO Date :」「Total Qty :」（冒號前有空格），原生 PDF 則是「Order #:」。
+    統一去掉冒號前的空格，讓後面同一組 regex 兩種版型都能用。"""
+    return re.sub(r'(?<=[A-Za-z#)]) +:', ':', t)
+
+
 @st.cache_data(show_spinner=False)
 def extract_po_text(pdf_bytes):
     """回傳 (text, used_ocr, error)。以檔案內容快取，重跑不需再 OCR。"""
@@ -567,7 +576,7 @@ def extract_po_text(pdf_bytes):
     except Exception as e:
         return '', False, f"PDF 讀取錯誤：{e}"
     if 'Order #' in text and len(text.strip()) > 200:
-        return text, False, None
+        return normalize_label_colons(text), False, None
 
     # 無文字層 → OCR。300dpi：150dpi 曾把 1.675 讀成 1.875。
     try:
@@ -585,7 +594,7 @@ def extract_po_text(pdf_bytes):
             del img
     except Exception as e:
         return '', True, f"OCR 失敗：{e}"
-    return '\f'.join(normalize_ocr_text(pg) for pg in pages), True, None
+    return '\f'.join(normalize_label_colons(normalize_ocr_text(pg)) for pg in pages), True, None
 
 
 def _po_resale(blk):
@@ -615,7 +624,9 @@ def parse_po_text(fname, txt):
         'fname_date': _po_g(r'_(\d{4})(?:\D[^_]*)?\.pdf$', fname),
         'is_change': bool(re.search(r'Import PO Change|PO Change Date', txt)),
         'is_cancel': bool(re.search(r'CANCEL ORDER', txt, re.I)),
-        'doc_date': _po_g(r'(?:PO Change Date|PO Date):.*?\n\s*(\d{2}/\d{2}/\d{4})', txt, 1, re.S),
+        # 網頁列印版日期跟在下一行「TARGET IMPORT」之後；先找緊接下一行，找不到再用原規則
+        'doc_date': (_po_g(r'(?:PO Change Date|PO Date):[^\n]*\n[^\n\d]*(\d{2}/\d{2}/\d{4})', txt) or
+                     _po_g(r'(?:PO Change Date|PO Date):.*?\n\s*(\d{2}/\d{2}/\d{4})', txt, 1, re.S)),
         'po_total': _po_g(r'Purchase Order Total:\s*([\d, ]+\.\d{2})', txt),
         'total_qty': _po_g(r'Total Qty:\s*([\d,]+)', txt),
         'n_orders': len(set(re.findall(r'Order #:\s*(\d{6,11})', txt))),
@@ -663,6 +674,9 @@ def parse_po_text(fname, txt):
             sku = dm.group(1)
             sm = _PO_STYLE_V3.search(blk)
             style_tok = sm.group(1).strip() if sm else ''
+            if style_tok.startswith('Number'):
+                sw = _PO_STYLE_WEB.search(blk)
+                style_tok = sw.group(1).strip() if sw else ''
             items.append({'kind': 'ast' if ptype.upper() == 'AST' else 'line',
                           'line': int(lineno), 'sku': sku, 'upc': upc,
                           'style': style_tok if re.match(r'^\d{0,2}[A-Za-z]', style_tok) else '',
