@@ -2328,6 +2328,14 @@ with col_logo:
 with col_title:
     st.markdown("<h1 style='margin-top:4px; font-size:2rem;'>TG Team PO 驗證管理平台</h1>", unsafe_allow_html=True)
 
+# ---- 部門切換：D53 用獨立頁面（d53/），D240 流程完全不變 ----
+_dept = st.sidebar.radio("部門 Department", ["D240", "D53"], horizontal=True, key="dept_switch")
+if _dept == "D53":
+    from d53.page import render_d53_page
+    render_d53_page()
+    st.stop()
+st.sidebar.markdown("---")
+
 # ---- Sidebar ----
 st.sidebar.header("📂 步驟 1：上傳共通資料庫")
 product_files = st.sidebar.file_uploader("產品資料表 PCN（可多選）", type=['csv', 'xlsx'], accept_multiple_files=True)
