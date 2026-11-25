@@ -91,7 +91,8 @@ def extract_text(pdfs, cache_path, use_cache=True):
             continue
         try:
             with pdfplumber.open(p) as pdf:
-                out[p] = '\n'.join((pg.extract_text() or '') for pg in pdf.pages)
+                out[p] = normalize_label_colons(
+                    '\n'.join((pg.extract_text() or '') for pg in pdf.pages))
         except Exception as e:                                   # noqa: BLE001
             out[p] = '__ERROR__ ' + str(e)
         fresh += 1
@@ -103,6 +104,14 @@ def extract_text(pdfs, cache_path, use_cache=True):
 
 
 # ------------------------------------------------------------------ parsing
+def normalize_label_colons(t):
+    """SPS printed straight from the web UI (Chrome, title "Transaction List :
+    Fulfillment") writes labels as "Order # :", "PO Date :", "Total Qty :" —
+    a space before the colon. The downloaded PDF writes "Order #:". Collapse
+    the space so one set of regexes serves both. First seen on D323 (11/2026)."""
+    return re.sub(r'(?<=[A-Za-z#)]) +:', ':', t)
+
+
 def g(pat, text, grp=1, flags=0):
     m = re.search(pat, text, flags)
     return m.group(grp).strip() if m else ''
@@ -138,10 +147,10 @@ PREPACK_ROW = re.compile(
 #    Each 147,599.52\n240020140 Product: 79.44\nBuyers Item Number:
 #    ASSORTMENT LS-2: Resale: 216.00\n..."
 LINE_START_V2 = re.compile(
-    r'^(\d{1,2}) Buyers Catalog Number:\s*(?:Vendors Style\s*)?'
+    r'^(\d{1,2}) Buyers Catalog Number:\s*(?:Vendors\s*(?:Style\s*)?)?'
     r'(\d{11,13})Product:\s*(\w+)\s*Unit\s*Price:\s*([\d,]+)\s*Each\s*([\d,]+\.\d{2})',
     re.M)
-DPCI_V2 = re.compile(r'^(\d{9})\s*(?:Number:\s*)?Product:\s*(.*?)\s*([\d,]+\.\d{2,4})\s*$', re.M)
+DPCI_V2 = re.compile(r'^(\d{9})\s*(?:Style\s*)?(?:Number:\s*)?Product:\s*(.*?)\s*([\d,]+\.\d{2,4})\s*$', re.M)
 STYLE_V2 = re.compile(r'Buyers Item Number:\s*(.*?)\s*Resale:\s*([\d.]+)', re.S)
 
 # "1 240024442 199592788790 1.10 89184 Each" — no vendor-style token at all
@@ -159,12 +168,19 @@ PREPACK_ROW_V2 = re.compile(
 # V2 cannot match it: V2 expects the quantity immediately after "Unit Price:".
 # The distinguishing token is that extra decimal before the integer quantity.
 LINE_START_V3 = re.compile(
-    r'^(\d{1,3}) Buyers Catalog Number:\s*(?:Vendors Style\s*)?'
+    r'^(\d{1,3}) Buyers Catalog Number:\s*(?:Vendors\s*(?:Style\s*)?)?'
     r'(\d{11,13})Product:\s*(\w+)\s*Unit\s*Price:\s*([\d.]+)\s+([\d,]+)\s*Each\s*'
     r'([\d,]+\.\d{2})', re.M)
 # DPCI on the following row; the vendor style follows "Buyers Item Number:".
 DPCI_V3 = re.compile(r'^(\d{9})\b', re.M)
 STYLE_V3 = re.compile(r'Buyers Item Number:\s*(\S+)')
+# Web-print variant: "Vendors" / "Style" split across rows, so the row reads
+#   "1 Buyers Catalog Number: Vendors 887634207315Product: REG Unit Price:22728 Each31,819.20
+#    323067432 Style Product: No Brand 1.40
+#    Buyers Item Number: Number: Puffy Stickers 3pk Resale: 7.00
+#    1013266648 27SBR02 # of Inners: 6 Wholesale"
+# and the style sits after the 10-digit item number on the next row.
+STYLE_WEB = re.compile(r'Buyers Item Number:[^\n]*\n\s*\d{8,10}\s+(\S+)')
 
 # "1 240046252 822826351360 Basket Yellow 1.09 14161 Each" — no vendor-style
 # token ahead of the UPC (unlike PREPACK_ROW) and a free-text description
@@ -229,7 +245,8 @@ def parse_text(path, txt):
                    # "Assigned by transaction set sender: BAS Basic:" on
                    # page 1. Don't assume the label vocabulary — read
                    # whatever short code sits there.
-                   g(r'Assigned by transaction set sender:\s*([A-Z]{2,5})\s+\w+', txt),
+                   # web print glues code and word: "SETSet Order:"
+                   g(r'Assigned by transaction set sender:\s*([A-Z]{2,5})(?=\s+\w|[A-Z][a-z])', txt),
         'is_revised': bool(re.search(r'revis', fname, re.I)),
         'po_date': g(r'Order PO Date:.*?\n(\d{2}/\d{2}/\d{4})', txt, 1, re.S),
         'cancel': g(r'Cancel Date:.*?\n(\d{2}/\d{2}/\d{4})', txt, 1, re.S),
@@ -278,6 +295,9 @@ def parse_text(path, txt):
 
             sm = STYLE_V3.search(blk)
             style_tok = sm.group(1).strip() if sm else ''
+            if style_tok.startswith('Number'):
+                sw = STYLE_WEB.search(blk)
+                style_tok = sw.group(1).strip() if sw else ''
             style = style_tok if re.match(r'^\d{0,2}[A-Za-z]', style_tok) else ''
 
             resale = _resale(blk)
