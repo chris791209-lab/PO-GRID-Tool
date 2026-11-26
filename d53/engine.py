@@ -880,7 +880,10 @@ def merge_update(state, new_docs, new_pcns=None, new_problems=None, settings_pat
 
 
 def new_state(ae, season_start, pcns, docs, problems, excluded_factories=(), excluded_dpci=(),
-              filter_mode="all", include_factories=(), include_dpci=()):
+              filter_mode=None, include_factories=(), include_dpci=()):
+    if filter_mode is None:  # infer from whichever list was given
+        filter_mode = ("include" if (include_factories or include_dpci)
+                       else "exclude" if (excluded_factories or excluded_dpci) else "all")
     return dict(settings=dict(ae=ae, season_start=season_start.isoformat() if hasattr(season_start, "isoformat") else season_start,
                               excluded_factories=list(excluded_factories), excluded_dpci=list(excluded_dpci),
                               filter_mode=filter_mode, include_factories=list(include_factories), include_dpci=list(include_dpci),
