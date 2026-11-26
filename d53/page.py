@@ -128,6 +128,7 @@ def _show_result(data, stats, fname, log=None):
 
 def render_d53_page():
     st.subheader("📊 D53 PO GRID")
+    st.caption(f"版本 {E.ENGINE_VERSION}")
     st.caption("以 PCN 為準：只放 PCN（與品項範圍）裡的品項；BAS 補貨單、非本季、已取消的 PO 會自動排除並列在「排除清單」。"
                "每個 Program 一個分頁（頁內依 Factory 分區塊），第一頁是 Validation Summary，再來是 Program 總覽。")
     mode = st.radio("要做什麼？", ["新建 GRID", "更新現有 GRID（加新 PO／加 Program）"], horizontal=True, key="d53_mode")

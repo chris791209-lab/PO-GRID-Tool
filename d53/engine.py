@@ -812,7 +812,7 @@ def render(state, photos=None, manual=None):
                 c.font = F(bold=bold); c.alignment = LW
                 if fill:
                     c.fill = fill
-    vs.append([f"D53 PO GRID｜{ae}｜Validation Summary｜{today}"]); vs["A1"].font = F(bold=True, size=14); vs.append([])
+    vs.append([f"D53 PO GRID｜{ae}｜Validation Summary｜{today}｜版本 {ENGINE_VERSION}"]); vs["A1"].font = F(bold=True, size=14); vs.append([])
     Hh("0. 核對總表 Validation Checklist")
     row(["檢查項目", "規則", "單位", "已檢查", "差異", "結果"], SUB, True)
     for c, rule, unit, n, bad_n in vsum:
