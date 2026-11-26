@@ -598,6 +598,8 @@ def render(state, photos=None, manual=None):
             ws.row_dimensions[rr].height = 22
         for i, h in enumerate(FIXH, 1):
             ws.cell(HR, i, h)
+        for j, p in enumerate(pos):  # DC code above each PO column, as in the AE templates
+            ws.cell(HR, P0 + j, str(p["dc"] or ""))
         for k, h in enumerate(TAILH):
             ws.cell(HR, T + k, h)
         for cc in range(1, LAST + 1):
