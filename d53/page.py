@@ -107,7 +107,7 @@ def _show_result(data, stats, fname, log=None):
     c[0].metric("納入 PO", f"{stats['pos']} 張")
     c[1].metric("PO 行", f"{stats['lines']:,}")
     c[2].metric("數量", f"{stats['qty']:,}")
-    c[3].metric("工廠分頁", stats["factories"])
+    c[3].metric("Program 分頁", stats.get("programs", stats["factories"]), help=f"{stats['factories']} 家工廠")
     c[4].metric("成本差異行", stats["costdiff"], help=f"PO 高於 PCN {stats['cost_hi']} 行／低於 PCN {stats['cost_lo']} 行")
     chk = stats.get("checks") or []
     if chk:
@@ -129,7 +129,7 @@ def _show_result(data, stats, fname, log=None):
 def render_d53_page():
     st.subheader("📊 D53 PO GRID")
     st.caption("以 PCN 為準：只放 PCN（與品項範圍）裡的品項；BAS 補貨單、非本季、已取消的 PO 會自動排除並列在「排除清單」。"
-               "每間工廠一個分頁，第一頁是 Validation Summary，再來是 Program 總覽。")
+               "每個 Program 一個分頁（頁內依 Factory 分區塊），第一頁是 Validation Summary，再來是 Program 總覽。")
     mode = st.radio("要做什麼？", ["新建 GRID", "更新現有 GRID（加新 PO／加 Program）"], horizontal=True, key="d53_mode")
 
     if mode == "新建 GRID":

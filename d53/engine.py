@@ -401,8 +401,16 @@ GRN = PatternFill("solid", fgColor="E2EFDA"); BLU = PatternFill("solid", fgColor
 _th = Side(style="thin", color="BFBFBF"); BOX = Border(top=_th, bottom=_th, left=_th, right=_th)
 CEN = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LW = Alignment(vertical="center", wrap_text=True)
-FIXH = ["STYLE", "DPCI", "Product Description", "Image", "Program", "Case/\nInner", "Unit Cost$", "Retail$", "Commit\n(Ent Ttl Rcpt U)"]
-FIX = len(FIXH); P0 = FIX + 1; HR = 11
+ORG = PatternFill("solid", fgColor="FFC000")
+_md = Side(style="medium", color="404040")
+# Program tab (Vanessa layout): PO header block in rows 1-8, column header in row 9, items from row 10.
+LABELS = ["PO No.", "Factory", "S/C（手填）", "PO Date", "Assigned by Sender\n(Purpose)", "AC（手填）",
+          "Shipping Point", "Shipping Window"]
+FIXH = ["Product Description", "Factory", "Image", "DPCI", "STYLE", "Case/\nInner", "Retail$", "Unit Cost$"]
+TAILH = ["Q'TY", "Forecasted Units\n(Commit)", "+-20%\n(Forecast×80%)", "差異 %\n(Forecast−Q'TY)/Forecast",
+         "核對", "AE 備註（自由欄）"]
+FIX = len(FIXH); P0 = FIX + 1; HR = len(LABELS) + 1
+C_FAC, C_IMG, C_DPCI, C_COST = 2, 3, 4, 8
 RESERVED = {"使用說明", "Validation Summary", "Validation Detail", "Program 總覽", "Cost Discrepancy", "排除清單", "PO Ledger", "更新紀錄", STATE_SHEET, PHOTO_SHEET}
 
 
@@ -515,16 +523,21 @@ def render(state, photos=None, manual=None):
     retdiff = {x["dpci"]: (x["retail"], pcn[x["dpci"]]["retail"]) for x in inscope
                if x["retail"] is not None and pcn[x["dpci"]]["retail"] is not None
                and abs(x["retail"] - pcn[x["dpci"]]["retail"]) > 0.005}
-    byfac = collections.defaultdict(list)
+    byprog = collections.defaultdict(list)
     for x in inscope:
-        byfac[x["factory"]].append(x)
-    facs = sorted(byfac, key=lambda f: -sum(x["qty"] for x in byfac[f]))
+        byprog[pcn[x["dpci"]]["program"]].append(x)
+    progs = sorted(byprog, key=lambda g: -sum(x["qty"] for x in byprog[g]))
+    fqty = collections.Counter()
+    for x in inscope:
+        fqty[x["factory"]] += x["qty"]
+    facs = sorted(fqty, key=lambda f: -fqty[f])
     names = {}
-    for f in facs:
-        n, i = _short(f), 2
+    for g in progs:
+        base = re.sub(r"[\[\]:*?/\\']", " ", g).strip()[:31] or "Program"
+        n, i = base, 2
         while n in names.values() or n in RESERVED:
-            n = f"{_short(f)[:28]}-{i}"; i += 1
-        names[f] = n
+            n = f"{base[:28]}-{i}"; i += 1
+        names[g] = n
 
     wb = openpyxl.Workbook()
     ws = wb.active; ws.title = "使用說明"
@@ -534,7 +547,8 @@ def render(state, photos=None, manual=None):
                  (f"2. 季別：Purpose 不是 BAS，且 Ship Window 開始日 ≥ 本季起始日（本檔：{season}）。", 0),
                  ("3. 版本：同一張 PO 取 SPS 列印時間最新的一份；收到 Import PO Change CANCEL 即整張排除。", 0),
                  ("不符合的 PO 行全部列在「排除清單」並寫明原因。", 0), ("", 0), ("怎麼用", 1),
-                 ("• 工廠分頁：第 3–10 列是 PO 表頭（S/C、AC 黃底手填）；品項依 Program 分區塊；最右側是合計、% vs Commit、核對、AE 備註（黃底）。", 0),
+                 ("• 每個 Program 一個分頁。品項依 Factory 分區塊（粗線隔開），PO 欄也依同樣的工廠順序排列，所以每家工廠的數量落在自己的區塊。", 0),
+                 ("• 第 1–8 列是 PO 表頭（S/C、AC 黃底手填）；最右側是 Q'TY、Forecasted Units（Commit）、+-20%、差異 %、核對、AE 備註（黃底）。", 0),
                  ("• 紅底數量格＝該 PO 單價 ≠ Unit Cost$（PO 為準，只標記）。所有核對項目（價錢、Retail、Case Pack、數量、Factory）的結果在 Validation Summary 第 0 節，逐筆明細在「Validation Detail」；英文的成本差異明細在「Cost Discrepancy」。", 0),
                  ("• 之後有新 PO：到 App 選「更新現有 GRID」，上傳這份檔案＋新的 PO PDF 即可；要加 Program 就一起上傳新的 PCN。", 0),
                  ("• 只有黃底欄位會在更新時保留；請不要在其他地方手寫資料，也不要改分頁名稱或刪除隱藏頁。", 0)]:
@@ -542,64 +556,75 @@ def render(state, photos=None, manual=None):
         c.font = F(bold=True, size=14) if b == 2 else (F(bold=True) if b == 1 else F())
     ws.column_dimensions["A"].width = 130
 
-    overview = collections.defaultdict(lambda: dict(items=set(), pos=set(), units=0, cost=0.0, diff=0))
+    overview = collections.defaultdict(lambda: dict(items=set(), pos=set(), units=0, cost=0.0, diff=0, row=None))
     sheetinfo = {}
-    for f in facs:
-        xs = byfac[f]; ws = wb.create_sheet(names[f])
+    for g in progs:
+        xs = byprog[g]; ws = wb.create_sheet(names[g])
+        gq = collections.Counter()
+        for x in xs:
+            gq[x["factory"]] += x["qty"]
+        gfacs = sorted(gq, key=lambda f: -gq[f]); forder = {f: i for i, f in enumerate(gfacs)}
         pos = {}
         for x in xs:
             pos.setdefault(x["po"], x)
-        pos = sorted(pos.values(), key=lambda x: (_swstart(x["sw"]) or datetime.date.max, x["po"]))
-        PN = P0 + len(pos) - 1; T = PN + 1
-        items = sorted({x["dpci"] for x in xs}, key=lambda d: (pcn[d]["program"], pcn[d]["style"]))
+        pos = sorted(pos.values(), key=lambda x: (forder[x["factory"]], _swstart(x["sw"]) or datetime.date.max, x["po"]))
+        PN = P0 + len(pos) - 1; T = PN + 1; LAST = T + len(TAILH) - 1
+        items = sorted({(x["factory"], x["dpci"]) for x in xs},
+                       key=lambda k: (forder[k[0]], pcn[k[1]]["style"] or "", k[1]))
         q = collections.defaultdict(int)
         for x in xs:
-            q[(x["dpci"], x["po"])] += x["qty"]
-        ws["A1"] = f"D53 PO GRID｜{f}"; ws["A1"].font = F(bold=True, size=14)
-        ws["A2"] = (f"{ae}｜產生 {today}｜有效 PO {len(pos)} 張｜品項 {len(items)}｜Program："
-                    f"{'、'.join(sorted({pcn[d]['program'] for d in items}))}｜紅底＝PO 單價 ≠ Unit Cost$")
-        ws["A2"].font = F(color="595959")
-        labels = ["PO#-DC", "PO Date", "Purpose", "Ship Point", "Ship Window", "Vendor #", "S/C（手填）", "AC（手填）"]
-        for i, lab in enumerate(labels):
-            rr = 3 + i; c = ws.cell(rr, FIX, lab); c.font = F(bold=True); c.fill = SUB; c.alignment = CEN; c.border = BOX
+            q[(x["dpci"], x["factory"], x["po"])] += x["qty"]
+        # first PO column of each factory -> medium left border (block-diagonal look)
+        fstart = {P0 + j for j, p in enumerate(pos) if j == 0 or p["factory"] != pos[j - 1]["factory"]}
+
+        def edge(c, top=False):
+            l = _md if c.column in fstart or c.column == T else _th
+            c.border = Border(left=l, right=_th, bottom=_th, top=_md if top else _th)
+
+        for i, lab in enumerate(LABELS):
+            rr = 1 + i
+            c = ws.cell(rr, 1, lab); c.font = F(bold=True); c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+            c.fill = ORG if i == 0 else SUB
+            ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=FIX)
             for j, p in enumerate(pos):
                 mp = manual["po"].get(p["po"], {})
-                v = [f"{p['po']}-{p['dc']}", p["po_date"], p["purpose"], p["ship_pt"],
-                     re.sub(r"/20(\d\d)", "", p["sw"] or ""), p["vendor"], mp.get("sc"), mp.get("ac")][i]
-                cc = ws.cell(rr, P0 + j, v); cc.alignment = CEN; cc.border = BOX; cc.font = F(size=9, bold=(i == 0))
-                if i >= 6:
+                v = [f"{p['po']}-{p['dc']}", _short(p["factory"]), mp.get("sc"), p["po_date"], p["purpose"], mp.get("ac"),
+                     p["ship_pt"], re.sub(r"/20(\d\d)", "", p["sw"] or "")][i]
+                cc = ws.cell(rr, P0 + j, v); cc.alignment = CEN; cc.font = F(size=9, bold=(i in (0, 1))); edge(cc)
+                if i == 0:
+                    cc.fill = ORG
+                elif i in (2, 5):
                     cc.fill = YEL
+            ws.row_dimensions[rr].height = 22
         for i, h in enumerate(FIXH, 1):
             ws.cell(HR, i, h)
-        for j in range(len(pos)):
-            c = ws.cell(HR, P0 + j); c.fill = HDR; c.border = BOX
-        for k, h in enumerate(["PO 合計", "% vs Commit", "未下單量", "核對", "AE 備註（自由欄）"]):
+        for k, h in enumerate(TAILH):
             ws.cell(HR, T + k, h)
-        for c in ws[HR]:
+        for cc in range(1, LAST + 1):
+            c = ws.cell(HR, cc); c.fill = HDR; edge(c)
             if c.value is not None:
-                c.font = F(bold=True, color="FFFFFF"); c.fill = HDR; c.alignment = CEN; c.border = BOX
-        ws.row_dimensions[HR].height = 30
-        r = HR; prevp = None; R0 = HR + 1
-        for d in items:
-            p = pcn[d]
-            if p["program"] != prevp:
-                r += 1; prevp = p["program"]
-                ws.cell(r, 1, f"▌Program：{prevp}　｜品項 {sum(1 for z in items if pcn[z]['program'] == prevp)}")
-                for cc in range(1, T + 5):
-                    ws.cell(r, cc).fill = BLU; ws.cell(r, cc).border = BOX
-                ws.cell(r, 1).font = F(bold=True); ws.row_dimensions[r].height = 20
-            r += 1
-            for i, v in enumerate([p["style"], d, p["desc"], None, p["program"], p["pack"], p["cost"], p["retail"], p["commit"]], 1):
-                c = ws.cell(r, i, v); c.border = BOX; c.alignment = LW if i in (1, 3, 5) else CEN; c.font = F(size=9)
-            ws.cell(r, 7).number_format = ws.cell(r, 8).number_format = "0.00"; ws.cell(r, 9).number_format = "#,##0"
+                c.font = F(bold=True, color="FFFFFF"); c.alignment = CEN
+        ws.row_dimensions[HR].height = 40
+        r = HR; R0 = HR + 1; prevf = None
+        for f, d in items:
+            p = pcn[d]; r += 1
+            newblock = prevf is not None and f != prevf
+            if f != prevf:
+                overview[(g, f)]["row"] = r
+            prevf = f
+            for i, v in enumerate([p["desc"], f, None, d, p["style"], p["pack"], p["retail"], p["cost"]], 1):
+                c = ws.cell(r, i, v); c.alignment = LW if i in (1, 2) else CEN; c.font = F(size=9)
+            ws.cell(r, 7).number_format = ws.cell(r, 8).number_format = "0.00"
+            ws.cell(r, C_COST).fill = GRN
             for j, po in enumerate(pos):
-                c = ws.cell(r, P0 + j, q.get((d, po["po"])))
-                c.border = BOX; c.number_format = "#,##0"; c.font = F(size=9); c.alignment = CEN
-                if (d, po["po"]) in bad:
+                c = ws.cell(r, P0 + j, q.get((d, f, po["po"])))
+                c.number_format = "#,##0"; c.font = F(size=9); c.alignment = CEN
+                if (d, po["po"]) in bad and po["factory"] == f:
                     c.fill = RED
             ws.cell(r, T, f"=SUM({CL(P0)}{r}:{CL(PN)}{r})").number_format = "#,##0"
-            ws.cell(r, T + 1, f'=IF({CL(FIX)}{r}>0,{CL(T)}{r}/{CL(FIX)}{r},"")').number_format = "0.0%"
-            ws.cell(r, T + 2, f'=IF({CL(FIX)}{r}>0,{CL(FIX)}{r}-{CL(T)}{r},"")').number_format = "#,##0"
+            ws.cell(r, T + 1, p["commit"]).number_format = "#,##0"
+            ws.cell(r, T + 2, f'=IF({CL(T + 1)}{r}>0,{CL(T + 1)}{r}*0.8,"")').number_format = "#,##0"
+            ws.cell(r, T + 3, f'=IF({CL(T + 1)}{r}>0,({CL(T + 1)}{r}-{CL(T)}{r})/{CL(T + 1)}{r},"")').number_format = "0.0%"
             fl = []
             for e in vflags.get((d, f), []) + [e for e in vflags.get((d, None), []) if e["check"] in ("數量｜vs Commit", "Image")]:
                 ck = e["check"]
@@ -616,53 +641,54 @@ def render(state, photos=None, manual=None):
                     fl.append(lab)
             if p["cost"] is None:
                 fl.append("PCN 無成本")
-            c = ws.cell(r, T + 3, "OK" if not fl else "；".join(fl)); c.alignment = LW
+            c = ws.cell(r, T + 4, "OK" if not fl else "；".join(fl)); c.alignment = LW
             c.font = F(size=9, color="006100" if not fl else "9C0006"); c.fill = GRN if not fl else RED
-            ws.cell(r, T + 4, manual["note"].get(d))
-            for k in range(T, T + 5):
-                ws.cell(r, k).border = BOX
-            for k in range(T, T + 3):
+            ws.cell(r, T + 5, manual["note"].get(d))
+            for k in range(T, T + 4):
                 ws.cell(r, k).alignment = CEN; ws.cell(r, k).font = F(size=9)
-            ws.cell(r, T + 4).fill = YEL; ws.cell(r, T + 4).alignment = LW
+            ws.cell(r, T + 5).fill = YEL; ws.cell(r, T + 5).alignment = LW
+            for cc in range(1, LAST + 1):
+                edge(ws.cell(r, cc), top=newblock)
             ws.row_dimensions[r].height = 62
             if d in photos:
                 im = XLImage(io.BytesIO(photos[d]))
                 s = 76 / max(im.width, im.height); im.width, im.height = int(im.width * s), int(im.height * s)
                 im.anchor = TwoCellAnchor(editAs="twoCell",
-                                          _from=AnchorMarker(col=3, colOff=19050, row=r - 1, rowOff=19050),
-                                          to=AnchorMarker(col=3, colOff=19050 + im.width * 9525, row=r - 1, rowOff=19050 + im.height * 9525))
+                                          _from=AnchorMarker(col=C_IMG - 1, colOff=19050, row=r - 1, rowOff=19050),
+                                          to=AnchorMarker(col=C_IMG - 1, colOff=19050 + im.width * 9525, row=r - 1, rowOff=19050 + im.height * 9525))
                 ws.add_image(im)
-            o = overview[(p["program"], f)]
+            o = overview[(g, f)]
             o["items"].add(d)
-            o["units"] += sum(v for (dd, _), v in q.items() if dd == d)
-            o["cost"] += sum(v * (p["cost"] or 0) for (dd, _), v in q.items() if dd == d)
-            o["pos"] |= {po["po"] for po in pos if q.get((d, po["po"]))}
+            o["units"] += sum(v for (dd, ff, _), v in q.items() if dd == d and ff == f)
+            o["cost"] += sum(v * (p["cost"] or 0) for (dd, ff, _), v in q.items() if dd == d and ff == f)
+            o["pos"] |= {po["po"] for po in pos if q.get((d, f, po["po"]))}
             o["diff"] += sum(1 for z in costdiff if z["dpci"] == d and z["factory"] == f)
         RN = r; t1, t2 = RN + 1, RN + 2
-        ws.cell(t1, 3, "Total Units"); ws.cell(t2, 3, "Total Cost $（Unit Cost$ × 數量）")
-        for j in range(len(pos) + 1):
-            col = CL(P0 + j) if j < len(pos) else CL(T)
-            ws[f"{col}{t1}"] = f"=SUM({col}{R0}:{col}{RN})"; ws[f"{col}{t1}"].number_format = "#,##0"
-            ws[f"{col}{t2}"] = f"=SUMPRODUCT({col}{R0}:{col}{RN},$G${R0}:$G${RN})"; ws[f"{col}{t2}"].number_format = "#,##0.00"
+        for rr, lab in ((t1, "Total Units"), (t2, "Total Cost $（Unit Cost$ × Q'TY）")):
+            ws.cell(rr, 1, lab).alignment = Alignment(horizontal="right", vertical="center")
+            ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=FIX)
+        cst = f"${CL(C_COST)}${R0}:${CL(C_COST)}${RN}"
+        for col in [P0 + j for j in range(len(pos))] + [T, T + 1]:
+            L = CL(col)
+            ws.cell(t1, col, f"=SUM({L}{R0}:{L}{RN})").number_format = "#,##0"
+            ws.cell(t2, col, f"=SUMPRODUCT({L}{R0}:{L}{RN},{cst})").number_format = "#,##0.00"
         for rr in (t1, t2):
-            for cc in range(1, T + 5):
-                c = ws.cell(rr, cc); c.font = F(bold=True, size=9); c.fill = SUB; c.border = BOX
-        for i, w in enumerate([13, 12, 30, 12, 24, 8, 8, 8, 14], 1):
+            for cc in range(1, LAST + 1):
+                c = ws.cell(rr, cc); c.font = F(bold=True, size=9); c.fill = SUB; edge(c, top=(rr == t1))
+        for i, w in enumerate([34, 18, 13, 13, 13, 8, 8, 9], 1):
             ws.column_dimensions[CL(i)].width = w
         for j in range(len(pos)):
-            ws.column_dimensions[CL(P0 + j)].width = 13
-        for k, w in enumerate([11, 10, 11, 30, 22]):
+            ws.column_dimensions[CL(P0 + j)].width = 14
+        for k, w in enumerate([11, 12, 11, 12, 30, 22]):
             ws.column_dimensions[CL(T + k)].width = w
-        for i in range(3, 11):
-            ws.row_dimensions[i].height = 24
         ws.freeze_panes = ws.cell(R0, P0)
-        ws.auto_filter.ref = f"A{HR}:{CL(T + 4)}{RN}"
-        sheetinfo[f] = (names[f], len(items), len(pos), sum(x["qty"] for x in xs))
+        ws.auto_filter.ref = f"A{HR}:{CL(LAST)}{RN}"
+        sheetinfo[g] = (names[g], len(gfacs), len({d for _, d in items}), len(pos), sum(x["qty"] for x in xs))
 
     # ---- Program 總覽
     ov = wb.create_sheet("Program 總覽")
     ov.append([f"Program 總覽｜{ae}｜{today}"]); ov["A1"].font = F(bold=True, size=14); ov.append([])
-    ov.append(["Program（PCN）", "Factory", "工廠分頁", "品項", "有效 PO", "數量", "Commit", "% vs Commit", "Cost $（Unit Cost$ × 數量）", "成本差異行"])
+    ov.append(["Program（PCN）", "Factory", "Program 分頁", "品項", "有效 PO", "數量", "Commit", "% vs Commit", "Cost $（Unit Cost$ × 數量）", "成本差異行"])
     for c in ov[3]:
         c.font = F(bold=True, color="FFFFFF"); c.fill = HDR; c.alignment = CEN; c.border = BOX
     for pg in sorted({k[0] for k in overview}):
@@ -670,11 +696,11 @@ def render(state, photos=None, manual=None):
         for (p, f), o in sorted(overview.items(), key=lambda kv: -kv[1]["units"]):
             if p != pg:
                 continue
-            ov.append([p, f, names[f], len(o["items"]), len(o["pos"]), o["units"],
+            ov.append([p, f, names[p], len(o["items"]), len(o["pos"]), o["units"],
                        sum(pcn[d]["commit"] for d in o["items"]), None, round(o["cost"], 2), o["diff"]])
             rr = ov.max_row
             ov.cell(rr, 8, f'=IF(G{rr}>0,F{rr}/G{rr},"")')
-            ov.cell(rr, 3).hyperlink = f"#'{names[f]}'!A1"; ov.cell(rr, 3).font = F(color="0563C1", underline="single")
+            ov.cell(rr, 3).hyperlink = f"#'{names[p]}'!A{o['row'] or 1}"; ov.cell(rr, 3).font = F(color="0563C1", underline="single")
             if o["diff"]:
                 ov.cell(rr, 10).fill = RED
         re_ = ov.max_row
@@ -818,10 +844,10 @@ def render(state, photos=None, manual=None):
         vs.append([]); Hh("⚠ 解析提醒")
         for p in probs:
             row([p], RED)
-    vs.append([]); Hh("2. 工廠分頁")
-    row(["Factory", "分頁", "品項", "有效 PO", "數量"], SUB, True)
-    for f in facs:
-        row([f, *sheetinfo[f]])
+    vs.append([]); Hh("2. Program 分頁")
+    row(["Program", "分頁", "工廠", "品項", "有效 PO", "數量"], SUB, True)
+    for g in progs:
+        row([g, *sheetinfo[g]])
     vs.append([]); Hh("3. 成本差異：PO 單價 ≠ Unit Cost$（PO 為準，只標記）")
     hi = [x for x in costdiff if x["cost"] > pcn[x["dpci"]]["cost"]]
     lo = [x for x in costdiff if x["cost"] < pcn[x["dpci"]]["cost"]]
@@ -872,15 +898,15 @@ def render(state, photos=None, manual=None):
             st.append([key, i // 30000, s[i:i + 30000]])
     st.sheet_state = "hidden"
 
-    order = ["使用說明", "Validation Summary", "Program 總覽"] + [names[f] for f in facs] + \
+    order = ["使用說明", "Validation Summary", "Program 總覽"] + [names[g] for g in progs] + \
             ["Validation Detail", "Cost Discrepancy", "排除清單", "PO Ledger", "更新紀錄", PHOTO_SHEET, STATE_SHEET]
     wb._sheets = [wb[n] for n in order]
     wb.active = 1
     out = io.BytesIO(); wb.save(out)
     stats = dict(checks=[(c, n, b) for c, _, _, n, b in vsum], pos=len({x["po"] for x in inscope}), lines=len(inscope), qty=sum(x["qty"] for x in inscope),
-                 dpci=len({x["dpci"] for x in inscope}), factories=len(facs), excluded=dict(rc),
+                 dpci=len({x["dpci"] for x in inscope}), factories=len(facs), programs=len(progs), factory_names=list(facs), excluded=dict(rc),
                  costdiff=len(costdiff), cost_hi=len(hi), cost_lo=len(lo), missing_photos=len(noph),
-                 cancelled=len(res["cancel"]), sheets=[names[f] for f in facs])
+                 cancelled=len(res["cancel"]), sheets=[names[g] for g in progs])
     return out.getvalue(), stats
 
 
@@ -908,23 +934,27 @@ def read_grid(data):
             except Exception:
                 continue
     for ws in wb.worksheets:
-        if ws.title in RESERVED or ws.cell(HR, 1).value != "STYLE":
+        if ws.title in RESERVED:
             continue
-        T = next((c for c in range(P0, ws.max_column + 1) if ws.cell(HR, c).value == "PO 合計"), None)
-        if not T:
+        lay = _grid_layout(ws)
+        if not lay:
             continue
-        for c in range(P0, T):
-            po = str(ws.cell(3, c).value or "").split("-")[0]
-            sc, ac = ws.cell(9, c).value, ws.cell(10, c).value
-            if po and (sc not in (None, "") or ac not in (None, "")):
-                manual["po"][po] = {"sc": sc, "ac": ac}
+        hr, dcol, T, ncol, porow, scrow, acrow = lay
+        for c in range(1, T):
+            m = re.match(r"(\d{11})-", str(ws.cell(porow, c).value or ""))
+            if not m:
+                continue
+            sc = ws.cell(scrow, c).value if scrow else None
+            ac = ws.cell(acrow, c).value if acrow else None
+            if sc not in (None, "") or ac not in (None, ""):
+                manual["po"][m.group(1)] = {"sc": sc, "ac": ac}
         rowdpci = {}
-        for r in range(HR + 1, ws.max_row + 1):
-            d = ws.cell(r, 2).value
+        for r in range(hr + 1, ws.max_row + 1):
+            d = ws.cell(r, dcol).value
             if isinstance(d, str) and re.fullmatch(r"\d{3}-\d{2}-\d{4}", d):
                 rowdpci[r] = d
-                note = ws.cell(r, T + 4).value
-                if note not in (None, ""):
+                note = ws.cell(r, ncol).value if ncol else None
+                if note not in (None, "") and d not in manual["note"]:
                     manual["note"][d] = note
         for im in ws._images:
             try:
@@ -934,6 +964,33 @@ def read_grid(data):
             except Exception:
                 continue
     return state, photos, manual
+
+
+def _grid_layout(ws):
+    """Locate the parts of a GRID tab.  Works for the Program-tab layout (header row 9) and the
+    older factory-sheet layout (header row 11), so GRIDs made before the change still update."""
+    for hr in range(1, 16):
+        vals = {ws.cell(hr, c).value: c for c in range(1, min(ws.max_column, 200) + 1)}
+        if "DPCI" not in vals:
+            continue
+        T = vals.get("Q'TY") or vals.get("PO 合計")
+        if not T:
+            continue
+        ncol = next((c for v, c in vals.items() if isinstance(v, str) and v.startswith("AE 備註")), None)
+        po = next(((r, c) for r in range(1, hr) for c in range(1, T)
+                   if re.match(r"\d{11}-", str(ws.cell(r, c).value or ""))), None)
+        if not po:
+            continue
+        scrow = acrow = None
+        for r in range(1, hr):  # row labels sit left of the first PO column
+            for c in range(1, po[1]):
+                v = ws.cell(r, c).value
+                if isinstance(v, str) and v.startswith("S/C"):
+                    scrow = r
+                elif isinstance(v, str) and v.startswith("AC"):
+                    acrow = r
+        return hr, vals["DPCI"], T, ncol, po[0], scrow, acrow
+    return None
 
 
 # =====================================================================  merge + change log

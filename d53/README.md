@@ -40,6 +40,13 @@ Validation Summary 第 0 節會列出每一項的「已檢查／差異」，逐�
 | PO 解析驗算 | 每張 PO 行數量合計 = Total Qty |
 | Image | WRK 有照片 |
 
+## GRID 版面｜Layout
+- 每個 Program（PCN）一個分頁，版面參照 Vanessa 的 PO Amount Grid。
+- 第 1–8 列是 PO 表頭：PO No.、Factory、S/C（手填）、PO Date、Assigned by Sender（Purpose）、AC（手填）、Shipping Point、Shipping Window。
+- 第 9 列是欄名：Product Description｜Factory｜Image｜DPCI｜STYLE｜Case/Inner｜Retail$｜Unit Cost$｜各張 PO｜Q'TY｜Forecasted Units（Commit）｜+-20%｜差異 %｜核對｜AE 備註。
+- 品項依 Factory 分區塊，PO 欄也依同樣的工廠順序排列，工廠之間用粗線隔開。
+- 舊版（每間工廠一頁）的 GRID 一樣可以拿來「更新」，產生的新檔會改成新版面，黃底資料會帶過去。
+
 ## 注意｜Notes
 - 只有**黃底欄位**（S/C、AC、AE 備註）會在更新時保留，其他欄位請不要手寫。
 - 不要刪除或改名隱藏頁 `_D53_STATE`、`_D53_PHOTOS`，更新要靠這兩頁。
