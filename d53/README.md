@@ -9,7 +9,7 @@
 4. （選填）上傳 **WRK** Workspace 匯出檔，用來放照片。
 5. 確認 **本季起始日**，預設是 PCN 檔名年份的 1/1。
 6. 選 **品項範圍**：
-   - 整份 PCN 都是我的（預設）
+   - 整份 PCN（預設）
    - **只納入我負責的**：把自己的 DPCI 或 Vendor Style# 從 Excel 整欄複製貼上（換行、逗號、空白都可以），也可以勾整家工廠。找不到的編號會列出來提醒。之後 PCN 新版多出來的 DPCI 不會自動納入。
    - 排除少數品項／工廠
 7. 按「產生 PO GRID」，下載檔案。
@@ -26,6 +26,19 @@
 | 版本 | 同一張 PO 取 SPS 列印時間最新的那份；收到 Import PO Change CANCEL 就整張排除 |
 
 沒通過關卡的行全部列在「排除清單」分頁，並寫明原因。
+
+## 核對項目｜Validation checklist
+Validation Summary 第 0 節會列出每一項的「已檢查／差異」，逐筆明細在「Validation Detail」。
+| 項目 | 規則 |
+|---|---|
+| Unit Cost$ | PO 單價 = PCN 成本（FCA／FOB） |
+| Retail$ | PO Resale = PCN Suggested Unit Retail |
+| Case Pack | PO # of Inners × Units per Inner = PCN Case；Units per Inner = PCN Inner |
+| 數量｜整箱 | PO 數量是 Case Pack 的整數倍 |
+| 數量｜vs Commit | 全部 PO 合計 ≤ Commit × 110% |
+| Factory | PO 上的工廠 = PCN Factory Name |
+| PO 解析驗算 | 每張 PO 行數量合計 = Total Qty |
+| Image | WRK 有照片 |
 
 ## 注意｜Notes
 - 只有**黃底欄位**（S/C、AC、AE 備註）會在更新時保留，其他欄位請不要手寫。

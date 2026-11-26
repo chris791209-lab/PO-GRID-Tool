@@ -54,7 +54,7 @@ def _photos(wrk_uploads):
     return ph
 
 
-_MODES = {"all": "整份 PCN 都是我的", "include": "只納入我負責的（貼上 DPCI 或 Style#）", "exclude": "排除少數品項／工廠"}
+_MODES = {"all": "整份 PCN", "include": "只納入我負責的（貼上 DPCI 或 Style#）", "exclude": "排除少數品項／工廠"}
 
 
 def _scope_filter(pcns, key, preset=None):
@@ -109,6 +109,11 @@ def _show_result(data, stats, fname, log=None):
     c[2].metric("數量", f"{stats['qty']:,}")
     c[3].metric("工廠分頁", stats["factories"])
     c[4].metric("成本差異行", stats["costdiff"], help=f"PO 高於 PCN {stats['cost_hi']} 行／低於 PCN {stats['cost_lo']} 行")
+    chk = stats.get("checks") or []
+    if chk:
+        st.markdown("**核對結果**")
+        st.dataframe([{"檢查項目": c, "已檢查": n, "差異": b, "結果": "—" if n == 0 else ("✔ 相符" if b == 0 else "✖ 有差異")}
+                      for c, n, b in chk], hide_index=True, use_container_width=True)
     if stats["excluded"]:
         st.caption("排除：" + "；".join(f"{k} {v} 行" for k, v in stats["excluded"].items()) + "（明細在「排除清單」分頁）")
     if stats["missing_photos"]:

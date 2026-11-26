@@ -85,10 +85,13 @@ def parse_po_text(fname, full):
         d2 = _PAGE_HDR.sub("", d)
         L = d2.split("\n")
         lines = []
-        for i, ln in enumerate(L):
+        starts = [i for i, ln in enumerate(L) if _LINE.search(ln)]
+        for k, i in enumerate(starts):
+            ln = L[i]
             mm = _LINE.search(ln)
-            if not mm:
-                continue
+            full_blk = "\n".join(L[i:starts[k + 1] if k + 1 < len(starts) else len(L)])
+            inn = re.search(r"#\s*of\s*Inners\s*:\s*(\d+)", full_blk)
+            upi = re.search(r"#\s*of\s*Units\s*per\s*Inner\s*:\s*(\d+)", full_blk)
             nxt = L[i + 1] if i + 1 < len(L) else ""
             dp = re.search(r"^(?:Number:\s*)?(\d{9})\b", nxt)
             cost = re.search(r"(\d*\.\d+)\s*$", nxt)
@@ -103,7 +106,9 @@ def parse_po_text(fname, full):
             lines.append(dict(line=int(mm.group(1)), dpci=dp.group(1) if dp else None,
                               qty=int(mm.group(2).replace(",", "")),
                               cost=float(cost.group(1)) if cost else None, retail=ret,
-                              style=st.group(1) if st else None))
+                              style=st.group(1) if st else None,
+                              inners=int(inn.group(1)) if inn else None,
+                              upi=int(upi.group(1)) if upi else None))
         rec["lines"] = lines
         lq = sum(x["qty"] for x in lines)
         if rec["total_qty"] is not None and abs(lq - rec["total_qty"]) > 0.5:
@@ -375,7 +380,7 @@ def compute(state):
                        purpose=r.get("purpose"), sw=r.get("sw"), ship_pt=r.get("ship_pt"),
                        factory=fullfac(r.get("factory")), vendor=r.get("vendor"), dept=r.get("dept"),
                        line=l["line"], dpci=dp, qty=l["qty"], cost=l["cost"], retail=l["retail"],
-                       file=r["file"], reason=reason)
+                       inners=l.get("inners"), upi=l.get("upi"), file=r["file"], reason=reason)
             (excl if reason else inscope).append(rec)
 
     def sig(r):
@@ -396,14 +401,101 @@ GRN = PatternFill("solid", fgColor="E2EFDA"); BLU = PatternFill("solid", fgColor
 _th = Side(style="thin", color="BFBFBF"); BOX = Border(top=_th, bottom=_th, left=_th, right=_th)
 CEN = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LW = Alignment(vertical="center", wrap_text=True)
-FIXH = ["STYLE", "DPCI", "品名", "照片", "Program", "Case/\nInner", "PCN 成本", "PCN 零售", "Commit\n(Ent Ttl Rcpt U)"]
+FIXH = ["STYLE", "DPCI", "Product Description", "Image", "Program", "Case/\nInner", "Unit Cost$", "Retail$", "Commit\n(Ent Ttl Rcpt U)"]
 FIX = len(FIXH); P0 = FIX + 1; HR = 11
-RESERVED = {"使用說明", "Validation Summary", "Program 總覽", "Cost Discrepancy", "排除清單", "PO Ledger", "更新紀錄", STATE_SHEET, PHOTO_SHEET}
+RESERVED = {"使用說明", "Validation Summary", "Validation Detail", "Program 總覽", "Cost Discrepancy", "排除清單", "PO Ledger", "更新紀錄", STATE_SHEET, PHOTO_SHEET}
 
 
 def _short(f):
     w = re.sub(r"[^\w& ]", " ", f).split()
     return (" ".join(w[:2]) or "Factory")[:31]
+
+
+CHECKS = [
+    ("Unit Cost$", "PO 單價 = PCN 成本（FCA／FOB）", "行"),
+    ("Retail$", "PO Resale = PCN Suggested Unit Retail", "行"),
+    ("Case Pack", "PO # of Inners × Units per Inner = PCN Case；Units per Inner = PCN Inner", "行"),
+    ("數量｜整箱", "PO 數量是 Case Pack 的整數倍", "行"),
+    ("數量｜vs Commit", "全部 PO 合計 ≤ Commit × 110%（±10% 規則）", "DPCI"),
+    ("Factory", "PO 上的工廠 = PCN Factory Name", "行"),
+    ("PO 解析驗算", "每張 PO 的行數量合計 = Total Qty", "PO"),
+    ("Image", "WRK 有這個 DPCI 的照片", "DPCI"),
+]
+
+
+def _norm_fac(f):
+    return re.sub(r"[^a-z]", "", (f or "").lower())
+
+
+def _pack(p):
+    m = re.match(r"(\d+)/(\d+)", p.get("pack") or "")
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+
+def validate(state, res, photos):
+    """Every check on every in-scope line.  Returns (summary rows, detail rows, flags by DPCI)."""
+    pcn, inscope = res["pcn"], res["inscope"]
+    det = []
+    tested = collections.Counter()
+    for x in inscope:
+        p = pcn[x["dpci"]]
+        base = dict(po=x["po"], dpci=x["dpci"], style=p["style"], factory=x["factory"])
+        if p["cost"] is not None and x["cost"] is not None:
+            tested["Unit Cost$"] += 1
+            if abs(x["cost"] - p["cost"]) > 0.005:
+                det.append(dict(base, check="Unit Cost$", po_v=x["cost"], pcn_v=p["cost"],
+                                note=f"PO {'高' if x['cost'] > p['cost'] else '低'}於 PCN {abs(x['cost'] - p['cost']):.3f}／pc，"
+                                     f"影響 USD {(x['cost'] - p['cost']) * x['qty']:,.2f}"))
+        if p["retail"] is not None and x["retail"] is not None:
+            tested["Retail$"] += 1
+            if abs(x["retail"] - p["retail"]) > 0.005:
+                det.append(dict(base, check="Retail$", po_v=x["retail"], pcn_v=p["retail"], note="PO 為準，只標記"))
+        case, inner = _pack(p)
+        if case and x.get("inners") and x.get("upi"):
+            tested["Case Pack"] += 1
+            po_case = x["inners"] * x["upi"]
+            if po_case != case or x["upi"] != inner:
+                det.append(dict(base, check="Case Pack", po_v=f"{po_case}/{x['upi']}", pcn_v=p["pack"],
+                                note=f"PO：{x['inners']} inner × {x['upi']} pcs"))
+        if case:
+            tested["數量｜整箱"] += 1
+            if x["qty"] % case:
+                det.append(dict(base, check="數量｜整箱", po_v=x["qty"], pcn_v=case,
+                                note=f"{x['qty']:,} ÷ {case} = {x['qty'] / case:,.2f} 箱"))
+        if p["factory"]:
+            tested["Factory"] += 1
+            a, b = _norm_fac(x["factory"]), _norm_fac(p["factory"])
+            if not (a[:12] and (a.startswith(b[:12]) or b.startswith(a[:12]))):
+                det.append(dict(base, check="Factory", po_v=x["factory"], pcn_v=p["factory"], note="PO 工廠與 PCN 不同"))
+    tot = collections.Counter()
+    for x in inscope:
+        tot[x["dpci"]] += x["qty"]
+    for d, q in tot.items():
+        cm = pcn[d]["commit"]
+        if cm > 0:
+            tested["數量｜vs Commit"] += 1
+            if q > cm * 1.1:
+                det.append(dict(po="（全部 PO）", dpci=d, style=pcn[d]["style"], factory=pcn[d]["factory"],
+                                check="數量｜vs Commit", po_v=q, pcn_v=cm, note=f"PO 合計為 Commit 的 {q / cm:.1%}，超過 110%"))
+    pos = {x["po"] for x in inscope}
+    tested["PO 解析驗算"] = len(pos)
+    for pr in state.get("problems", []):
+        m = re.search(r"PO (\d{11})", pr)
+        if m and m.group(1) in pos and "Total Qty" in pr:
+            det.append(dict(po=m.group(1), dpci="", style="", factory="", check="PO 解析驗算", po_v="", pcn_v="", note=pr))
+    tested["Image"] = len(tot)
+    for d in sorted(tot):
+        if d not in photos:
+            det.append(dict(po="", dpci=d, style=pcn[d]["style"], factory=pcn[d]["factory"], check="Image",
+                            po_v="", pcn_v="", note="WRK 沒有這個 DPCI 的照片"))
+    nbad = collections.Counter(e["check"] for e in det)
+    summary = [(c, rule, unit, tested[c], nbad[c]) for c, rule, unit in CHECKS]
+    flags = collections.defaultdict(list)
+    for e in det:
+        if e["dpci"]:
+            flags[(e["dpci"], e["factory"])].append(e)
+            flags[(e["dpci"], None)].append(e)
+    return summary, det, flags
 
 
 def render(state, photos=None, manual=None):
@@ -412,6 +504,7 @@ def render(state, photos=None, manual=None):
     manual = manual or {"po": {}, "note": {}}
     res = compute(state)
     pcn, inscope, excl = res["pcn"], res["inscope"], res["excl"]
+    vsum, vdet, vflags = validate(state, res, photos)
     S = state["settings"]
     ae = S.get("ae") or "（未指定 AE）"
     today = datetime.date.today().isoformat()
@@ -442,7 +535,7 @@ def render(state, photos=None, manual=None):
                  ("3. 版本：同一張 PO 取 SPS 列印時間最新的一份；收到 Import PO Change CANCEL 即整張排除。", 0),
                  ("不符合的 PO 行全部列在「排除清單」並寫明原因。", 0), ("", 0), ("怎麼用", 1),
                  ("• 工廠分頁：第 3–10 列是 PO 表頭（S/C、AC 黃底手填）；品項依 Program 分區塊；最右側是合計、% vs Commit、核對、AE 備註（黃底）。", 0),
-                 ("• 紅底數量格＝該 PO 單價 ≠ PCN 成本（PO 為準，只標記）。英文明細在「Cost Discrepancy」。", 0),
+                 ("• 紅底數量格＝該 PO 單價 ≠ Unit Cost$（PO 為準，只標記）。所有核對項目（價錢、Retail、Case Pack、數量、Factory）的結果在 Validation Summary 第 0 節，逐筆明細在「Validation Detail」；英文的成本差異明細在「Cost Discrepancy」。", 0),
                  ("• 之後有新 PO：到 App 選「更新現有 GRID」，上傳這份檔案＋新的 PO PDF 即可；要加 Program 就一起上傳新的 PCN。", 0),
                  ("• 只有黃底欄位會在更新時保留；請不要在其他地方手寫資料，也不要改分頁名稱或刪除隱藏頁。", 0)]:
         ws.append([t]); c = ws.cell(ws.max_row, 1)
@@ -464,7 +557,7 @@ def render(state, photos=None, manual=None):
             q[(x["dpci"], x["po"])] += x["qty"]
         ws["A1"] = f"D53 PO GRID｜{f}"; ws["A1"].font = F(bold=True, size=14)
         ws["A2"] = (f"{ae}｜產生 {today}｜有效 PO {len(pos)} 張｜品項 {len(items)}｜Program："
-                    f"{'、'.join(sorted({pcn[d]['program'] for d in items}))}｜紅底＝PO 單價 ≠ PCN 成本")
+                    f"{'、'.join(sorted({pcn[d]['program'] for d in items}))}｜紅底＝PO 單價 ≠ Unit Cost$")
         ws["A2"].font = F(color="595959")
         labels = ["PO#-DC", "PO Date", "Purpose", "Ship Point", "Ship Window", "Vendor #", "S/C（手填）", "AC（手填）"]
         for i, lab in enumerate(labels):
@@ -478,8 +571,8 @@ def render(state, photos=None, manual=None):
                     cc.fill = YEL
         for i, h in enumerate(FIXH, 1):
             ws.cell(HR, i, h)
-        for j, p in enumerate(pos):
-            ws.cell(HR, P0 + j, p["dc"])
+        for j in range(len(pos)):
+            c = ws.cell(HR, P0 + j); c.fill = HDR; c.border = BOX
         for k, h in enumerate(["PO 合計", "% vs Commit", "未下單量", "核對", "AE 備註（自由欄）"]):
             ws.cell(HR, T + k, h)
         for c in ws[HR]:
@@ -508,15 +601,21 @@ def render(state, photos=None, manual=None):
             ws.cell(r, T + 1, f'=IF({CL(FIX)}{r}>0,{CL(T)}{r}/{CL(FIX)}{r},"")').number_format = "0.0%"
             ws.cell(r, T + 2, f'=IF({CL(FIX)}{r}>0,{CL(FIX)}{r}-{CL(T)}{r},"")').number_format = "#,##0"
             fl = []
-            cd = sorted({z["cost"] for z in costdiff if z["dpci"] == d and z["factory"] == f})
-            if cd:
-                fl.append(f"成本 PO {'/'.join(map(str, cd))} vs PCN {p['cost']}")
+            for e in vflags.get((d, f), []) + [e for e in vflags.get((d, None), []) if e["check"] in ("數量｜vs Commit", "Image")]:
+                ck = e["check"]
+                if ck == "Unit Cost$":
+                    lab = f"Cost PO {e['po_v']} vs {e['pcn_v']}"
+                elif ck == "Retail$":
+                    lab = f"Retail PO {e['po_v']} vs {e['pcn_v']}"
+                elif ck == "Case Pack":
+                    lab = f"Case Pack PO {e['po_v']} vs {e['pcn_v']}"
+                else:
+                    lab = {"數量｜整箱": "數量非整箱", "數量｜vs Commit": "超過 Commit 110%",
+                           "Factory": "Factory 與 PCN 不同", "Image": "缺照片"}.get(ck, ck)
+                if lab not in fl:
+                    fl.append(lab)
             if p["cost"] is None:
                 fl.append("PCN 無成本")
-            if d in retdiff:
-                fl.append(f"零售 PO {retdiff[d][0]} vs PCN {retdiff[d][1]:g}")
-            if d not in photos:
-                fl.append("缺照片")
             c = ws.cell(r, T + 3, "OK" if not fl else "；".join(fl)); c.alignment = LW
             c.font = F(size=9, color="006100" if not fl else "9C0006"); c.fill = GRN if not fl else RED
             ws.cell(r, T + 4, manual["note"].get(d))
@@ -540,7 +639,7 @@ def render(state, photos=None, manual=None):
             o["pos"] |= {po["po"] for po in pos if q.get((d, po["po"]))}
             o["diff"] += sum(1 for z in costdiff if z["dpci"] == d and z["factory"] == f)
         RN = r; t1, t2 = RN + 1, RN + 2
-        ws.cell(t1, 3, "Total Units"); ws.cell(t2, 3, "Total 成本 $（PCN 成本 × 數量）")
+        ws.cell(t1, 3, "Total Units"); ws.cell(t2, 3, "Total Cost $（Unit Cost$ × 數量）")
         for j in range(len(pos) + 1):
             col = CL(P0 + j) if j < len(pos) else CL(T)
             ws[f"{col}{t1}"] = f"=SUM({col}{R0}:{col}{RN})"; ws[f"{col}{t1}"].number_format = "#,##0"
@@ -563,7 +662,7 @@ def render(state, photos=None, manual=None):
     # ---- Program 總覽
     ov = wb.create_sheet("Program 總覽")
     ov.append([f"Program 總覽｜{ae}｜{today}"]); ov["A1"].font = F(bold=True, size=14); ov.append([])
-    ov.append(["Program（PCN）", "工廠", "工廠分頁", "品項", "有效 PO", "數量", "Commit", "% vs Commit", "成本 $（PCN）", "成本差異行"])
+    ov.append(["Program（PCN）", "Factory", "工廠分頁", "品項", "有效 PO", "數量", "Commit", "% vs Commit", "Cost $（Unit Cost$ × 數量）", "成本差異行"])
     for c in ov[3]:
         c.font = F(bold=True, color="FFFFFF"); c.fill = HDR; c.alignment = CEN; c.border = BOX
     for pg in sorted({k[0] for k in overview}):
@@ -620,9 +719,21 @@ def render(state, photos=None, manual=None):
         cd.column_dimensions[CL(i)].width = w
     cd.freeze_panes = "A5"
 
+    # ---- Validation Detail
+    vd = wb.create_sheet("Validation Detail")
+    vd.append(["檢查項目", "PO#", "DPCI", "STYLE", "Factory", "PO 值", "PCN 值", "說明"])
+    for c in vd[1]:
+        c.font = F(bold=True, color="FFFFFF"); c.fill = HDR; c.alignment = CEN
+    order_c = {c[0]: i for i, c in enumerate(CHECKS)}
+    for e in sorted(vdet, key=lambda e: (order_c.get(e["check"], 99), e["po"], e["dpci"])):
+        vd.append([e["check"], e["po"], e["dpci"], e["style"], e["factory"], e["po_v"], e["pcn_v"], e["note"]])
+    for i, w in enumerate([16, 13, 12, 14, 32, 14, 14, 60], 1):
+        vd.column_dimensions[CL(i)].width = w
+    vd.freeze_panes = "A2"; vd.auto_filter.ref = vd.dimensions
+
     # ---- 排除清單
     ex = wb.create_sheet("排除清單")
-    ex.append(["原因", "PO#", "DC", "Dept", "Purpose", "PO Date", "Ship Window", "工廠", "Line", "DPCI", "數量", "來源檔案"])
+    ex.append(["原因", "PO#", "DC", "Dept", "Purpose", "PO Date", "Ship Window", "Factory", "Line", "DPCI", "數量", "來源檔案"])
     for c in ex[1]:
         c.font = F(bold=True, color="FFFFFF"); c.fill = HDR; c.alignment = CEN
     for x in sorted(excl, key=lambda x: (x["reason"], x["po"], x["line"])):
@@ -634,22 +745,23 @@ def render(state, photos=None, manual=None):
 
     # ---- PO Ledger
     lg = wb.create_sheet("PO Ledger")
-    lg.append(["PO#", "DC", "PO Date", "SPS 列印時間", "Purpose", "Ship Window", "Ship Point", "工廠", "Vendor #", "Line",
-               "DPCI", "STYLE", "品名", "Program", "數量", "PO 單價", "PCN 成本", "PO 零售", "PCN 零售", "來源檔案"])
+    lg.append(["PO#", "DC", "PO Date", "SPS 列印時間", "Purpose", "Ship Window", "Ship Point", "Factory", "Vendor #", "Line",
+               "DPCI", "STYLE", "Product Description", "Program", "數量", "PO 單價", "Unit Cost$", "PO Retail", "Retail$",
+               "PO Inners", "PO Units/Inner", "來源檔案"])
     for c in lg[1]:
         c.font = F(bold=True, color="FFFFFF"); c.fill = HDR; c.alignment = CEN
     for x in sorted(inscope, key=lambda x: (x["factory"], x["po"], x["line"])):
         p = pcn[x["dpci"]]
         lg.append([x["po"], x["dc"], x["po_date"], x["printed"], x["purpose"], x["sw"], x["ship_pt"], x["factory"],
                    x["vendor"], x["line"], x["dpci"], p["style"], p["desc"], p["program"], x["qty"], x["cost"],
-                   p["cost"], x["retail"], p["retail"], x["file"]])
-    for i, w in enumerate([13, 6, 11, 16, 8, 22, 9, 30, 10, 5, 12, 14, 34, 26, 9, 8, 8, 8, 8, 34], 1):
+                   p["cost"], x["retail"], p["retail"], x.get("inners"), x.get("upi"), x["file"]])
+    for i, w in enumerate([13, 6, 11, 16, 8, 22, 9, 30, 10, 5, 12, 14, 34, 26, 9, 8, 8, 8, 8, 8, 9, 34], 1):
         lg.column_dimensions[CL(i)].width = w
     lg.freeze_panes = "A2"; lg.auto_filter.ref = lg.dimensions
 
     # ---- 更新紀錄
     cl = wb.create_sheet("更新紀錄")
-    cl.append(["時間", "動作", "PO#", "DPCI", "工廠", "原數量", "新數量", "說明"])
+    cl.append(["時間", "動作", "PO#", "DPCI", "Factory", "原數量", "新數量", "說明"])
     for c in cl[1]:
         c.font = F(bold=True, color="FFFFFF"); c.fill = HDR; c.alignment = CEN
     for e in reversed(state.get("changelog", [])):
@@ -673,6 +785,12 @@ def render(state, photos=None, manual=None):
                 if fill:
                     c.fill = fill
     vs.append([f"D53 PO GRID｜{ae}｜Validation Summary｜{today}"]); vs["A1"].font = F(bold=True, size=14); vs.append([])
+    Hh("0. 核對總表 Validation Checklist")
+    row(["檢查項目", "規則", "單位", "已檢查", "差異", "結果"], SUB, True)
+    for c, rule, unit, n, bad_n in vsum:
+        res_txt = "—（沒有資料可比對）" if n == 0 else ("✔ 全部相符" if bad_n == 0 else f"✖ {bad_n} 筆，見「Validation Detail」")
+        row([c, rule, unit, n, bad_n, res_txt], None if n == 0 else (GRN if bad_n == 0 else RED))
+    vs.append([])
     Hh("1. 範圍")
     row(["項目", "數量", "說明"], SUB, True)
     for p in state["pcn"].values():
@@ -701,27 +819,25 @@ def render(state, photos=None, manual=None):
         for p in probs:
             row([p], RED)
     vs.append([]); Hh("2. 工廠分頁")
-    row(["工廠", "分頁", "品項", "有效 PO", "數量"], SUB, True)
+    row(["Factory", "分頁", "品項", "有效 PO", "數量"], SUB, True)
     for f in facs:
         row([f, *sheetinfo[f]])
-    vs.append([]); Hh("3. 成本差異：PO 單價 ≠ PCN 成本（PO 為準，只標記）")
+    vs.append([]); Hh("3. 成本差異：PO 單價 ≠ Unit Cost$（PO 為準，只標記）")
     hi = [x for x in costdiff if x["cost"] > pcn[x["dpci"]]["cost"]]
     lo = [x for x in costdiff if x["cost"] < pcn[x["dpci"]]["cost"]]
     row(["PO 高於 PCN", f"{len(hi)} 行", f"{len({x['dpci'] for x in hi})} 個 DPCI、{len({x['po'] for x in hi})} 張 PO；合計 USD "
          f"{sum((x['cost'] - pcn[x['dpci']]['cost']) * x['qty'] for x in hi):,.2f}"], RED if hi else None)
     row(["PO 低於 PCN（對我們不利）", f"{len(lo)} 行",
          "；".join(sorted({f"{x['dpci']} PO {x['cost']} vs PCN {pcn[x['dpci']]['cost']}" for x in lo})) or "無"], RED if lo else None)
-    if retdiff:
-        row(["零售價差異", f"{len(retdiff)} 個 DPCI", "；".join(f"{k} PO {a} vs PCN {b:g}" for k, (a, b) in retdiff.items())])
     vs.append([]); Hh("4. 已取消 PO → 重開對照")
-    row(["已取消 PO", "工廠", "原 Ship Window", "重開為"], SUB, True)
+    row(["已取消 PO", "Factory", "原 Ship Window", "重開為"], SUB, True)
     for p, new in sorted(res["reissue"].items(), key=lambda kv: res["orders"][kv[0]].get("factory") or ""):
         o = res["orders"][p]
         if not any(fmt_dpci(l["dpci"]) in pcn for l in o["lines"]):
             continue
         row([f"{p}-{o['dc']}", o.get("factory"), o.get("sw"), ", ".join(new) or "找不到相同內容的新單"], None if new else RED)
     vs.append([]); Hh("5. PCN 有、但還沒收到本季 PO 的品項（Commit > 0，排除 No Longer Under Consideration）")
-    row(["DPCI", "STYLE", "品名", "Program", "Commit", "Plan Status", "PCN 工廠"], SUB, True)
+    row(["DPCI", "STYLE", "Product Description", "Program", "Commit", "Plan Status", "Factory"], SUB, True)
     got = {x["dpci"] for x in inscope}
     for d, p in sorted(pcn.items(), key=lambda kv: (kv[1]["program"], kv[0])):
         if d in got or p["commit"] <= 0 or p["status"] == "No Longer Under Consideration":
@@ -759,11 +875,11 @@ def render(state, photos=None, manual=None):
     st.sheet_state = "hidden"
 
     order = ["使用說明", "Validation Summary", "Program 總覽"] + [names[f] for f in facs] + \
-            ["Cost Discrepancy", "排除清單", "PO Ledger", "更新紀錄", PHOTO_SHEET, STATE_SHEET]
+            ["Validation Detail", "Cost Discrepancy", "排除清單", "PO Ledger", "更新紀錄", PHOTO_SHEET, STATE_SHEET]
     wb._sheets = [wb[n] for n in order]
     wb.active = 1
     out = io.BytesIO(); wb.save(out)
-    stats = dict(pos=len({x["po"] for x in inscope}), lines=len(inscope), qty=sum(x["qty"] for x in inscope),
+    stats = dict(checks=[(c, n, b) for c, _, _, n, b in vsum], pos=len({x["po"] for x in inscope}), lines=len(inscope), qty=sum(x["qty"] for x in inscope),
                  dpci=len({x["dpci"] for x in inscope}), factories=len(facs), excluded=dict(rc),
                  costdiff=len(costdiff), cost_hi=len(hi), cost_lo=len(lo), missing_photos=len(noph),
                  cancelled=len(res["cancel"]), sheets=[names[f] for f in facs])
