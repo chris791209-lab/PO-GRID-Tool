@@ -54,16 +54,52 @@ def _photos(wrk_uploads):
     return ph
 
 
-def _advanced_filter(pcns, key, preset_f=(), preset_d=()):
+_MODES = {"all": "整份 PCN 都是我的", "include": "只納入我負責的（貼上 DPCI 或 Style#）", "exclude": "排除少數品項／工廠"}
+
+
+def _scope_filter(pcns, key, preset=None):
+    """品項範圍.  Returns a settings dict: filter_mode + include/exclude lists."""
+    preset = preset or {}
     rows = {d: r for p in pcns for d, r in p["rows"].items()}
     facs = sorted({r["factory"] for r in rows.values() if r["factory"]})
-    with st.expander("進階篩選（PCN 跟別人共用時才需要；預設全部納入）", expanded=bool(preset_f or preset_d)):
-        ex_f = st.multiselect("排除這些工廠", facs, default=[f for f in preset_f if f in facs], key=f"{key}_f")
+    st.markdown("**品項範圍**")
+    modes = list(_MODES)
+    mode = st.radio("品項範圍", modes, index=modes.index(E.filter_mode(preset)), format_func=_MODES.get,
+                    horizontal=True, key=f"{key}_mode", label_visibility="collapsed")
+    out = dict(filter_mode=mode, include_dpci=[], include_factories=[], excluded_dpci=[], excluded_factories=[])
+    if mode == "include":
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            pre = "\n".join(preset.get("include_dpci", []))
+            txt = st.text_area("貼上 DPCI 或 Vendor Style#（從 Excel 整欄複製即可，換行、逗號、空白都可分隔）",
+                               value=pre, height=150, key=f"{key}_paste",
+                               placeholder="053-00-0527\n053000528\nV27PFI04")
+        with c2:
+            inc_f = st.multiselect("（選填）整家工廠都是我的", facs,
+                                   default=[f for f in preset.get("include_factories", []) if f in facs], key=f"{key}_incf")
+        matched, hits, unmatched = E.match_tokens(pcns, txt)
+        out.update(include_dpci=matched, include_factories=inc_f)
+        n = len(set(matched) | {d for d, r in rows.items() if r["factory"] in inc_f})
+        if n:
+            st.success(f"納入 {n} 個 DPCI（PCN 共 {len(rows)} 個）")
+            show = sorted(set(matched) | {d for d, r in rows.items() if r["factory"] in inc_f})
+            st.dataframe([{"DPCI": d, "Style": rows[d]["style"], "品名": rows[d]["desc"], "工廠": rows[d]["factory"],
+                           "Program": rows[d]["program"]} for d in show], hide_index=True, use_container_width=True,
+                         height=min(38 + 35 * len(show), 320))
+        else:
+            st.info("還沒有納入任何品項：請貼上 DPCI／Style#，或選擇工廠。")
+        if unmatched:
+            st.warning(f"這 {len(unmatched)} 個在 PCN 裡找不到，已略過：{'、'.join(unmatched[:30])}")
+    elif mode == "exclude":
+        ex_f = st.multiselect("排除這些工廠", facs, default=[f for f in preset.get("excluded_factories", []) if f in facs], key=f"{key}_f")
         opts = {f"{d}｜{r['style']}｜{r['desc'][:40]}": d for d, r in sorted(rows.items()) if r["factory"] not in ex_f}
         inv = {v: k for k, v in opts.items()}
-        ex_d = st.multiselect("排除個別 DPCI", list(opts), default=[inv[d] for d in preset_d if d in inv], key=f"{key}_d")
+        ex_d = st.multiselect("排除個別 DPCI", list(opts), default=[inv[d] for d in preset.get("excluded_dpci", []) if d in inv], key=f"{key}_d")
+        out.update(excluded_factories=ex_f, excluded_dpci=[opts[x] for x in ex_d])
         st.caption(f"納入 {sum(1 for r in rows.values() if r['factory'] not in ex_f) - len(ex_d)} / {len(rows)} 個 DPCI")
-    return ex_f, [opts[x] for x in ex_d]
+    else:
+        st.caption(f"納入 PCN 全部 {len(rows)} 個 DPCI")
+    return out
 
 
 def _show_result(data, stats, fname, log=None):
@@ -87,7 +123,7 @@ def _show_result(data, stats, fname, log=None):
 
 def render_d53_page():
     st.subheader("📊 D53 PO GRID")
-    st.caption("以 PCN 為準：只放 PCN 裡的品項；BAS 補貨單、非本季、已取消的 PO 會自動排除並列在「排除清單」。"
+    st.caption("以 PCN 為準：只放 PCN（與品項範圍）裡的品項；BAS 補貨單、非本季、已取消的 PO 會自動排除並列在「排除清單」。"
                "每間工廠一個分頁，第一頁是 Validation Summary，再來是 Program 總覽。")
     mode = st.radio("要做什麼？", ["新建 GRID", "更新現有 GRID（加新 PO／加 Program）"], horizontal=True, key="d53_mode")
 
@@ -108,11 +144,14 @@ def render_d53_page():
                 st.error(str(e))
         season = st.date_input("本季起始日（Ship Window 早於這天的 PO 行會排除）",
                                value=_season_default([f.name for f in pcn_up or []]), key="d53_season")
-        ex_f, ex_d = _advanced_filter(pcns, "d53_new") if pcns else ([], [])
-        if st.button("產生 PO GRID", type="primary", disabled=not (pcns and po_up and ae), key="d53_build"):
+        scope = _scope_filter(pcns, "d53_new") if pcns else dict(filter_mode="all")
+        empty_inc = scope["filter_mode"] == "include" and not (scope["include_dpci"] or scope["include_factories"])
+        if st.button("產生 PO GRID", type="primary", disabled=not (pcns and po_up and ae) or empty_inc, key="d53_build"):
             docs, probs = _parse_uploads(po_up)
             with st.spinner("產生 GRID…"):
-                state = E.new_state(ae, season, pcns, docs, probs, ex_f, ex_d)
+                state = E.new_state(ae, season, pcns, docs, probs, scope.get("excluded_factories", []),
+                                    scope.get("excluded_dpci", []), scope["filter_mode"],
+                                    scope.get("include_factories", []), scope.get("include_dpci", []))
                 data, stats = E.render(state, _photos(wrk_up))
             st.session_state["d53_out"] = (data, stats, f"D53_PO_GRID_{ae}_{datetime.date.today():%Y%m%d}.xlsx", None, probs)
         if not (pcns and po_up and ae):
@@ -143,13 +182,13 @@ def render_d53_page():
                     st.error(str(e))
             season = st.date_input("本季起始日", value=datetime.date.fromisoformat(S["season_start"]), key="d53_season_u")
             all_pcns = list({**state["pcn"], **{p["program"]: p for p in new_pcns}}.values())
-            ex_f, ex_d = _advanced_filter(all_pcns, "d53_upd", S.get("excluded_factories", []), S.get("excluded_dpci", []))
+            scope = _scope_filter(all_pcns, "d53_upd", S)
             if st.button("更新 PO GRID", type="primary", key="d53_update"):
                 docs, probs = _parse_uploads(po_up or [])
                 with st.spinner("更新 GRID…"):
                     photos.update(_photos(wrk_up))
                     state, log, _ = E.merge_update(state, docs, new_pcns, probs,
-                                                   dict(season_start=season.isoformat(), excluded_factories=ex_f, excluded_dpci=ex_d))
+                                                   dict(season_start=season.isoformat(), **scope))
                     data, stats = E.render(state, photos, manual)
                 st.session_state["d53_out"] = (data, stats, f"D53_PO_GRID_{S.get('ae')}_{datetime.date.today():%Y%m%d}.xlsx", log, probs)
 

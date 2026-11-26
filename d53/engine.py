@@ -3,7 +3,7 @@
 Data flow:  PCN (scope) -> SPS PO PDFs (quantities) -> WRK workspace (photos) -> GRID workbook.
 
 Scope gates applied to every PO line:
-  1. DPCI is in an uploaded PCN (minus anything removed in 進階篩選)
+  1. DPCI is in an uploaded PCN, narrowed by the 範圍 setting (all / include list / exclude list)
   2. Purpose code is not BAS, and the Ship Window starts on/after the season start date
   3. Latest SPS print of each PO wins; a PO with an "Import PO Change ... CANCEL" notice is excluded
 Lines that fail a gate are kept in the 排除清單 sheet with the reason — nothing is dropped silently.
@@ -284,13 +284,52 @@ def _swstart(sw):
     return datetime.date(int(m[3]), int(m[1]), int(m[2])) if m else None
 
 
+def filter_mode(settings):
+    m = settings.get("filter_mode")
+    if m:
+        return m
+    return "exclude" if (settings.get("excluded_factories") or settings.get("excluded_dpci")) else "all"
+
+
+def match_tokens(pcns, text):
+    """Match pasted DPCI / Vendor Style # tokens against PCN rows.
+    Returns (matched DPCI list, {token: [dpci...]}, unmatched tokens)."""
+    rows = {d: r for p in pcns for d, r in p["rows"].items()}
+    by_style = collections.defaultdict(list)
+    for d, r in rows.items():
+        if r["style"]:
+            by_style[r["style"].strip().upper()].append(d)
+    hits, unmatched, matched = {}, [], []
+    for tok in re.split(r"[\s,;，；、]+", text or ""):
+        tok = tok.strip().strip("'\"")
+        if not tok:
+            continue
+        digits = re.sub(r"\D", "", tok)
+        cand = []
+        if len(digits) == 9 and re.fullmatch(r"[\d\-\s]+", tok):
+            d = fmt_dpci(digits)
+            cand = [d] if d in rows else []
+        if not cand:
+            cand = by_style.get(tok.upper(), [])
+        if cand:
+            hits[tok] = cand
+            matched += [d for d in cand if d not in matched]
+        else:
+            unmatched.append(tok)
+    return matched, hits, unmatched
+
+
 def effective_pcn(state):
-    excl_f = set(state["settings"].get("excluded_factories", []))
-    excl_d = set(state["settings"].get("excluded_dpci", []))
+    S = state["settings"]
+    mode = filter_mode(S)
+    inc_f, inc_d = set(S.get("include_factories", [])), set(S.get("include_dpci", []))
+    excl_f, excl_d = set(S.get("excluded_factories", [])), set(S.get("excluded_dpci", []))
     out = {}
     for p in state["pcn"].values():
         for d, r in p["rows"].items():
-            if d in excl_d or r["factory"] in excl_f:
+            if mode == "include" and not (d in inc_d or r["factory"] in inc_f):
+                continue
+            if mode == "exclude" and (d in excl_d or r["factory"] in excl_f):
                 continue
             out[d] = r
     return out
@@ -398,7 +437,7 @@ def render(state, photos=None, manual=None):
     ws = wb.active; ws.title = "使用說明"
     for t, b in [(f"D53 PO GRID｜{ae}", 2), (f"產生 {today}｜資料流：PCN（範圍）→ PO（數量）→ WRK（照片）", 0), ("", 0),
                  ("範圍怎麼決定", 1),
-                 ("1. 品項：只看上傳的 PCN（每份 PCN＝一個 Program）。PCN 跟別人共用時，可在 App 的「進階篩選」排除不屬於自己的工廠／品項。", 0),
+                 ("1. 品項：只看上傳的 PCN（每份 PCN＝一個 Program）。PCN 跟別人共用時，可在 App 的「品項範圍」貼上自己負責的 DPCI／Style#，只納入這些。", 0),
                  (f"2. 季別：Purpose 不是 BAS，且 Ship Window 開始日 ≥ 本季起始日（本檔：{season}）。", 0),
                  ("3. 版本：同一張 PO 取 SPS 列印時間最新的一份；收到 Import PO Change CANCEL 即整張排除。", 0),
                  ("不符合的 PO 行全部列在「排除清單」並寫明原因。", 0), ("", 0), ("怎麼用", 1),
@@ -641,8 +680,14 @@ def render(state, photos=None, manual=None):
         if p.get("nodpci"):
             row(["　└ 沒有 DPCI 的列", sum(p["nodpci"].values()),
                  "無法和 PO 比對：" + "、".join(f"{k} {v}" for k, v in p["nodpci"].items())], YEL)
-    nx = len(S.get("excluded_factories", [])) + len(S.get("excluded_dpci", []))
-    row(["進階篩選", "全選" if not nx else f"排除 {len(S.get('excluded_factories', []))} 家工廠、{len(S.get('excluded_dpci', []))} 個 DPCI", ""])
+    fm = filter_mode(S)
+    if fm == "include":
+        ftxt = f"只納入：{len(S.get('include_dpci', []))} 個指定 DPCI" + (f"＋{len(S.get('include_factories', []))} 家工廠的全部品項" if S.get("include_factories") else "")
+    elif fm == "exclude":
+        ftxt = f"排除 {len(S.get('excluded_factories', []))} 家工廠、{len(S.get('excluded_dpci', []))} 個 DPCI"
+    else:
+        ftxt = "整份 PCN 全部納入"
+    row(["品項範圍", ftxt, f"實際納入 {len(pcn)} 個 DPCI"])
     row(["本季起始日", season, "Ship Window 開始日早於此日的 PO 行排除"])
     row(["PO 文件（取最新版）", f"{len(res['orders'])} 張", f"另有 {len(res['cancel'])} 張收到 CANCEL"])
     row(["納入本 GRID", f"{len({x['po'] for x in inscope})} 張 PO",
@@ -824,7 +869,9 @@ def merge_update(state, new_docs, new_pcns=None, new_problems=None, settings_pat
     for p in (new_pcns or []):
         added = sorted(set(p["rows"]) - old_pcn_dpci)
         if added:
-            log.append(dict(time=now, action="PCN 更新", note=f"{p['program']}：新增 {len(added)} 個 DPCI（已納入；不屬於你請用進階篩選排除）："
+            how = ("未納入；若是你的請加進「只納入」清單" if filter_mode(state["settings"]) == "include"
+                   else "已納入；不屬於你請在範圍設定排除")
+            log.append(dict(time=now, action="PCN 更新", note=f"{p['program']}：新增 {len(added)} 個 DPCI（{how}）："
                             + "、".join(added[:30]) + ("…" if len(added) > 30 else "")))
     if not log:
         log.append(dict(time=now, action="更新", note=f"上傳 {len(new_docs)} 份 PO 文件，GRID 內容沒有變化"))
@@ -832,9 +879,11 @@ def merge_update(state, new_docs, new_pcns=None, new_problems=None, settings_pat
     return state, log, added_docs
 
 
-def new_state(ae, season_start, pcns, docs, problems, excluded_factories=(), excluded_dpci=()):
+def new_state(ae, season_start, pcns, docs, problems, excluded_factories=(), excluded_dpci=(),
+              filter_mode="all", include_factories=(), include_dpci=()):
     return dict(settings=dict(ae=ae, season_start=season_start.isoformat() if hasattr(season_start, "isoformat") else season_start,
                               excluded_factories=list(excluded_factories), excluded_dpci=list(excluded_dpci),
+                              filter_mode=filter_mode, include_factories=list(include_factories), include_dpci=list(include_dpci),
                               created=datetime.datetime.now().strftime("%Y-%m-%d %H:%M")),
                 pcn={p["program"]: p for p in pcns}, docs=docs,
                 changelog=[dict(time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), action="新建",
