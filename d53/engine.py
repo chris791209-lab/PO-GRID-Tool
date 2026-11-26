@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter as CL
 
 STATE_SHEET = "_D53_STATE"
 PHOTO_SHEET = "_D53_PHOTOS"
-ENGINE_VERSION = "d53-1.0"
+ENGINE_VERSION = "d53-1.1"
 AE_LIST = ["Michelle", "Theresa", "Vanessa", "Chris", "Elaine"]
 
 
@@ -816,7 +816,8 @@ def render(state, photos=None, manual=None):
     Hh("0. 核對總表 Validation Checklist")
     row(["檢查項目", "規則", "單位", "已檢查", "差異", "結果"], SUB, True)
     for c, rule, unit, n, bad_n in vsum:
-        res_txt = "—（沒有資料可比對）" if n == 0 else ("✔ 全部相符" if bad_n == 0 else f"✖ {bad_n} 筆，見「Validation Detail」")
+        res_txt = ("—（PO 沒有 Inner 資料：這份 GRID 的 PO 是舊版解析的，更新時把 PO PDF 重新上傳一次即可補上）"
+                   if n == 0 and c == "Case Pack" and inscope else "—（沒有資料可比對）") if n == 0 else ("✔ 全部相符" if bad_n == 0 else f"✖ {bad_n} 筆，見「Validation Detail」")
         row([c, rule, unit, n, bad_n, res_txt], None if n == 0 else (GRN if bad_n == 0 else RED))
     vs.append([])
     Hh("1. 範圍")
@@ -1009,8 +1010,13 @@ def merge_update(state, new_docs, new_pcns=None, new_problems=None, settings_pat
     """Add new PO documents / PCN files to a stored state and append the change log."""
     before, fac_b, canc_b = _qty_map(state)
     old_pcn_dpci = {d for p in state["pcn"].values() for d in p["rows"]}
-    seen = {(d["po"], d["doc"], d.get("printed"), d["file"]) for d in state["docs"]}
-    added_docs = [d for d in new_docs if (d["po"], d["doc"], d.get("printed"), d["file"]) not in seen]
+    key = lambda d: (d["po"], d["doc"], d.get("printed"), d["file"])  # noqa: E731
+    fresh = {key(d): d for d in new_docs}
+    # a PDF uploaded again replaces its stored copy, so fields added to the parser later
+    # (e.g. # of Inners / Units per Inner) get filled in for GRIDs built by an older version
+    state["docs"] = [fresh.get(key(d), d) for d in state["docs"]]
+    seen = {key(d) for d in state["docs"]}
+    added_docs = [d for d in new_docs if key(d) not in seen]
     state["docs"] = state["docs"] + added_docs
     for p in (new_pcns or []):
         state["pcn"][p["program"]] = p

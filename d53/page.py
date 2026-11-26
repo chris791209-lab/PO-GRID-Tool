@@ -8,17 +8,17 @@ from d53 import engine as E
 
 
 @st.cache_data(show_spinner=False, max_entries=2000)
-def _parse_pdf(name, data):
+def _parse_pdf(name, data, ver):  # ver: engine version, so a parser change never reuses old cache
     return E.parse_po_pdf(name, data)
 
 
 @st.cache_data(show_spinner=False, max_entries=50)
-def _load_pcn(name, data):
+def _load_pcn(name, data, ver):
     return E.load_pcn(name, data)
 
 
 @st.cache_data(show_spinner=False, max_entries=50)
-def _wrk_photos(name, data):
+def _wrk_photos(name, data, ver):
     return E.extract_wrk_photos(name, data)
 
 
@@ -37,7 +37,7 @@ def _parse_uploads(pdf_uploads):
         return docs, probs
     bar = st.progress(0.0, text="解析 PO PDF…")
     for i, (n, b) in enumerate(files, 1):
-        d, p = _parse_pdf(n, b)
+        d, p = _parse_pdf(n, b, E.ENGINE_VERSION)
         docs += d; probs += p
         bar.progress(i / len(files), text=f"解析 PO PDF… {i}/{len(files)}　{n}")
     bar.empty()
@@ -48,7 +48,7 @@ def _photos(wrk_uploads):
     ph = {}
     for f in wrk_uploads or []:
         try:
-            ph.update(_wrk_photos(f.name, f.getvalue()))
+            ph.update(_wrk_photos(f.name, f.getvalue(), E.ENGINE_VERSION))
         except Exception as e:  # a bad WRK file should not stop the run
             st.warning(f"{f.name} 讀不到照片：{e}")
     return ph
@@ -144,7 +144,7 @@ def render_d53_page():
         pcns = []
         for f in pcn_up or []:
             try:
-                pcns.append(_load_pcn(f.name, f.getvalue()))
+                pcns.append(_load_pcn(f.name, f.getvalue(), E.ENGINE_VERSION))
             except Exception as e:
                 st.error(str(e))
         season = st.date_input("本季起始日（Ship Window 早於這天的 PO 行會排除）",
@@ -182,7 +182,7 @@ def render_d53_page():
             new_pcns = []
             for f in pcn_up or []:
                 try:
-                    new_pcns.append(_load_pcn(f.name, f.getvalue()))
+                    new_pcns.append(_load_pcn(f.name, f.getvalue(), E.ENGINE_VERSION))
                 except Exception as e:
                     st.error(str(e))
             season = st.date_input("本季起始日", value=datetime.date.fromisoformat(S["season_start"]), key="d53_season_u")
