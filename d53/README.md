@@ -44,6 +44,7 @@ Validation Summary 第 0 節會列出每一項的「已檢查／差異」，逐�
 - Domestic 單沒有 SPS PDF，來源是 Target 的 **Modern PO Visibility (PO/Item Level)** 匯出 .csv。直接和 PDF 一起上傳到「② PO」，不用另開區塊。
 - 每張 Domestic PO 一欄，表頭顯示 `PO#-DOM`、Shipping Point = Domestic，跟 Import PO 放在同一個 Program 分頁。
 - 數量取 REVISED QUANTITY；單價 ITEM COST $；Retail = REV RETAIL $ ÷ 數量；Case Pack = VCP／SSP。
+- PO Date：CSV 的 CREATE DATE 是系統錯誤，不採用。Domestic PO 的 PO Date 格是黃底，由 AE 自行填，更新時會保留。
 - 工廠：CSV 沒有工廠欄，取 PCN 的 Factory Name，所以 Factory 這項不比對。
 - 成本：Domestic 行比對 PCN 的 Collect（或 Prepaid）Domestic Unit Cost；Import 行比對 FCA／FOB。
 - 版本：同一張 PO 有好幾份 CSV 時，取 Exported at 時間最新的那份。整張都 CANCELED 等同 CANCEL；只有單行 CANCELED 的列在「排除清單」。

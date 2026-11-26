@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter as CL
 
 STATE_SHEET = "_D53_STATE"
 PHOTO_SHEET = "_D53_PHOTOS"
-ENGINE_VERSION = "d53-1.2"
+ENGINE_VERSION = "d53-1.3"
 AE_LIST = ["Michelle", "Theresa", "Vanessa", "Chris", "Elaine"]
 
 
@@ -198,7 +198,8 @@ def parse_po_csv(fname, data):
         sb, se = _csv_date(r.get("REV SHIP BEGIN") or r.get("ORIG SHIP BEGIN")), _csv_date(r.get("REV SHIP END") or r.get("ORIG SHIP END"))
         d = docs.setdefault(po, dict(file=fname, po=po, dc="DOM", doc="ORDER", printed=printed, source="csv",
                                      vendor=r.get("VENDOR ID"), dept=(r.get("DEPARTMENT") or "").zfill(3) or None,
-                                     po_date=_csv_date(r.get("CREATE DATE")), sw=f"{sb}-{se}" if sb and se else sb,
+                                     po_date=None,  # CSV CREATE DATE is unreliable; AE fills PO Date in the GRID
+                                     sw=f"{sb}-{se}" if sb and se else sb,
                                      factory=None, ship_pt="Domestic", purpose="DOM", lines=[], cancelled=[]))
         qty = _csv_num(r.get("REVISED QUANTITY"))
         qty = _csv_num(r.get("ORIGINAL QUANTITY")) if qty is None else qty
@@ -615,6 +616,9 @@ def render(state, photos=None, manual=None):
     manual = manual or {"po": {}, "note": {}}
     res = compute(state)
     pcn, inscope, excl = res["pcn"], res["inscope"], res["excl"]
+    for x in inscope + excl:  # Domestic PO Date comes from the AE, not the CSV
+        if x["dc"] == "DOM":
+            x["po_date"] = manual["po"].get(x["po"], {}).get("po_date")
     vsum, vdet, vflags = validate(state, res, photos)
     S = state["settings"]
     ae = S.get("ae") or "（未指定 AE）"
@@ -653,7 +657,7 @@ def render(state, photos=None, manual=None):
                  ("3. 版本：同一張 PO 取 SPS 列印時間最新的一份；收到 Import PO Change CANCEL 即整張排除。", 0),
                  ("不符合的 PO 行全部列在「排除清單」並寫明原因。", 0), ("", 0), ("怎麼用", 1),
                  ("• 每個 Program 一個分頁。品項依 Factory 分區塊（粗線隔開），PO 欄也依同樣的工廠順序排列，所以每家工廠的數量落在自己的區塊。", 0),
-                 ("• 第 1–8 列是 PO 表頭（S/C、AC 黃底手填）；最右側是 Q'TY、Forecasted Units（Commit）、+-20%、差異 %、核對、AE 備註（黃底）。", 0),
+                 ("• 第 1–8 列是 PO 表頭（S/C、AC 黃底手填；Domestic PO 的 PO Date 也是黃底手填）；最右側是 Q'TY、Forecasted Units（Commit）、+-20%、差異 %、核對、AE 備註（黃底）。", 0),
                  ("• 紅底數量格＝該 PO 單價 ≠ Unit Cost$（PO 為準，只標記）。所有核對項目（價錢、Retail、Case Pack、數量、Factory）的結果在 Validation Summary 第 0 節，逐筆明細在「Validation Detail」；英文的成本差異明細在「Cost Discrepancy」。", 0),
                  ("• 之後有新 PO：到 App 選「更新現有 GRID」，上傳這份檔案＋新的 PO PDF 即可；要加 Program 就一起上傳新的 PCN。", 0),
                  ("• 只有黃底欄位會在更新時保留；請不要在其他地方手寫資料，也不要改分頁名稱或刪除隱藏頁。", 0)]:
@@ -693,12 +697,14 @@ def render(state, photos=None, manual=None):
             ws.merge_cells(start_row=rr, start_column=1, end_row=rr, end_column=FIX)
             for j, p in enumerate(pos):
                 mp = manual["po"].get(p["po"], {})
-                v = [f"{p['po']}-{p['dc']}", _short(p["factory"]), mp.get("sc"), p["po_date"], p["purpose"], mp.get("ac"),
+                dom = p["dc"] == "DOM"
+                v = [f"{p['po']}-{p['dc']}", _short(p["factory"]), mp.get("sc"),
+                     mp.get("po_date") if dom else p["po_date"], p["purpose"], mp.get("ac"),
                      p["ship_pt"], re.sub(r"/20(\d\d)", "", p["sw"] or "")][i]
                 cc = ws.cell(rr, P0 + j, v); cc.alignment = CEN; cc.font = F(size=9, bold=(i in (0, 1))); edge(cc)
                 if i == 0:
                     cc.fill = ORG
-                elif i in (2, 5):
+                elif i in (2, 5) or (i == 3 and dom):  # S/C, AC, and PO Date of a Domestic PO are typed by the AE
                     cc.fill = YEL
             ws.row_dimensions[rr].height = 22
         for i, h in enumerate(FIXH, 1):
@@ -1052,15 +1058,21 @@ def read_grid(data):
         lay = _grid_layout(ws)
         if not lay:
             continue
-        hr, dcol, T, ncol, porow, scrow, acrow = lay
+        hr, dcol, T, ncol, porow, scrow, acrow, pdrow = lay
         for c in range(1, T):
-            m = re.match(r"(\d{11})-", str(ws.cell(porow, c).value or ""))
+            m = re.match(r"(\d{11})-(\w+)", str(ws.cell(porow, c).value or ""))
             if not m:
                 continue
             sc = ws.cell(scrow, c).value if scrow else None
             ac = ws.cell(acrow, c).value if acrow else None
-            if sc not in (None, "") or ac not in (None, ""):
-                manual["po"][m.group(1)] = {"sc": sc, "ac": ac}
+            pd_ = ws.cell(pdrow, c).value if (pdrow and m.group(2) == "DOM") else None
+            if isinstance(pd_, (datetime.datetime, datetime.date)):
+                pd_ = pd_.strftime("%m/%d/%Y")
+            if any(v not in (None, "") for v in (sc, ac, pd_)):
+                rec = {"sc": sc, "ac": ac}
+                if pd_ not in (None, ""):
+                    rec["po_date"] = pd_
+                manual["po"][m.group(1)] = rec
         rowdpci = {}
         for r in range(hr + 1, ws.max_row + 1):
             d = ws.cell(r, dcol).value
@@ -1094,7 +1106,7 @@ def _grid_layout(ws):
                    if re.match(r"\d{11}-", str(ws.cell(r, c).value or ""))), None)
         if not po:
             continue
-        scrow = acrow = None
+        scrow = acrow = pdrow = None
         for r in range(1, hr):  # row labels sit left of the first PO column
             for c in range(1, po[1]):
                 v = ws.cell(r, c).value
@@ -1102,7 +1114,9 @@ def _grid_layout(ws):
                     scrow = r
                 elif isinstance(v, str) and v.startswith("AC"):
                     acrow = r
-        return hr, vals["DPCI"], T, ncol, po[0], scrow, acrow
+                elif isinstance(v, str) and v.startswith("PO Date"):
+                    pdrow = r
+        return hr, vals["DPCI"], T, ncol, po[0], scrow, acrow, pdrow
     return None
 
 
