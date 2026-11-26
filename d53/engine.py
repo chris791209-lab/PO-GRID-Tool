@@ -843,9 +843,7 @@ def render(state, photos=None, manual=None):
         if d in got or p["commit"] <= 0 or p["status"] == "No Longer Under Consideration":
             continue
         row([d, p["style"], p["desc"], p["program"], p["commit"], p["status"], p["factory"]])
-    vs.append([]); Hh("6. 資料缺口")
     noph = sorted({x["dpci"] for x in inscope if x["dpci"] not in photos})
-    row(["缺照片", f"{len(noph)} 個 DPCI", "上傳對應的 Map It Workspace 匯出檔（WRK）後重新更新即可"], YEL if noph else None)
     for i, w in enumerate([34, 26, 40, 22, 12, 16, 30], 1):
         vs.column_dimensions[CL(i)].width = w
 
