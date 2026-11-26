@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter as CL
 
 STATE_SHEET = "_D53_STATE"
 PHOTO_SHEET = "_D53_PHOTOS"
-ENGINE_VERSION = "d53-1.1"
+ENGINE_VERSION = "d53-1.2"
 AE_LIST = ["Michelle", "Theresa", "Vanessa", "Chris", "Elaine"]
 
 
@@ -126,6 +126,8 @@ def parse_po_text(fname, full):
 
 
 def parse_po_pdf(fname, data):
+    if fname.lower().endswith(".csv"):
+        return parse_po_csv(fname, data)
     return parse_po_text(fname, "\n".join(_pdf_text_pages(data)))
 
 
@@ -135,7 +137,7 @@ def iter_uploaded_pdfs(files):
         if name.lower().endswith(".zip"):
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 for info in z.infolist():
-                    if info.is_dir() or not info.filename.lower().endswith(".pdf"):
+                    if info.is_dir() or not info.filename.lower().endswith((".pdf", ".csv")):
                         continue
                     n = info.filename
                     for enc in ("cp950", "utf-8", "cp936"):
@@ -145,8 +147,94 @@ def iter_uploaded_pdfs(files):
                         except (UnicodeEncodeError, UnicodeDecodeError):
                             continue
                     yield n.split("/")[-1], z.read(info)
-        elif name.lower().endswith(".pdf"):
+        elif name.lower().endswith((".pdf", ".csv")):
             yield name, data
+
+
+# ---------------------------------------------------------------------  Domestic PO (.csv)
+# Target "Modern PO Visibility (PO/Item Level)" export.  Domestic POs have no SPS PDF; this turns
+# the CSV into the same document records the PDF parser produces (dc = "DOM", factory from PCN).
+def _csv_num(v):
+    try:
+        return float(str(v).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _csv_date(v):  # 2027-01-16 / 01-16-2027 -> 01/16/2027
+    v = str(v or "").strip()
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)", v)
+    if m:
+        return f"{m[2]}/{m[3]}/{m[1]}"
+    m = re.match(r"(\d\d)[-/](\d\d)[-/](\d{4})", v)
+    return f"{m[1]}/{m[2]}/{m[3]}" if m else None
+
+
+def parse_po_csv(fname, data):
+    """Return (docs, problems) from a Modern PO Visibility CSV export."""
+    import csv
+    text = data.decode("utf-8-sig", errors="replace") if isinstance(data, bytes) else data
+    problems = []
+    ex = re.search(r"Exported at:\s*(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d\d)(?::\d\d)?\s*([ap]m)?", text, re.I)
+    if ex:
+        hh = int(ex[4]) % 12 + (12 if (ex[6] or "").lower() == "pm" else 0) if ex[6] else int(ex[4])
+        printed = f"{ex[3]}/{int(ex[1]):02d}/{int(ex[2]):02d} {hh:02d}:{ex[5]}"
+    else:
+        printed = ""
+        problems.append(f"{fname}：找不到 Exported at 時間，同一張 PO 有多份 CSV 時無法判斷哪份最新")
+    rows = []
+    for r in csv.DictReader(io.StringIO(text)):
+        if not r.get("PO #") or not re.fullmatch(r"\d{11}", str(r["PO #"]).strip()):
+            continue  # footer / blank lines
+        rows.append({k.strip(): (v or "").strip() for k, v in r.items() if k})
+    if not rows:
+        problems.append(f"{fname}：CSV 裡沒有 PO 資料列（欄位要有 PO #、DPCI、REVISED QUANTITY）")
+    docs = {}
+    for i, r in enumerate(rows, 1):
+        po = r["PO #"]
+        if r.get("IMPORT FLAG", "").lower() == "true":
+            problems.append(f"{fname}：PO {po} 是 Import 單，請用 SPS 的 PO PDF（CSV 只用在 Domestic）")
+            continue
+        sb, se = _csv_date(r.get("REV SHIP BEGIN") or r.get("ORIG SHIP BEGIN")), _csv_date(r.get("REV SHIP END") or r.get("ORIG SHIP END"))
+        d = docs.setdefault(po, dict(file=fname, po=po, dc="DOM", doc="ORDER", printed=printed, source="csv",
+                                     vendor=r.get("VENDOR ID"), dept=(r.get("DEPARTMENT") or "").zfill(3) or None,
+                                     po_date=_csv_date(r.get("CREATE DATE")), sw=f"{sb}-{se}" if sb and se else sb,
+                                     factory=None, ship_pt="Domestic", purpose="DOM", lines=[], cancelled=[]))
+        qty = _csv_num(r.get("REVISED QUANTITY"))
+        qty = _csv_num(r.get("ORIGINAL QUANTITY")) if qty is None else qty
+        dp = re.sub(r"\D", "", r.get("DPCI", ""))
+        if r.get("CANCELED FLAG", "").lower() == "true" or not qty:
+            d["cancelled"].append(dict(dpci=dp, qty=int(_csv_num(r.get("ORIGINAL QUANTITY")) or 0)))
+            continue
+        vcp, ssp = _csv_num(r.get("VCP QUANTITY")), _csv_num(r.get("SSP QUANTITY"))
+        rr = _csv_num(r.get("REV RETAIL $") or r.get("ORIG RETAIL $"))
+        inn = (vcp / ssp) if vcp and ssp else None
+        d["lines"].append(dict(line=len(d["lines"]) + 1, dpci=dp if len(dp) == 9 else None, qty=int(qty),
+                               cost=_csv_num(r.get("ITEM COST $")),
+                               retail=round(rr / qty, 2) if rr and qty else None,
+                               style=r.get("MANUFACTURER STYLE") or None,
+                               inners=int(inn) if inn and inn == int(inn) else inn, upi=int(ssp) if ssp else None,
+                               orig_qty=_csv_num(r.get("ORIGINAL QUANTITY"))))
+    out = []
+    for d in docs.values():
+        d["total_qty"] = float(sum(x["qty"] for x in d["lines"]))
+        out.append(d)
+        if not d["lines"]:  # every line cancelled -> treat like an Import PO Change CANCEL
+            out.append(dict(d, doc="CHANGE", change="CANCEL", lines=[]))
+        elif d["cancelled"]:
+            problems.append(f"{fname}：Domestic PO {d['po']} 有 {len(d['cancelled'])} 行 CANCELED，已不列入")
+        if any(x["dpci"] is None for x in d["lines"]):
+            problems.append(f"{fname}：PO {d['po']} 有品項抓不到 DPCI")
+    return out, problems
+
+
+def _line_pcn_cost(p, domestic):
+    """PCN cost a PO line is checked against: Domestic POs use the domestic (collect / prepaid)
+    cost, Import POs the FCA / FOB cost; either falls back to the other when the PCN has only one."""
+    if not p:
+        return None
+    a, b = (p.get("cost_dom"), p.get("cost_imp")) if domestic else (p.get("cost_imp"), p.get("cost_dom"))
+    return next((v for v in (a, b, p.get("cost")) if v is not None), None)
 
 
 # =====================================================================  PCN / WRK
@@ -194,7 +282,10 @@ def load_pcn(fname, data):
             dpci=dpci, program=prog, desc=str(g(r, "Product Description") or ""),
             style=str(g(r, "Manufacturer Style #", "Manufacturer Style # *") or ""),
             commit=round(num(g(r, "Ent Ttl Rcpt U")) or 0),
-            cost=num(g(r, "FCA Factory City Unit Cost", "FOB Unit Cost")),
+            cost=num(g(r, "FCA Factory City Unit Cost", "FOB Unit Cost")) if num(g(r, "FCA Factory City Unit Cost", "FOB Unit Cost")) is not None
+            else num(g(r, "Collect Domestic Unit Cost", "Prepaid Domestic Unit Cost", "Direct to Store Delivery cost")),
+            cost_imp=num(g(r, "FCA Factory City Unit Cost", "FOB Unit Cost")),
+            cost_dom=num(g(r, "Collect Domestic Unit Cost", "Prepaid Domestic Unit Cost", "Direct to Store Delivery cost")),
             retail=num(g(r, "Suggested Unit Retail")),
             pack=f"{int(cq)}/{int(iq)}" if cq and iq else "",
             factory=str(g(r, "Factory Name *", "Factory Name") or ""), status=status)
@@ -367,7 +458,7 @@ def compute(state):
         for l in r["lines"]:
             dp = fmt_dpci(l["dpci"])
             if r["po"] in cancel:
-                reason = "已取消（Import PO Change CANCEL）"
+                reason = ("已取消（CSV CANCELED FLAG）" if r["dc"] == "DOM" else "已取消（Import PO Change CANCEL）")
             elif dp not in pcn:
                 reason = "DPCI 不在本次的 PCN" + ("" if r.get("dept") in (None, "053") else f"（Dept {r['dept']}）")
             elif r.get("purpose") == "BAS":
@@ -378,10 +469,21 @@ def compute(state):
                 reason = None
             rec = dict(po=r["po"], dc=r["dc"], po_date=r.get("po_date"), printed=r.get("printed"),
                        purpose=r.get("purpose"), sw=r.get("sw"), ship_pt=r.get("ship_pt"),
-                       factory=fullfac(r.get("factory")), vendor=r.get("vendor"), dept=r.get("dept"),
+                       factory=(fullfac(r.get("factory")) if r.get("factory")
+                                else (pcn[dp]["factory"] if dp in pcn and pcn[dp]["factory"] else "（工廠不明）")),
+                       vendor=r.get("vendor"), dept=r.get("dept"), domestic=r["dc"] == "DOM",
+                       pcn_cost=_line_pcn_cost(pcn.get(dp), r["dc"] == "DOM"),
                        line=l["line"], dpci=dp, qty=l["qty"], cost=l["cost"], retail=l["retail"],
                        inners=l.get("inners"), upi=l.get("upi"), file=r["file"], reason=reason)
             (excl if reason else inscope).append(rec)
+
+    for r in orders.values():  # single lines cancelled on a Domestic CSV
+        for k, c in enumerate(r.get("cancelled") or [], 1):
+            excl.append(dict(po=r["po"], dc=r["dc"], po_date=r.get("po_date"), printed=r.get("printed"),
+                             purpose=r.get("purpose"), sw=r.get("sw"), ship_pt=r.get("ship_pt"),
+                             factory=pcn[fmt_dpci(c["dpci"])]["factory"] if fmt_dpci(c["dpci"]) in pcn else "（工廠不明）",
+                             vendor=r.get("vendor"), dept=r.get("dept"), line=f"X{k}", dpci=fmt_dpci(c["dpci"]),
+                             qty=c["qty"], cost=None, retail=None, file=r["file"], reason="已取消（CSV 單行 CANCELED FLAG）"))
 
     def sig(r):
         return (r.get("factory"), r["dc"], tuple(sorted((l["dpci"], l["qty"]) for l in r["lines"])))
@@ -425,8 +527,8 @@ CHECKS = [
     ("Case Pack", "PO # of Inners × Units per Inner = PCN Case；Units per Inner = PCN Inner", "行"),
     ("數量｜整箱", "PO 數量是 Case Pack 的整數倍", "行"),
     ("數量｜vs Commit", "全部 PO 合計 ≤ Commit × 110%（±10% 規則）", "DPCI"),
-    ("Factory", "PO 上的工廠 = PCN Factory Name", "行"),
-    ("PO 解析驗算", "每張 PO 的行數量合計 = Total Qty", "PO"),
+    ("Factory", "PO 上的工廠 = PCN Factory Name（Domestic CSV 沒有工廠，不比對）", "行"),
+    ("PO 解析驗算", "每張 PO 的行數量合計 = Total Qty（Domestic CSV 不適用）", "PO"),
     ("Image", "WRK 有這個 DPCI 的照片", "DPCI"),
 ]
 
@@ -448,12 +550,13 @@ def validate(state, res, photos):
     for x in inscope:
         p = pcn[x["dpci"]]
         base = dict(po=x["po"], dpci=x["dpci"], style=p["style"], factory=x["factory"])
-        if p["cost"] is not None and x["cost"] is not None:
+        pc = x.get("pcn_cost", p["cost"])
+        if pc is not None and x["cost"] is not None:
             tested["Unit Cost$"] += 1
-            if abs(x["cost"] - p["cost"]) > 0.005:
-                det.append(dict(base, check="Unit Cost$", po_v=x["cost"], pcn_v=p["cost"],
-                                note=f"PO {'高' if x['cost'] > p['cost'] else '低'}於 PCN {abs(x['cost'] - p['cost']):.3f}／pc，"
-                                     f"影響 USD {(x['cost'] - p['cost']) * x['qty']:,.2f}"))
+            if abs(x["cost"] - pc) > 0.005:
+                det.append(dict(base, check="Unit Cost$", po_v=x["cost"], pcn_v=pc,
+                                note=f"{'Domestic ' if x.get('domestic') else ''}PO {'高' if x['cost'] > pc else '低'}於 PCN {abs(x['cost'] - pc):.3f}／pc，"
+                                     f"影響 USD {(x['cost'] - pc) * x['qty']:,.2f}"))
         if p["retail"] is not None and x["retail"] is not None:
             tested["Retail$"] += 1
             if abs(x["retail"] - p["retail"]) > 0.005:
@@ -470,7 +573,7 @@ def validate(state, res, photos):
             if x["qty"] % case:
                 det.append(dict(base, check="數量｜整箱", po_v=x["qty"], pcn_v=case,
                                 note=f"{x['qty']:,} ÷ {case} = {x['qty'] / case:,.2f} 箱"))
-        if p["factory"]:
+        if p["factory"] and not x.get("domestic"):  # CSV has no factory: it is taken from the PCN
             tested["Factory"] += 1
             a, b = _norm_fac(x["factory"]), _norm_fac(p["factory"])
             if not (a[:12] and (a.startswith(b[:12]) or b.startswith(a[:12]))):
@@ -486,7 +589,7 @@ def validate(state, res, photos):
                 det.append(dict(po="（全部 PO）", dpci=d, style=pcn[d]["style"], factory=pcn[d]["factory"],
                                 check="數量｜vs Commit", po_v=q, pcn_v=cm, note=f"PO 合計為 Commit 的 {q / cm:.1%}，超過 110%"))
     pos = {x["po"] for x in inscope}
-    tested["PO 解析驗算"] = len(pos)
+    tested["PO 解析驗算"] = len({x["po"] for x in inscope if not x.get("domestic")})
     for pr in state.get("problems", []):
         m = re.search(r"PO (\d{11})", pr)
         if m and m.group(1) in pos and "Total Qty" in pr:
@@ -517,8 +620,10 @@ def render(state, photos=None, manual=None):
     ae = S.get("ae") or "（未指定 AE）"
     today = datetime.date.today().isoformat()
     season = S["season_start"]
-    costdiff = [x for x in inscope if pcn[x["dpci"]]["cost"] is not None and x["cost"] is not None
-                and abs(x["cost"] - pcn[x["dpci"]]["cost"]) > 0.005]
+    for x in inscope:
+        x.setdefault("pcn_cost", pcn[x["dpci"]]["cost"])
+    costdiff = [x for x in inscope if x["pcn_cost"] is not None and x["cost"] is not None
+                and abs(x["cost"] - x["pcn_cost"]) > 0.005]
     bad = {(x["dpci"], x["po"]) for x in costdiff}
     retdiff = {x["dpci"]: (x["retail"], pcn[x["dpci"]]["retail"]) for x in inscope
                if x["retail"] is not None and pcn[x["dpci"]]["retail"] is not None
@@ -731,7 +836,7 @@ def render(state, photos=None, manual=None):
     for x in sorted(costdiff, key=lambda x: (x["po"], x["dpci"])):
         p = pcn[x["dpci"]]; rr = cd.max_row + 1
         cd.append([x["po"], x["dc"], x["po_date"], x["sw"], x["factory"], x["dpci"], p["style"], p["desc"],
-                   x["qty"], x["cost"], p["cost"], f"=J{rr}-K{rr}", f"=I{rr}*L{rr}"])
+                   x["qty"], x["cost"], x["pcn_cost"], f"=J{rr}-K{rr}", f"=I{rr}*L{rr}"])
         for c in cd[rr]:
             c.border = BOX; c.font = F(size=9)
         cd[f"I{rr}"].number_format = "#,##0"; cd[f"M{rr}"].number_format = "#,##0.00"
@@ -782,7 +887,7 @@ def render(state, photos=None, manual=None):
         p = pcn[x["dpci"]]
         lg.append([x["po"], x["dc"], x["po_date"], x["printed"], x["purpose"], x["sw"], x["ship_pt"], x["factory"],
                    x["vendor"], x["line"], x["dpci"], p["style"], p["desc"], p["program"], x["qty"], x["cost"],
-                   p["cost"], x["retail"], p["retail"], x.get("inners"), x.get("upi"), x["file"]])
+                   x["pcn_cost"], x["retail"], p["retail"], x.get("inners"), x.get("upi"), x["file"]])
     for i, w in enumerate([13, 6, 11, 16, 8, 22, 9, 30, 10, 5, 12, 14, 34, 26, 9, 8, 8, 8, 8, 8, 9, 34], 1):
         lg.column_dimensions[CL(i)].width = w
     lg.freeze_panes = "A2"; lg.auto_filter.ref = lg.dimensions
@@ -816,8 +921,13 @@ def render(state, photos=None, manual=None):
     Hh("0. 核對總表 Validation Checklist")
     row(["檢查項目", "規則", "單位", "已檢查", "差異", "結果"], SUB, True)
     for c, rule, unit, n, bad_n in vsum:
-        res_txt = ("—（PO 沒有 Inner 資料：這份 GRID 的 PO 是舊版解析的，更新時把 PO PDF 重新上傳一次即可補上）"
-                   if n == 0 and c == "Case Pack" and inscope else "—（沒有資料可比對）") if n == 0 else ("✔ 全部相符" if bad_n == 0 else f"✖ {bad_n} 筆，見「Validation Detail」")
+        if n == 0 and c == "Case Pack" and inscope:
+            why = "—（PO 沒有 Inner 資料：這份 GRID 的 PO 是舊版解析的，更新時把 PO PDF 重新上傳一次即可補上）"
+        elif n == 0 and c == "Factory" and inscope and all(x.get("domestic") for x in inscope):
+            why = "—（Domestic CSV 沒有工廠欄，工廠直接取 PCN，不需比對）"
+        else:
+            why = "—（沒有資料可比對）"
+        res_txt = why if n == 0 else ("✔ 全部相符" if bad_n == 0 else f"✖ {bad_n} 筆，見「Validation Detail」")
         row([c, rule, unit, n, bad_n, res_txt], None if n == 0 else (GRN if bad_n == 0 else RED))
     vs.append([])
     Hh("1. 範圍")
@@ -852,12 +962,12 @@ def render(state, photos=None, manual=None):
     for g in progs:
         row([g, *sheetinfo[g]])
     vs.append([]); Hh("3. 成本差異：PO 單價 ≠ Unit Cost$（PO 為準，只標記）")
-    hi = [x for x in costdiff if x["cost"] > pcn[x["dpci"]]["cost"]]
-    lo = [x for x in costdiff if x["cost"] < pcn[x["dpci"]]["cost"]]
+    hi = [x for x in costdiff if x["cost"] > x["pcn_cost"]]
+    lo = [x for x in costdiff if x["cost"] < x["pcn_cost"]]
     row(["PO 高於 PCN", f"{len(hi)} 行", f"{len({x['dpci'] for x in hi})} 個 DPCI、{len({x['po'] for x in hi})} 張 PO；合計 USD "
-         f"{sum((x['cost'] - pcn[x['dpci']]['cost']) * x['qty'] for x in hi):,.2f}"], RED if hi else None)
+         f"{sum((x['cost'] - x['pcn_cost']) * x['qty'] for x in hi):,.2f}"], RED if hi else None)
     row(["PO 低於 PCN（對我們不利）", f"{len(lo)} 行",
-         "；".join(sorted({f"{x['dpci']} PO {x['cost']} vs PCN {pcn[x['dpci']]['cost']}" for x in lo})) or "無"], RED if lo else None)
+         "；".join(sorted({f"{x['dpci']} PO {x['cost']} vs PCN {x['pcn_cost']}" for x in lo})) or "無"], RED if lo else None)
     vs.append([]); Hh("4. 已取消 PO → 重開對照")
     row(["已取消 PO", "Factory", "原 Ship Window", "重開為"], SUB, True)
     for p, new in sorted(res["reissue"].items(), key=lambda kv: res["orders"][kv[0]].get("factory") or ""):
@@ -1003,7 +1113,8 @@ def _qty_map(state):
     for x in res["inscope"]:
         m[(x["po"], x["dpci"])] = m.get((x["po"], x["dpci"]), 0) + x["qty"]
     fac = {x["po"]: x["factory"] for x in res["inscope"]}
-    return m, fac, set(res["cancel"])
+    canc = set(res["cancel"]) | {(x["po"], x["dpci"]) for x in res["excl"] if x["reason"].startswith("已取消")}
+    return m, fac, canc
 
 
 def merge_update(state, new_docs, new_pcns=None, new_problems=None, settings_patch=None):
@@ -1039,7 +1150,7 @@ def merge_update(state, new_docs, new_pcns=None, new_problems=None, settings_pat
         if b == a:
             continue
         if a is None:
-            act = "已取消" if po in canc_a else "移出範圍"
+            act = "已取消" if (po in canc_a or k in canc_a) else "移出範圍"
         elif b is None:
             act = "新增品項"
         else:

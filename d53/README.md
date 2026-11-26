@@ -40,6 +40,15 @@ Validation Summary 第 0 節會列出每一項的「已檢查／差異」，逐�
 | PO 解析驗算 | 每張 PO 行數量合計 = Total Qty |
 | Image | WRK 有照片 |
 
+## Domestic PO（.csv）
+- Domestic 單沒有 SPS PDF，來源是 Target 的 **Modern PO Visibility (PO/Item Level)** 匯出 .csv。直接和 PDF 一起上傳到「② PO」，不用另開區塊。
+- 每張 Domestic PO 一欄，表頭顯示 `PO#-DOM`、Shipping Point = Domestic，跟 Import PO 放在同一個 Program 分頁。
+- 數量取 REVISED QUANTITY；單價 ITEM COST $；Retail = REV RETAIL $ ÷ 數量；Case Pack = VCP／SSP。
+- 工廠：CSV 沒有工廠欄，取 PCN 的 Factory Name，所以 Factory 這項不比對。
+- 成本：Domestic 行比對 PCN 的 Collect（或 Prepaid）Domestic Unit Cost；Import 行比對 FCA／FOB。
+- 版本：同一張 PO 有好幾份 CSV 時，取 Exported at 時間最新的那份。整張都 CANCELED 等同 CANCEL；只有單行 CANCELED 的列在「排除清單」。
+- 匯出時用 purchase_order_id 篩選就好，一份 CSV 可以包含多張 PO。
+
 ## GRID 版面｜Layout
 - 每個 Program（PCN）一個分頁，版面參照 Vanessa 的 PO Amount Grid。
 - 第 1–8 列是 PO 表頭：PO No.、Factory、S/C（手填）、PO Date、Assigned by Sender（Purpose）、AC（手填）、Shipping Point、Shipping Window。

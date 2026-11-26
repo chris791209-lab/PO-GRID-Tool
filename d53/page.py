@@ -35,11 +35,11 @@ def _parse_uploads(pdf_uploads):
     docs, probs = [], []
     if not files:
         return docs, probs
-    bar = st.progress(0.0, text="解析 PO PDF…")
+    bar = st.progress(0.0, text="解析 PO…")
     for i, (n, b) in enumerate(files, 1):
         d, p = _parse_pdf(n, b, E.ENGINE_VERSION)
         docs += d; probs += p
-        bar.progress(i / len(files), text=f"解析 PO PDF… {i}/{len(files)}　{n}")
+        bar.progress(i / len(files), text=f"解析 PO… {i}/{len(files)}　{n}")
     bar.empty()
     return docs, probs
 
@@ -140,7 +140,7 @@ def render_d53_page():
             ae = st.text_input("AE 名稱", key="d53_ae_other") if ae_pick == "其他" else ae_pick
             pcn_up = st.file_uploader("① PCN 主檔（每份＝一個 Program，可多選）", type=["xlsx"], accept_multiple_files=True, key="d53_pcn")
         with c2:
-            po_up = st.file_uploader("② PO PDF（整包丟進來即可，可多選或 .zip）", type=["pdf", "zip"], accept_multiple_files=True, key="d53_po")
+            po_up = st.file_uploader("② PO：Import 用 SPS PDF、Domestic 用 PO Visibility .csv（整包丟進來即可，可多選或 .zip）", type=["pdf", "csv", "zip"], accept_multiple_files=True, key="d53_po")
             wrk_up = st.file_uploader("③ WRK Workspace 匯出檔（照片，選填）", type=["xlsx"], accept_multiple_files=True, key="d53_wrk")
         pcns = []
         for f in pcn_up or []:
@@ -176,7 +176,7 @@ def render_d53_page():
                        f"PO 文件 {len(state['docs'])} 份｜上次更新：{state['changelog'][-1]['time'] if state['changelog'] else '-'}")
             c1, c2 = st.columns(2)
             with c1:
-                po_up = st.file_uploader("② 新的 PO PDF（新單、改單、CANCEL 都可以；可 .zip）", type=["pdf", "zip"], accept_multiple_files=True, key="d53_po_u")
+                po_up = st.file_uploader("② 新的 PO：PDF 或 Domestic .csv（新單、改單、CANCEL 都可以；可 .zip）", type=["pdf", "csv", "zip"], accept_multiple_files=True, key="d53_po_u")
                 wrk_up = st.file_uploader("④ WRK 匯出檔（補照片，選填）", type=["xlsx"], accept_multiple_files=True, key="d53_wrk_u")
             with c2:
                 pcn_up = st.file_uploader("③ PCN（加新的 Program，或同名 PCN 的新版本，選填）", type=["xlsx"], accept_multiple_files=True, key="d53_pcn_u")
